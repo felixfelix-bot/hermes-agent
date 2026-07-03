@@ -421,21 +421,47 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
-       :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    1. ``board`` arg explicitly provided (not ``None``) — resolves to
+       that board's DB. An explicit board request ALWAYS wins over
+       env-var pins (``HERMES_KANBAN_DB``, ``HERMES_KANBAN_BOARD``), so
+       cross-board operations from pinned workers — e.g. filing a
+       human-gate shadow — land on the right DB.
+    2. ``_CURRENT_BOARD_OVERRIDE`` ContextVar — set by
+       :func:`scoped_current_board` when the CLI ``--board`` flag is
+       used. Wins over ``HERMES_KANBAN_DB`` so ``--board`` works inside
+       dispatched (env-pinned) workers.
+    3. ``HERMES_KANBAN_DB`` env var — pins the path directly. Used as
+       the dispatcher→worker pin mechanism when no explicit board is
+       requested. Honoured for back-compat and defense in depth.
+    4. When ``board`` arg is None and no override is active, the active
+       board from :func:`get_current_board` is used.
+    5. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
+    # 1. Explicit board arg — always wins over env-var pins.
+    slug = _normalize_board_slug(board)
+    if slug is not None:
+        if slug == DEFAULT_BOARD:
+            return kanban_home() / "kanban.db"
+        return board_dir(slug) / "kanban.db"
+    # 2. ContextVar scope (--board CLI flag) — beats env pins so that
+    #    a pinned worker can still --board to a different board.
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        try:
+            normed = _normalize_board_slug(scoped)
+        except ValueError:
+            normed = None
+        if normed and board_exists(normed):
+            if normed == DEFAULT_BOARD:
+                return kanban_home() / "kanban.db"
+            return board_dir(normed) / "kanban.db"
+    # 3. HERMES_KANBAN_DB env (dispatcher→worker pin, defense in depth).
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
+    # 4-5. Active board from get_current_board().
+    slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
@@ -445,19 +471,41 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
-    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env.
+    Resolution mirrors :func:`kanban_db_path`:
+
+    1. ``board`` arg explicitly provided — always wins.
+    2. ``_CURRENT_BOARD_OVERRIDE`` ContextVar (CLI ``--board`` flag).
+    3. ``HERMES_KANBAN_WORKSPACES_ROOT`` env var — pins the path directly
+       (dispatcher→worker pin, defense in depth).
+    4. Active board from :func:`get_current_board`.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
+    # 1. Explicit board arg — always wins.
+    slug = _normalize_board_slug(board)
+    if slug is not None:
+        if slug == DEFAULT_BOARD:
+            return kanban_home() / "kanban" / "workspaces"
+        return board_dir(slug) / "workspaces"
+    # 2. ContextVar scope (--board CLI flag) — beats env pins.
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        try:
+            normed = _normalize_board_slug(scoped)
+        except ValueError:
+            normed = None
+        if normed and board_exists(normed):
+            if normed == DEFAULT_BOARD:
+                return kanban_home() / "kanban" / "workspaces"
+            return board_dir(normed) / "workspaces"
+    # 3. HERMES_KANBAN_WORKSPACES_ROOT env (dispatcher→worker pin).
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
+    # 4. Active board from get_current_board().
+    slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "workspaces"
     return board_dir(slug) / "workspaces"
@@ -470,8 +518,13 @@ def attachments_root(board: Optional[str] = None) -> Path:
     per-board so attachments don't leak between projects. Each task gets
     its own ``<root>/.../attachments/<task_id>/`` subdirectory.
 
-    ``HERMES_KANBAN_ATTACHMENTS_ROOT`` pins the path directly (highest
-    precedence) for tests and unusual deployments.
+    Resolution mirrors :func:`kanban_db_path`:
+
+    1. ``board`` arg explicitly provided — always wins.
+    2. ``_CURRENT_BOARD_OVERRIDE`` ContextVar (CLI ``--board`` flag).
+    3. ``HERMES_KANBAN_ATTACHMENTS_ROOT`` env var — pins the path directly
+       (dispatcher→worker pin, defense in depth).
+    4. Active board from :func:`get_current_board`.
 
     ``default`` uses ``<root>/kanban/attachments/``; other boards use
     ``<root>/kanban/boards/<slug>/attachments/``.
@@ -482,12 +535,29 @@ def attachments_root(board: Optional[str] = None) -> Path:
     directly. Remote backends (Docker/Modal) need this directory mounted;
     see the kanban docs.
     """
+    # 1. Explicit board arg — always wins.
+    slug = _normalize_board_slug(board)
+    if slug is not None:
+        if slug == DEFAULT_BOARD:
+            return kanban_home() / "kanban" / "attachments"
+        return board_dir(slug) / "attachments"
+    # 2. ContextVar scope (--board CLI flag) — beats env pins.
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        try:
+            normed = _normalize_board_slug(scoped)
+        except ValueError:
+            normed = None
+        if normed and board_exists(normed):
+            if normed == DEFAULT_BOARD:
+                return kanban_home() / "kanban" / "attachments"
+            return board_dir(normed) / "attachments"
+    # 3. HERMES_KANBAN_ATTACHMENTS_ROOT env (dispatcher→worker pin).
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
+    # 4. Active board from get_current_board().
+    slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban" / "attachments"
     return board_dir(slug) / "attachments"

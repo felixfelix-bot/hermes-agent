@@ -2725,6 +2725,76 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
+# Explicit board override vs HERMES_KANBAN_DB env pin (t_9ca24258)
+# ---------------------------------------------------------------------------
+
+def test_explicit_board_arg_beats_kanban_db_env(tmp_path, monkeypatch):
+    """A board-pinned worker (HERMES_KANBAN_DB set) that explicitly
+    requests a different board must reach that board's DB — not the
+    pinned one. Without this, cross-board operations like human-gate
+    shadow creation silently land on the wrong board.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    kb.create_board("fips")
+    kb.create_board("human-gate")
+
+    # Simulate dispatcher pinning the worker to the fips board.
+    fips_db = kb.kanban_db_path(board="fips")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fips_db))
+
+    # Without a board arg, the pin wins (backward compat).
+    assert kb.kanban_db_path() == fips_db
+
+    # With an explicit board arg, the explicit board wins.
+    hg_db = kb.kanban_db_path(board="human-gate")
+    assert hg_db == kb.board_dir("human-gate") / "kanban.db"
+    assert hg_db != fips_db
+
+
+def test_scoped_board_beats_kanban_db_env(tmp_path, monkeypatch):
+    """The CLI --board flag uses scoped_current_board (a ContextVar).
+    When HERMES_KANBAN_DB is set (pinned worker), the scoped board must
+    still win so --board works inside dispatched workers.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    kb.create_board("fips")
+    kb.create_board("human-gate")
+
+    fips_db = kb.kanban_db_path(board="fips")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fips_db))
+
+    # ContextVar scope must beat the env pin.
+    with kb.scoped_current_board("human-gate"):
+        resolved = kb.kanban_db_path()
+        assert resolved == kb.board_dir("human-gate") / "kanban.db"
+        assert resolved != fips_db
+
+
+def test_kanban_db_env_still_used_when_no_board_specified(tmp_path, monkeypatch):
+    """Backward compat: when no board arg and no ContextVar scope,
+    HERMES_KANBAN_DB is the pin mechanism for dispatcher→worker handoff.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    pinned_db = tmp_path / "pinned" / "dispatch.db"
+    pinned_db.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_db))
+
+    assert kb.kanban_db_path() == pinned_db
+
+
+# ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
 
