@@ -2132,21 +2132,71 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        # FIX 1: read dispatch_stale_timeout_seconds from config so the CLI
+        # path reclaims stale running tasks exactly like the gateway-embedded
+        # watcher (_kanban_dispatcher_watcher). Previously this defaulted to 0
+        # (disabled), so a manual `hermes kanban dispatch` and the stale-
+        # resetter's re-dispatch never reclaimed TTL-expired zombies — only
+        # the gateway watcher did.
+        raw_stale = _kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
+        try:
+            stale_timeout_seconds = int(raw_stale or 0)
+        except (TypeError, ValueError):
+            stale_timeout_seconds = 0
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+        stale_timeout_seconds = 0
+
+    failure_limit = getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+
+    def _dispatch_one(slug: str) -> "kb.DispatchResult":
+        with kb.connect_closing(board=slug) as conn:
+            return kb.dispatch_once(
+                conn,
+                dry_run=args.dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=failure_limit,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                stale_timeout_seconds=stale_timeout_seconds,
+                board=slug,
+            )
+
+    # FIX 2: when no explicit --board is given, dispatch across ALL boards
+    # (matching the gateway-embedded watcher). Previously the CLI only
+    # processed the resolved "current" board, so ready tasks on other boards
+    # were never picked up by a manual `hermes kanban dispatch`. An explicit
+    # --board X still scopes to that single board.
+    board_override = getattr(args, "board", None)
+    if board_override:
+        res = _dispatch_one(board_override)
+    else:
+        try:
+            _all_boards = kb.list_boards(include_archived=False)
+        except Exception:
+            _all_boards = []
+        _slugs = (
+            [b.get("slug") or kb.DEFAULT_BOARD for b in (_all_boards or [])]
+            or [kb.DEFAULT_BOARD]
         )
+        _per_board = [_dispatch_one(s) for s in _slugs]
+        res = kb.DispatchResult()
+        for _r in _per_board:
+            res.reclaimed += _r.reclaimed
+            res.promoted += _r.promoted
+            res.spawned.extend(_r.spawned)
+            res.skipped_unassigned.extend(_r.skipped_unassigned)
+            res.auto_assigned_default.extend(_r.auto_assigned_default)
+            res.skipped_nonspawnable.extend(_r.skipped_nonspawnable)
+            res.skipped_per_profile_capped.extend(_r.skipped_per_profile_capped)
+            res.crashed.extend(_r.crashed)
+            res.auto_blocked.extend(_r.auto_blocked)
+            res.timed_out.extend(_r.timed_out)
+            res.stale.extend(_r.stale)
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
