@@ -6770,19 +6770,33 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
-def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
-    """True if the bundled ``kanban-worker`` skill resolves for the home the
-    spawned worker will run under.
+# Skills the dispatcher auto-injects into every worker via ``--skills``.
+# ``kanban-worker`` provides the pattern library (good summary/metadata
+# shapes, retry diagnostics, block-reason examples). ``request-human-action``
+# provides the human-gate escalation protocol (block + create shadow task +
+# stop, with resolver/digest cron wiring). Both are additive to the
+# profile's default skill set and dropped silently if not resolvable.
+_KANBAN_AUTO_INJECT_SKILLS: list[str] = [
+    "kanban-worker",
+    "request-human-action",
+]
 
-    The dispatcher injects ``--skills kanban-worker`` into every worker. When
-    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
-    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
-    the bundled skill (it ships in the *default* root home, not every
-    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
-    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
-    worker before the agent loop runs. Gate the flag on actual resolvability;
-    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
-    omitting the flag only drops the supplementary pattern library.
+
+def _kanban_skill_available(
+    skill_name: str, hermes_home: Optional[str]
+) -> bool:
+    """True if a bundled skill resolves for the home the spawned worker runs under.
+
+    The dispatcher injects skills from ``_KANBAN_AUTO_INJECT_SKILLS`` into
+    every worker. When the worker activates a profile (``hermes -p <name>``),
+    its ``SKILLS_DIR`` becomes ``<profile_home>/skills`` — which on many
+    profiles does NOT contain the bundled skill (it ships in the *default*
+    root home, not every profile-scoped skills dir). Preloading a missing
+    skill is fatal at CLI startup (``ValueError: Unknown skill(s): ...``),
+    aborting the worker before the agent loop runs. Gate the flag on actual
+    resolvability; the kanban lifecycle contract is still injected via
+    ``KANBAN_GUIDANCE``, so omitting a skill only drops the supplementary
+    pattern library.
     """
     from pathlib import Path as _Path
 
@@ -6794,15 +6808,20 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
         return False
     # Canonical bundled location first (cheap), then a bounded scan for
     # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
+    if (skills_root / "devops" / skill_name / "SKILL.md").is_file():
         return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+        for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
             if skill_md.is_file():
                 return True
     except OSError:
         pass
     return False
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """Backward-compatible thin wrapper for ``_kanban_skill_available``."""
+    return _kanban_skill_available("kanban-worker", hermes_home)
 
 
 def _worker_terminal_timeout_env(
@@ -6987,18 +7006,31 @@ def _default_spawn(
     # profile-scoped skills dirs, and preloading a missing skill is
     # fatal at CLI startup. Omitting it is safe — the lifecycle
     # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
+    # Auto-inject every skill in _KANBAN_AUTO_INJECT_SKILLS (kanban-worker
+    # plus request-human-action) so each dispatched worker loads the full
+    # lifecycle pattern library AND the human-gate escalation workflow.
+    # The MANDATORY lifecycle is already in the system prompt via
+    # KANBAN_GUIDANCE; these skills are the deeper reference. --skills is
+    # additive to the profile's default skill set, so users can still point
+    # a profile at different/additional skills via config.
+    #
+    # Each flag is gated on actual resolvability for the worker's HERMES_HOME:
+    # bundled skills are absent from many profile-scoped skills dirs, and
+    # preloading a missing skill is fatal at CLI startup. Omitting one is
+    # safe — the lifecycle contract still ships via KANBAN_GUIDANCE.
+    for _auto_skill in _KANBAN_AUTO_INJECT_SKILLS:
+        if _kanban_skill_available(_auto_skill, env.get("HERMES_HOME")):
+            cmd.extend(["--skills", _auto_skill])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
+    # Dedupe against the auto-injected set so we don't double-load a
+    # skill a task author also asks for explicitly.
     if task.skills:
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
+            if sk and sk not in _KANBAN_AUTO_INJECT_SKILLS:
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
