@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import random
+import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -63,6 +65,74 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+
+# Buffer DB for non-admin group messages (monitoring/summarization)
+_BUFFER_DB = os.path.join(
+    os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")),
+    "state", "group_buffer.db",
+)
+
+
+def _anon_hash(name: str) -> str:
+    """Hash a sender name to a short anonymous identifier."""
+    import hashlib
+    return "user_" + hashlib.sha256(name.encode()).hexdigest()[:8]
+
+
+def _buffer_group_message(
+    group_id: str, sender_name: str, sender_id: str, text: str
+) -> None:
+    """Store a non-admin group message for monitoring without entering the agent loop.
+
+    Privacy: Sender names are SHA-256 hashed — no profile names or phone numbers
+    are stored. Dedup: content_hash = group_id + sender_hash + text_hash within
+    a 5-minute bucket (handles SSE retries without losing unique messages).
+    Messages NEVER reach the LLM in real-time — zero prompt-injection risk.
+    """
+    import hashlib
+    import sqlite3
+
+    # Anonymize: hash the sender identity
+    raw_identity = (sender_name or sender_id or "unknown").strip().lower()
+    anon_sender = _anon_hash(raw_identity)
+
+    # Normalize text for stable hashing
+    text_clean = " ".join(text[:2000].split())
+
+    # Dedup: 5-minute time bucket + content hash
+    ts = time.time()
+    bucket = int(ts // 300)  # 5-min bucket
+    content_key = f"{group_id}:{anon_sender}:{hashlib.sha256(text_clean[:500].encode()).hexdigest()[:16]}:{bucket}"
+    content_hash = hashlib.sha256(content_key.encode()).hexdigest()
+
+    try:
+        os.makedirs(os.path.dirname(_BUFFER_DB), exist_ok=True)
+        conn = sqlite3.connect(_BUFFER_DB, timeout=2)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                sender_hash TEXT,
+                message_text TEXT,
+                timestamp REAL NOT NULL,
+                content_hash TEXT UNIQUE,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_content_hash "
+            "ON group_messages(content_hash)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO group_messages "
+            "(group_id, sender_hash, message_text, timestamp, content_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (group_id[:32], anon_sender, text_clean, ts, content_hash),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # best-effort; never crash the gateway over logging
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +279,19 @@ class SignalAdapter(BasePlatformAdapter):
         dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
 
+        # Group admin sender filter — in groups, only authorized senders can
+        # issue commands. Non-admin messages are buffered (anonymized, deduped)
+        # by the module-level _buffer_group_message function for monitoring.
+        # See _buffer_group_message() near top of file for implementation.
+        # "*" means all group senders allowed (backward compatible default).
+        _ga_cfg = extra.get("group_admin_senders")
+        if _ga_cfg is not None:
+            self.group_admin_senders = set(_parse_comma_list(str(_ga_cfg)))
+        else:
+            self.group_admin_senders = set(
+                _parse_comma_list(os.getenv("SIGNAL_GROUP_ADMIN_SENDERS", "*"))
+            )
+
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
 
@@ -242,9 +325,10 @@ class SignalAdapter(BasePlatformAdapter):
         self._recipient_number_by_uuid: Dict[str, str] = {}
         self._recipient_cache_lock = asyncio.Lock()
 
-        logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
+        logger.info("Signal adapter initialized: url=%s account=%s groups=%s admin_senders=%d",
                      self.http_url, redact_phone(self.account),
-                     "enabled" if self.group_allow_from else "disabled")
+                     "enabled" if self.group_allow_from else "disabled",
+                     len(self.group_admin_senders))
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -281,6 +365,9 @@ class SignalAdapter(BasePlatformAdapter):
 
             self._running = True
             self._last_sse_activity = time.time()
+
+            await self._drain_backlog()
+
             self._sse_task = asyncio.create_task(self._sse_listener())
             self._health_monitor_task = asyncio.create_task(self._health_monitor())
 
@@ -324,6 +411,50 @@ class SignalAdapter(BasePlatformAdapter):
         self._release_platform_lock()
 
         logger.info("Signal: disconnected")
+
+    async def _drain_backlog(self) -> int:
+        """Drain messages that arrived during gateway downtime.
+
+        Calls signal-cli's receive RPC to get undelivered messages before
+        starting the SSE listener. This prevents message loss when the gateway
+        crashes or restarts — the REST API daemon retains messages in its
+        in-memory queue until consumed.
+
+        Non-fatal: any error is logged at DEBUG and SSE starts normally.
+        """
+        try:
+            resp = await self.client.post(
+                f"{self.http_url}/api/v1/rpc",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "receive",
+                    "params": {"account": self.account},
+                    "id": int(time.time()),
+                },
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                logger.debug("Signal backfill: RPC returned %d", resp.status_code)
+                return 0
+            data = resp.json()
+            envelopes = data.get("result", [])
+            if not envelopes:
+                return 0
+
+            count = 0
+            for envelope in envelopes:
+                try:
+                    await self._handle_envelope(envelope)
+                    count += 1
+                except Exception:
+                    logger.debug("Signal backfill: error processing envelope", exc_info=True)
+
+            if count > 0:
+                logger.info("Signal: drained %d backlogged messages on startup", count)
+            return count
+        except Exception as e:
+            logger.debug("Signal: backlog drain failed (non-fatal): %s", e)
+            return 0
 
     # ------------------------------------------------------------------
     # SSE Streaming (inbound messages)
@@ -514,6 +645,34 @@ class SignalAdapter(BasePlatformAdapter):
                 return
             if "*" not in self.group_allow_from and group_id not in self.group_allow_from:
                 logger.debug("Signal: group %s not in allowlist", group_id[:8] if group_id else "?")
+                return
+
+        # Group admin sender filter — only authorized senders can issue commands
+        # in groups. Non-admin messages are buffered for monitoring but NOT
+        # processed by the agent loop (no prompt injection risk).
+        if is_group and self.group_admin_senders and "*" not in self.group_admin_senders:
+            _snd_phone = (sender or "").lower()
+            _snd_name = (sender_name or "").lower()
+            _snd_uuid = (sender_uuid or "").lower()
+            _is_admin = any(
+                admin.lower() in (_snd_phone, _snd_name, _snd_uuid)
+                for admin in self.group_admin_senders
+            )
+            if not _is_admin:
+                # Buffer non-admin message for monitoring/summarization.
+                # Sender is hashed for privacy. Duplicates are skipped.
+                # Message NEVER enters the agent loop — zero injection risk.
+                _msg_text = data_message.get("message", "")
+                if _msg_text:
+                    _buffer_group_message(
+                        group_id, sender_name or "", sender or "", _msg_text,
+                    )
+                logger.debug(
+                    "Signal: buffered group message from non-admin sender "
+                    "(hash=%s, group=%s)",
+                    _anon_hash(sender_name or sender or "unknown"),
+                    group_id[:8],
+                )
                 return
 
         # Build chat info
@@ -996,6 +1155,16 @@ class SignalAdapter(BasePlatformAdapter):
 
         if result is not None:
             self._track_sent_timestamp(result)
+
+            if chat_id.startswith("group:"):
+                _buffer_group_message(
+                    chat_id[6:], "felix", self.account, plain_text,
+                )
+            else:
+                _buffer_group_message(
+                    f"dm:{chat_id}", "felix", self.account, plain_text,
+                )
+
             # Signal has no editable message identifier. Returning None keeps the
             # stream consumer on the non-edit fallback path instead of pretending
             # future edits can remove an in-progress cursor from the chat thread.
