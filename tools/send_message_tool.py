@@ -312,7 +312,11 @@ def _handle_send(args):
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                # Use the resolved ID directly. Re-parsing through
+                # _parse_target_ref can fail for opaque platform IDs (e.g.
+                # Signal group IDs like "group:base64hash") that don't match
+                # any per-platform regex — the resolver already validated it.
+                chat_id = resolved
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
