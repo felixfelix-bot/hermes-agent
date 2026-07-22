@@ -164,6 +164,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    NOSTR = "nostr"  # NIP-29 group chat via strfry relays
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
@@ -499,6 +500,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     # signal in the experimental phase. EXPERIMENTAL — may change.
     Platform.RELAY: lambda cfg: bool(
         cfg.extra.get("relay_url") or cfg.extra.get("url")
+    ),
+    Platform.NOSTR: lambda cfg: bool(
+        cfg.extra.get("relays") or os.getenv("NOSTR_RELAYS")
     ),
 }
 
@@ -1563,6 +1567,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "account": signal_account,
             "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in {"true", "1", "yes"},
         })
+        # Load per-channel prompts from YAML config (signal.channel_prompts).
+        # Keyed by chat_id (e.g. "group:<base64>" for Signal groups).
+        # Re-read config.yaml here since _apply_env_overrides doesn't receive yaml_cfg.
+        try:
+            import yaml
+            _cfg_path = get_hermes_home() / "config.yaml"
+            if _cfg_path.exists():
+                with open(_cfg_path, encoding="utf-8") as _f:
+                    _yaml = yaml.safe_load(_f) or {}
+                _cp = (_yaml.get("signal") or {}).get("channel_prompts")
+                if isinstance(_cp, dict) and _cp:
+                    signal_config.extra["channel_prompts"] = _cp
+        except Exception:
+            pass
     signal_home = os.getenv("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
