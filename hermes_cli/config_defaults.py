@@ -2096,6 +2096,22 @@ DEFAULT_CONFIG = {
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
 
+    # Nostr platform settings (gateway mode, NIP-29 groups)
+    "nostr": {
+        "relays": [
+            "ws://100.90.101.9:7780",
+            "ws://100.90.22.201:7780",
+        ],                             # NIP-29 relay URLs
+        "groups": [
+            "balloon-orch",
+            "plebeian-orch",
+            "plebeian-my-prs",
+            "plebeian-reviews",
+            "plebeian-adrs",
+        ],                             # NIP-29 group names to listen on
+        "nsec_path": "~/.hermes/state/nip29-relay-nsec.key",  # Path to nsec hex key file
+    },
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
@@ -4206,6 +4222,24 @@ OPTIONAL_ENV_VARS = {
     "MATRIX_RECOVERY_KEY": {
         "description": "Matrix recovery key for cross-signing verification after device key rotation (from Element: Settings → Security → Recovery Key)",
         "prompt": "Matrix recovery key",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
+
+    # ── Nostr (NIP-29 groups) ──
+    "NOSTR_RELAYS": {
+        "description": "Comma-separated list of Nostr NIP-29 relay URLs (e.g. ws://relay.example.com:7780)",
+        "prompt": "Nostr relay URLs (comma-separated)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "NOSTR_NSEC_PATH": {
+        "description": "Path to file containing the nsec hex key for the Nostr relay bot identity",
+        "prompt": "Nostr nsec key file path",
         "url": None,
         "password": True,
         "category": "messaging",

@@ -14266,6 +14266,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.NOSTR:
+            from gateway.platforms.nostr import NostrAdapter, check_nostr_requirements
+            if not check_nostr_requirements():
+                logger.warning("Nostr: NOSTR_NSEC_PATH and NOSTR_RELAYS env vars required")
+                return None
+            return NostrAdapter(config)
+
         return None
 
     def _make_adapter_auth_check(

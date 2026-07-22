@@ -345,6 +345,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    NOSTR = "nostr"  # NIP-29 group chat via strfry relays
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
@@ -910,6 +911,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     # signal in the experimental phase. EXPERIMENTAL — may change.
     Platform.RELAY: lambda cfg: bool(
         cfg.extra.get("relay_url") or cfg.extra.get("url")
+    ),
+    Platform.NOSTR: lambda cfg: bool(
+        cfg.extra.get("relays") or os.getenv("NOSTR_RELAYS")
     ),
 }
 
