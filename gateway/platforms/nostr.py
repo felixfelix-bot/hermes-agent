@@ -152,6 +152,28 @@ class NostrAdapter(BasePlatformAdapter):
             groups_env = os.getenv("NOSTR_GROUPS", "")
             self.groups = [g.strip() for g in groups_env.split(",") if g.strip()]
 
+        # Load group mappings from nip29-groups.yaml if available
+        self.group_mappings: Dict[str, str] = {}  # signal_chat_id -> nostr_group_id
+        groups_config_path = extra.get("groups_config_path",
+                                        os.path.expanduser("~/.hermes/profiles/manager/state/nip29-groups.yaml"))
+        if os.path.exists(groups_config_path):
+            try:
+                import yaml
+                with open(groups_config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                for mapping in cfg.get("groups", []):
+                    signal_id = mapping.get("signal_chat_id", "")
+                    nostr_id = mapping.get("nostr_group_id", "")
+                    if signal_id and nostr_id:
+                        self.group_mappings[signal_id] = nostr_id
+                        if nostr_id not in self.groups:
+                            self.groups.append(nostr_id)
+                logger.info("Nostr: loaded %d group mappings from %s",
+                            len(self.group_mappings), groups_config_path)
+            except Exception as e:
+                logger.warning("Nostr: failed to load group config from %s: %s",
+                               groups_config_path, e)
+
         self.nsec_path: str = extra.get("nsec_path", os.getenv("NOSTR_NSEC_PATH", ""))
         self._privkey: Optional[bytes] = None
         self._pubkey: Optional[str] = None
@@ -217,11 +239,13 @@ class NostrAdapter(BasePlatformAdapter):
                 connected += 1
                 logger.info("Nostr: connected to %s", relay_url)
 
-                # Send REQ subscription for kind 9 events with h tag filters
+                # Send REQ subscription for NIP-29 event kinds with h tag filters
+                # kinds: 9 (text), 10 (reaction), 11 (chat thread), 39000-39003 (metadata/admins/members/roles), 9000-9022 (moderation)
+                nip29_kinds = [9, 10, 11, 39000, 39001, 39002, 39003, 9000, 9001, 9002, 9004, 9005, 9006, 9007, 9008]
                 req = json.dumps([
                     "REQ",
                     self._sub_id,
-                    {"kinds": [9], "#h": self.groups},
+                    {"kinds": nip29_kinds, "#h": self.groups},
                 ])
                 await ws.send(req)
                 logger.info("Nostr: subscribed to kind 9 on %s for groups %s",
@@ -322,7 +346,7 @@ class NostrAdapter(BasePlatformAdapter):
             logger.info("Nostr: NOTICE from %s: %s", relay_url, notice)
 
     async def _process_event(self, event: dict, relay_url: str):
-        """Process a kind 9 chat event."""
+        """Process a NIP-29 group event (kind 9 chat, or metadata/moderation events)."""
         event_id = event.get("id", "")
         if not event_id or event_id in self._seen_ids:
             return
@@ -330,12 +354,9 @@ class NostrAdapter(BasePlatformAdapter):
         # Track for dedup
         self._seen_ids.add(event_id)
         if len(self._seen_ids) > self._max_seen:
-            # Trim oldest (set is unordered but this is good enough for dedup)
             self._seen_ids = set(list(self._seen_ids)[-self._max_seen:])
 
         kind = event.get("kind")
-        if kind != 9:
-            return
 
         # Extract group from h tag
         tags = event.get("tags", [])
@@ -353,47 +374,94 @@ class NostrAdapter(BasePlatformAdapter):
             return
 
         content = event.get("content", "")
-        if not content:
-            return
 
-        pubkey = event.get("pubkey", "unknown")
-        created_at = event.get("created_at", int(time.time()))
+        # Handle kind 9 (text chat) — route to gateway
+        if kind == 9:
+            if not content:
+                return
 
-        logger.info("Nostr: incoming message from %s in group %s: %s",
-                     pubkey[:16], group, content[:80])
+            pubkey = event.get("pubkey", "unknown")
+            created_at = event.get("created_at", int(time.time()))
 
-        # Build SessionSource
-        source = SessionSource(
-            platform=Platform.NOSTR,
-            chat_id=group,
-            chat_name=group,
-            chat_type="group",
-            user_id=pubkey,
-            user_name=f"npub{pubkey[:12]}",
-        )
+            logger.info("Nostr: incoming chat from %s in group %s: %s",
+                         pubkey[:16], group, content[:80])
 
-        # Build MessageEvent
-        msg_event = MessageEvent(
-            text=content,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=event,
-            message_id=event_id,
-        )
+            # Build SessionSource
+            source = SessionSource(
+                platform=Platform.NOSTR,
+                chat_id=group,
+                chat_name=group,
+                chat_type="group",
+                user_id=pubkey,
+                user_name=f"npub{pubkey[:12]}",
+            )
 
-        # Route to gateway
-        await self.handle_message(msg_event)
+            # Build MessageEvent
+            msg_event = MessageEvent(
+                text=content,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=event,
+                message_id=event_id,
+            )
+
+            # Route to gateway
+            await self.handle_message(msg_event)
+
+            # Also inject via self-delivery for cross-platform bridge
+            self._inject_self_delivery(group, content, pubkey, event_id)
+
+        # Handle metadata/moderation events — log but don't route as messages
+        elif kind in (39000, 39001, 39002, 39003):
+            logger.info("Nostr: metadata event kind=%d in group %s", kind, group)
+        elif kind in (9000, 9001, 9002, 9004, 9005, 9006, 9007, 9008):
+            logger.debug("Nostr: moderation event kind=%d in group %s", kind, group)
+        elif kind in (10, 11):
+            logger.debug("Nostr: reaction/thread event kind=%d in group %s", kind, group)
+
+    def _inject_self_delivery(self, group: str, content: str,
+                               pubkey: str, event_id: str):
+        """Inject message into /tmp/hermes-self-delivery/ for cross-platform bridging.
+
+        This allows messages received on Nostr to be forwarded to Signal groups
+        that are mapped to the same NIP-29 group.
+        """
+        delivery_dir = "/tmp/hermes-self-delivery"
+        try:
+            os.makedirs(delivery_dir, exist_ok=True)
+            # Find Signal chat_id for this nostr group
+            for signal_id, nostr_id in self.group_mappings.items():
+                if nostr_id == group:
+                    import json as _json
+                    delivery = {
+                        "platform": "signal",
+                        "chat_id": signal_id,
+                        "text": f"[Nostr/{group}] {content}",
+                        "source": f"nostr:{pubkey[:12]}",
+                        "event_id": event_id,
+                    }
+                    delivery_file = os.path.join(delivery_dir, f"nostr-{event_id[:16]}.json")
+                    with open(delivery_file, "w") as f:
+                        _json.dump(delivery, f)
+                    logger.debug("Nostr: injected self-delivery for Signal %s", signal_id)
+                    break
+        except Exception as e:
+            logger.warning("Nostr: self-delivery injection failed: %s", e)
 
     # ------------------------------------------------------------------
     # Reconnection
     # ------------------------------------------------------------------
 
     async def _reconnect_watcher(self):
-        """Periodically check and reconnect to dropped relays."""
+        """Periodically check and reconnect to dropped relays with exponential backoff."""
         import websockets
 
+        backoff = {}  # relay_url -> current backoff seconds
+        initial_backoff = 1
+        max_backoff = 300  # 5 minutes max
+
         while self._running:
-            await asyncio.sleep(30)  # Check every 30 seconds
+            await asyncio.sleep(5)  # Check every 5 seconds
 
             for relay_url in self.relays:
                 if relay_url in self._ws:
@@ -402,19 +470,23 @@ class NostrAdapter(BasePlatformAdapter):
                 if not self._running:
                     break
 
-                logger.info("Nostr: attempting reconnect to %s", relay_url)
+                current_backoff = backoff.get(relay_url, initial_backoff)
+                logger.info("Nostr: attempting reconnect to %s (backoff=%ds)",
+                            relay_url, current_backoff)
                 try:
                     ws = await asyncio.wait_for(
                         websockets.connect(relay_url, ping_interval=30, ping_timeout=10),
                         timeout=10,
                     )
                     self._ws[relay_url] = ws
+                    backoff[relay_url] = initial_backoff  # Reset backoff on success
 
-                    # Re-subscribe
+                    # Re-subscribe with broad NIP-29 kinds
+                    nip29_kinds = [9, 10, 11, 39000, 39001, 39002, 39003, 9000, 9001, 9002, 9004, 9005, 9006, 9007, 9008]
                     req = json.dumps([
                         "REQ",
                         self._sub_id,
-                        {"kinds": [9], "#h": self.groups},
+                        {"kinds": nip29_kinds, "#h": self.groups},
                     ])
                     await ws.send(req)
 
@@ -424,7 +496,10 @@ class NostrAdapter(BasePlatformAdapter):
 
                     logger.info("Nostr: reconnected to %s", relay_url)
                 except Exception as e:
-                    logger.warning("Nostr: reconnect to %s failed: %s", relay_url, e)
+                    # Exponential backoff
+                    backoff[relay_url] = min(current_backoff * 2, max_backoff)
+                    logger.warning("Nostr: reconnect to %s failed (backoff=%ds): %s",
+                                   relay_url, backoff[relay_url], e)
 
     # ------------------------------------------------------------------
     # Send
