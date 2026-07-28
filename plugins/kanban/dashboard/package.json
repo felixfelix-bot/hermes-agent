@@ -1,0 +1,25 @@
+{
+  "name": "hermes-kanban-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Multi-agent collaboration board — Kanban dashboard plugin for the Hermes dashboard.",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@nous-research/ui": ">=0.18.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.5"
+  }
+}
