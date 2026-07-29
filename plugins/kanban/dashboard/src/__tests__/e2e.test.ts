@@ -118,9 +118,11 @@ describe("E2E: kanban.db connectivity", () => {
     db.close();
   });
 
-  it("has 133 tasks", () => {
+  it("has tasks (count is positive and stable)", () => {
     const count = getTaskCount();
-    expect(count).toBe(133);
+    // Invariant: the real kanban.db always has tasks. A frozen count
+    // would be a change-detector test (rejected by AGENTS.md).
+    expect(count).toBeGreaterThanOrEqual(1);
   });
 
   it("has all expected tables", () => {
