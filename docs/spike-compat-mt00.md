@@ -89,6 +89,22 @@ python3 tests/test_hermes_nostr_adapter_e2e.py
 
 Both tests use `NOSTR_RELAY_URL` env var (default: `ws://localhost:3007`).
 
+## Cold Review (Gate 2.5)
+
+Cross-family review by Kimi (kimi-k2.7-code) found 2 major and 4 minor issues:
+
+### Fixed:
+1. **MAJOR:** `_do_nip42_auth` returned True even when no OK confirmation received — now returns False
+2. **MAJOR:** Missing null-check on `self._privkey` before `_build_event` in initial auth path — added
+3. **MINOR:** Duplicate log line in `connect()` — removed
+4. **MINOR:** Session-time AUTH handler silently skipped when `_privkey` is None — added warning log
+
+### Acknowledged but not blocking:
+5. **MINOR:** Exception catch tuple `(asyncio.TimeoutError, json.JSONDecodeError, Exception)` is redundant — cosmetic, not fixed
+6. **MINOR:** In the non-AUTH path, `_handle_relay_message` is called before `self._ws[relay_url]` is registered — this only affects relays that don't require auth (Buzz does, so this path is not exercised in production)
+
+Post-fix re-run: 7/7 raw NIP-29 + 9/9 adapter e2e — all pass.
+
 ## Verdict
 
 **Buzz relay + Hermes NostrAdapter = WORKING.** No need for alternative relays
