@@ -186,6 +186,104 @@ class NostrAdapter(BasePlatformAdapter):
             logger.error("Nostr: failed to load nsec: %s", e)
             return False
 
+    async def _do_nip42_auth(self, ws, relay_url: str) -> bool:
+        """Perform NIP-42 AUTH challenge-response if the relay requests it.
+
+        Some relays (e.g. Buzz) require NIP-42 authentication before accepting
+        REQ subscriptions or EVENT publishes. The relay sends an AUTH challenge
+        immediately on WebSocket connection. This reads the first message,
+        responds with a signed kind 22242 event if needed, then subscribes.
+
+        Returns True if auth succeeded or was not needed, False on failure.
+        """
+        # Read the first message — could be AUTH challenge or EOSE/EVENT
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            msg = json.loads(raw)
+        except (asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
+            logger.warning("Nostr: no response from %s during auth probe: %s",
+                           relay_url, e)
+            return False
+
+        msg_type = msg[0] if isinstance(msg, list) and msg else ""
+
+        if msg_type != "AUTH":
+            # No auth required — relay responded with EOSE/EVENT/etc.
+            logger.debug("Nostr: %s does not require NIP-42 auth (got %s)",
+                         relay_url, msg_type)
+            # Process the initial message if it's an event
+            if msg_type in ("EVENT", "EOSE"):
+                await self._handle_relay_message(msg, relay_url)
+            # Now send REQ subscription
+            req = json.dumps([
+                "REQ",
+                self._sub_id,
+                {"kinds": [9], "#h": self.groups},
+            ])
+            await ws.send(req)
+            return True
+
+        # We got an AUTH challenge
+        challenge = msg[1] if len(msg) > 1 else ""
+        if not challenge:
+            logger.error("Nostr: AUTH challenge from %s has no challenge string",
+                         relay_url)
+            return False
+
+        if not self._privkey:
+            logger.error("Nostr: cannot respond to AUTH challenge from %s — no private key loaded",
+                         relay_url)
+            return False
+
+        logger.info("Nostr: received NIP-42 AUTH challenge from %s", relay_url)
+
+        # Build kind 22242 auth event
+        auth_tags = [
+            ["relay", relay_url],
+            ["challenge", challenge],
+        ]
+        auth_event = _build_event(self._privkey, 22242, auth_tags, "")
+
+        # Send AUTH response
+        await ws.send(json.dumps(["AUTH", auth_event]))
+
+        # Drain messages until we get OK for our AUTH event
+        # (relay may have queued NOTICE/CLOSED from before auth)
+        got_ok = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2)
+                drain_msg = json.loads(raw)
+                drain_type = drain_msg[0] if isinstance(drain_msg, list) else ""
+                if drain_type == "OK" and len(drain_msg) >= 3 and drain_msg[2] is True:
+                    logger.info("Nostr: NIP-42 auth successful for %s", relay_url)
+                    got_ok = True
+                    break
+                elif drain_type in ("NOTICE", "CLOSED"):
+                    logger.debug("Nostr: draining pre-auth %s from %s: %s",
+                                 drain_type, relay_url, str(drain_msg)[:100])
+                else:
+                    logger.debug("Nostr: draining unexpected msg from %s: %s",
+                                 relay_url, str(drain_msg)[:100])
+            except asyncio.TimeoutError:
+                break
+
+        if not got_ok:
+            logger.warning("Nostr: no OK confirmation for NIP-42 auth on %s",
+                           relay_url)
+            return False
+
+        # Now send REQ subscription — we're authenticated
+        req = json.dumps([
+            "REQ",
+            self._sub_id,
+            {"kinds": [9], "#h": self.groups},
+        ])
+        await ws.send(req)
+
+        return True
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -213,19 +311,19 @@ class NostrAdapter(BasePlatformAdapter):
                     websockets.connect(relay_url, ping_interval=30, ping_timeout=10),
                     timeout=10,
                 )
-                self._ws[relay_url] = ws
-                connected += 1
                 logger.info("Nostr: connected to %s", relay_url)
 
-                # Send REQ subscription for kind 9 events with h tag filters
-                req = json.dumps([
-                    "REQ",
-                    self._sub_id,
-                    {"kinds": [9], "#h": self.groups},
-                ])
-                await ws.send(req)
-                logger.info("Nostr: subscribed to kind 9 on %s for groups %s",
-                            relay_url, self.groups)
+                # Perform NIP-42 auth if required, then subscribe
+                authenticated = await self._do_nip42_auth(ws, relay_url)
+                if not authenticated:
+                    logger.warning("Nostr: NIP-42 auth failed for %s", relay_url)
+                    await ws.close()
+                    self._ws.pop(relay_url, None)
+                    continue
+
+                self._ws[relay_url] = ws
+                connected += 1
+                logger.info("Nostr: authenticated and subscribed on %s", relay_url)
             except Exception as e:
                 logger.warning("Nostr: failed to connect to %s: %s", relay_url, e)
 
@@ -321,6 +419,28 @@ class NostrAdapter(BasePlatformAdapter):
             notice = msg[1] if len(msg) > 1 else ""
             logger.info("Nostr: NOTICE from %s: %s", relay_url, notice)
 
+        elif msg_type == "AUTH":
+            # Relay requests auth during the session (e.g. after publishing)
+            challenge = msg[1] if len(msg) > 1 else ""
+            if challenge and self._privkey:
+                logger.info("Nostr: AUTH challenge during session from %s",
+                            relay_url)
+                auth_tags = [
+                    ["relay", relay_url],
+                    ["challenge", challenge],
+                ]
+                auth_event = _build_event(self._privkey, 22242, auth_tags, "")
+                ws = self._ws.get(relay_url)
+                if ws:
+                    try:
+                        await ws.send(json.dumps(["AUTH", auth_event]))
+                    except Exception as e:
+                        logger.warning("Nostr: failed to send AUTH to %s: %s",
+                                       relay_url, e)
+            elif challenge and not self._privkey:
+                logger.warning("Nostr: AUTH challenge from %s but no private key loaded — cannot authenticate",
+                               relay_url)
+
     async def _process_event(self, event: dict, relay_url: str):
         """Process a kind 9 chat event."""
         event_id = event.get("id", "")
@@ -408,15 +528,17 @@ class NostrAdapter(BasePlatformAdapter):
                         websockets.connect(relay_url, ping_interval=30, ping_timeout=10),
                         timeout=10,
                     )
-                    self._ws[relay_url] = ws
 
-                    # Re-subscribe
-                    req = json.dumps([
-                        "REQ",
-                        self._sub_id,
-                        {"kinds": [9], "#h": self.groups},
-                    ])
-                    await ws.send(req)
+                    # Re-auth and re-subscribe
+                    authenticated = await self._do_nip42_auth(ws, relay_url)
+                    if not authenticated:
+                        logger.warning("Nostr: NIP-42 auth failed on reconnect to %s",
+                                       relay_url)
+                        await ws.close()
+                        self._ws.pop(relay_url, None)
+                        continue
+
+                    self._ws[relay_url] = ws
 
                     # Start listener
                     task = asyncio.create_task(self._relay_listener(relay_url))
