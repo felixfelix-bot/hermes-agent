@@ -100,6 +100,40 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
 
 
 # ---------------------------------------------------------------------------
+# Tasks created directly in blocked (--initial-status blocked) are sticky too
+# ---------------------------------------------------------------------------
+
+
+def test_created_blocked_task_is_sticky_across_recompute_ready(
+    kanban_home: Path,
+) -> None:
+    """A task created with ``--initial-status blocked`` (parked directly
+    for human-ops review) must stay blocked across dispatcher ticks.
+
+    ``create_task(initial_status="blocked")`` used to set the status
+    column without emitting a ``blocked`` event, so ``_has_sticky_block``
+    saw nothing and ``recompute_ready`` auto-promoted the parked task on
+    the very next tick — spawning workers on a task no human had
+    reviewed yet (bitblik-trust-demo incident).  The sticky state must
+    clear only via an explicit ``kanban_unblock``."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="parked for human ops", initial_status="blocked"
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # The dispatcher's promotion pass must leave it alone.
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "created-as-blocked task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "blocked"
+
+        # Explicit unblock is the (only) way out of the sticky state.
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+# ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
 
