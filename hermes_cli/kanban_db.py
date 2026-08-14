@@ -3308,6 +3308,16 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # A task parked directly in ``blocked`` at creation is a
+                # deliberate human-ops handoff: emit the ``blocked`` event
+                # (same style as ``block_task``) so ``_has_sticky_block``
+                # sees it and ``recompute_ready`` won't auto-promote it on
+                # the next dispatch tick. Must run after the INSERT above
+                # (task_events.task_id is FK-checked with foreign_keys=ON).
+                if initial_status == "blocked":
+                    _append_event(
+                        conn, task_id, "blocked", {"reason": "initial-status"}
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
