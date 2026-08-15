@@ -167,6 +167,14 @@ class NostrAdapter(BasePlatformAdapter):
         self._seen_ids: Set[str] = set()
         self._max_seen = 5000
 
+        # Pending publish confirmations: event_id -> {relay_url: Future[(ok, reason)]}
+        # Relays acknowledge every EVENT with ["OK", event_id, accepted, reason]
+        # (NIP-01). The frames arrive on the listener task; the OK handler in
+        # _handle_relay_message resolves the matching future so send() can
+        # await relay acknowledgement instead of fire-and-forget.
+        self._pending_oks: Dict[str, Dict[str, asyncio.Future]] = {}
+        self._ok_timeout: float = float(extra.get("ok_timeout", 10.0))
+
         logger.info("Nostr adapter initialized: relays=%s groups=%s",
                      self.relays, self.groups)
 
@@ -185,6 +193,114 @@ class NostrAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Nostr: failed to load nsec: %s", e)
             return False
+
+    async def _do_nip42_auth(self, ws, relay_url: str) -> bool:
+        """Perform NIP-42 AUTH challenge-response if the relay requests it.
+
+        Some relays (e.g. Buzz) require NIP-42 authentication before accepting
+        REQ subscriptions or EVENT publishes. The relay sends an AUTH challenge
+        immediately on WebSocket connection. This reads the first message,
+        responds with a signed kind 22242 event if needed, then subscribes.
+
+        Returns True if auth succeeded or was not needed, False on failure.
+        """
+        # Read the first message — could be AUTH challenge or EOSE/EVENT.
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            msg = json.loads(raw)
+        except asyncio.TimeoutError:
+            # Relay said nothing on connect: no AUTH challenge required.
+            # Treat as unauthenticated relay and subscribe directly.
+            logger.debug("Nostr: %s sent no AUTH challenge — subscribing without auth",
+                         relay_url)
+            await ws.send(json.dumps([
+                "REQ",
+                self._sub_id,
+                {"kinds": [9], "#h": self.groups},
+            ]))
+            return True
+        except Exception as e:
+            logger.warning("Nostr: connection to %s failed during auth probe: %s",
+                           relay_url, e)
+            return False
+
+        msg_type = msg[0] if isinstance(msg, list) and msg else ""
+
+        if msg_type != "AUTH":
+            # No auth required — relay responded with EOSE/EVENT/etc.
+            logger.debug("Nostr: %s does not require NIP-42 auth (got %s)",
+                         relay_url, msg_type)
+            # Process the initial message if it's an event
+            if msg_type in ("EVENT", "EOSE"):
+                await self._handle_relay_message(msg, relay_url)
+            # Now send REQ subscription
+            req = json.dumps([
+                "REQ",
+                self._sub_id,
+                {"kinds": [9], "#h": self.groups},
+            ])
+            await ws.send(req)
+            return True
+
+        # We got an AUTH challenge
+        challenge = msg[1] if len(msg) > 1 else ""
+        if not challenge:
+            logger.error("Nostr: AUTH challenge from %s has no challenge string",
+                         relay_url)
+            return False
+
+        if not self._privkey:
+            logger.error("Nostr: cannot respond to AUTH challenge from %s — no private key loaded",
+                         relay_url)
+            return False
+
+        logger.info("Nostr: received NIP-42 AUTH challenge from %s", relay_url)
+
+        # Build kind 22242 auth event
+        auth_tags = [
+            ["relay", relay_url],
+            ["challenge", challenge],
+        ]
+        auth_event = _build_event(self._privkey, 22242, auth_tags, "")
+
+        # Send AUTH response
+        await ws.send(json.dumps(["AUTH", auth_event]))
+
+        # Drain messages until we get OK for our AUTH event
+        # (relay may have queued NOTICE/CLOSED from before auth)
+        got_ok = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2)
+                drain_msg = json.loads(raw)
+                drain_type = drain_msg[0] if isinstance(drain_msg, list) else ""
+                if drain_type == "OK" and len(drain_msg) >= 3 and drain_msg[2] is True:
+                    logger.info("Nostr: NIP-42 auth successful for %s", relay_url)
+                    got_ok = True
+                    break
+                elif drain_type in ("NOTICE", "CLOSED"):
+                    logger.debug("Nostr: draining pre-auth %s from %s: %s",
+                                 drain_type, relay_url, str(drain_msg)[:100])
+                else:
+                    logger.debug("Nostr: draining unexpected msg from %s: %s",
+                                 relay_url, str(drain_msg)[:100])
+            except asyncio.TimeoutError:
+                break
+
+        if not got_ok:
+            logger.warning("Nostr: no OK confirmation for NIP-42 auth on %s",
+                           relay_url)
+
+        # Now send REQ subscription — we're authenticated
+        req = json.dumps([
+            "REQ",
+            self._sub_id,
+            {"kinds": [9], "#h": self.groups},
+        ])
+        await ws.send(req)
+
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -213,19 +329,18 @@ class NostrAdapter(BasePlatformAdapter):
                     websockets.connect(relay_url, ping_interval=30, ping_timeout=10),
                     timeout=10,
                 )
-                self._ws[relay_url] = ws
-                connected += 1
                 logger.info("Nostr: connected to %s", relay_url)
 
-                # Send REQ subscription for kind 9 events with h tag filters
-                req = json.dumps([
-                    "REQ",
-                    self._sub_id,
-                    {"kinds": [9], "#h": self.groups},
-                ])
-                await ws.send(req)
-                logger.info("Nostr: subscribed to kind 9 on %s for groups %s",
-                            relay_url, self.groups)
+                # Perform NIP-42 auth if required, then subscribe
+                authenticated = await self._do_nip42_auth(ws, relay_url)
+                if not authenticated:
+                    logger.warning("Nostr: NIP-42 auth failed for %s", relay_url)
+                    await ws.close()
+                    self._ws.pop(relay_url, None)
+                    continue
+
+                self._ws[relay_url] = ws
+                connected += 1
             except Exception as e:
                 logger.warning("Nostr: failed to connect to %s: %s", relay_url, e)
 
@@ -298,6 +413,8 @@ class NostrAdapter(BasePlatformAdapter):
                 logger.warning("Nostr: listener for %s disconnected: %s", relay_url, e)
                 # Remove dead connection
                 self._ws.pop(relay_url, None)
+                self._fail_pending_oks(
+                    relay_url, RuntimeError(f"relay connection lost: {e}"))
 
     async def _handle_relay_message(self, msg: list, relay_url: str):
         """Handle a message from the relay."""
@@ -320,6 +437,49 @@ class NostrAdapter(BasePlatformAdapter):
         elif msg_type == "NOTICE":
             notice = msg[1] if len(msg) > 1 else ""
             logger.info("Nostr: NOTICE from %s: %s", relay_url, notice)
+
+        elif msg_type == "OK":
+            # ["OK", event_id, accepted, message] — relay acknowledgement for
+            # a published EVENT (or AUTH) frame. Correlate with pending sends;
+            # log unsolicited rejections (e.g. AUTH events) for visibility.
+            if len(msg) < 3:
+                return
+            event_id = msg[1] if isinstance(msg[1], str) else ""
+            accepted = bool(msg[2])
+            reason = msg[3] if len(msg) > 3 else ""
+            waiters = self._pending_oks.get(event_id)
+            fut = None
+            if waiters is not None:
+                fut = waiters.pop(relay_url, None)
+                if not waiters:
+                    self._pending_oks.pop(event_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result((accepted, reason))
+            elif not accepted:
+                logger.warning("Nostr: %s rejected event %s: %s",
+                               relay_url, str(event_id)[:12], reason)
+            else:
+                logger.debug("Nostr: %s accepted event %s (no pending send)",
+                             relay_url, str(event_id)[:12])
+
+        elif msg_type == "AUTH":
+            # Relay requests auth during the session (e.g. after publishing)
+            challenge = msg[1] if len(msg) > 1 else ""
+            if challenge and self._privkey:
+                logger.info("Nostr: AUTH challenge during session from %s",
+                            relay_url)
+                auth_tags = [
+                    ["relay", relay_url],
+                    ["challenge", challenge],
+                ]
+                auth_event = _build_event(self._privkey, 22242, auth_tags, "")
+                ws = self._ws.get(relay_url)
+                if ws:
+                    try:
+                        await ws.send(json.dumps(["AUTH", auth_event]))
+                    except Exception as e:
+                        logger.warning("Nostr: failed to send AUTH to %s: %s",
+                                       relay_url, e)
 
     async def _process_event(self, event: dict, relay_url: str):
         """Process a kind 9 chat event."""
@@ -408,15 +568,17 @@ class NostrAdapter(BasePlatformAdapter):
                         websockets.connect(relay_url, ping_interval=30, ping_timeout=10),
                         timeout=10,
                     )
-                    self._ws[relay_url] = ws
 
-                    # Re-subscribe
-                    req = json.dumps([
-                        "REQ",
-                        self._sub_id,
-                        {"kinds": [9], "#h": self.groups},
-                    ])
-                    await ws.send(req)
+                    # Re-auth and re-subscribe
+                    authenticated = await self._do_nip42_auth(ws, relay_url)
+                    if not authenticated:
+                        logger.warning("Nostr: NIP-42 auth failed on reconnect to %s",
+                                       relay_url)
+                        await ws.close()
+                        self._ws.pop(relay_url, None)
+                        continue
+
+                    self._ws[relay_url] = ws
 
                     # Start listener
                     task = asyncio.create_task(self._relay_listener(relay_url))
@@ -433,44 +595,139 @@ class NostrAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str,
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send a message by publishing a kind 9 event to all relays."""
+        """Send a message by publishing a kind 9 event to all relays.
+
+        Each EVENT is acknowledged by the relay with an OK message (NIP-01).
+        We wait for that acknowledgement: success is reported only when at
+        least one relay accepted the event. Rejections (e.g. NIP-42
+        auth-required) are logged with the relay's reason and surfaced in
+        the SendResult instead of being silently dropped.
+        """
         if not self._privkey:
             return SendResult(success=False, error="Nostr: no private key loaded")
 
         if not self._ws:
-            return SendResult(success=False, error="Nostr: no relay connections")
+            return SendResult(success=False, error="Nostr: no relay connections",
+                              retryable=True)
 
         # Build and sign the event
         tags = [["h", chat_id]]
         event = _build_event(self._privkey, 9, tags, content)
+        msg = json.dumps(["EVENT", event])
 
-        # Publish to all connected relays
-        published = 0
-        errors = []
+        # Publish to all connected relays, awaiting each relay's OK
+        outcomes: Dict[str, Dict[str, Any]] = {}
         for relay_url, ws in list(self._ws.items()):
-            try:
-                msg = json.dumps(["EVENT", event])
-                await ws.send(msg)
-                published += 1
-            except Exception as e:
-                errors.append(f"{relay_url}: {e}")
-                logger.warning("Nostr: failed to send to %s: %s", relay_url, e)
+            accepted, reason = await self._publish_to_relay(
+                relay_url, ws, event, msg)
+            outcomes[relay_url] = {"ok": accepted, "reason": reason}
 
-        if published == 0:
+        published = [url for url, res in outcomes.items() if res["ok"]]
+        failures = {url: res["reason"] for url, res in outcomes.items()
+                    if not res["ok"]}
+
+        if not published:
             return SendResult(
                 success=False,
-                error=f"Nostr: failed to publish to any relay: {'; '.join(errors)}",
+                error=f"Nostr: no relay accepted event: {failures}",
                 retryable=True,
+                raw_response={"outcomes": outcomes},
             )
 
-        logger.info("Nostr: sent message to group %s (%d/%d relays): %s",
-                     chat_id, published, len(self.relays), content[:80])
+        logger.info("Nostr: sent message to group %s (%d/%d relays accepted): %s",
+                    chat_id, len(published), len(outcomes), content[:80])
 
         return SendResult(
             success=True,
             message_id=event["id"],
-            raw_response={"published": published, "total": len(self.relays)},
+            raw_response={"accepted_by": published, "outcomes": outcomes},
         )
+
+    async def _publish_to_relay(self, relay_url: str, ws,
+                                event: Dict[str, Any], msg: str) -> tuple:
+        """Publish one EVENT frame to one relay and await its OK.
+
+        Returns (accepted, reason). On auth-required rejections the publish
+        is retried once — by the time we see the rejection, the listener's
+        AUTH handler has already answered the relay's challenge. Suspect
+        connections (send failure, no acknowledgement) are dropped so the
+        reconnect watcher can re-establish them.
+        """
+        try:
+            accepted, reason = await self._publish_and_wait(relay_url, ws, event, msg)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Nostr: %s did not acknowledge event %s within %.1fs — dropping connection",
+                relay_url, str(event["id"])[:12], self._ok_timeout)
+            await self._drop_relay(relay_url, ws)
+            return (False, f"timeout: no OK from {relay_url}")
+        except Exception as e:
+            logger.warning("Nostr: failed to send to %s: %s", relay_url, e)
+            await self._drop_relay(relay_url, ws)
+            return (False, f"{relay_url}: {e}")
+
+        if not accepted and "auth" in str(reason).lower():
+            logger.warning(
+                "Nostr: %s rejected event %s (%s) — re-authenticating and retrying once",
+                relay_url, str(event["id"])[:12], reason)
+            await asyncio.sleep(0.5)  # let the AUTH response settle
+            try:
+                accepted, reason = await self._publish_and_wait(relay_url, ws, event, msg)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Nostr: %s did not acknowledge retried event %s — dropping connection",
+                    relay_url, str(event["id"])[:12])
+                await self._drop_relay(relay_url, ws)
+                return (False, f"timeout on auth retry: {relay_url}")
+            except Exception as e:
+                logger.warning("Nostr: auth retry to %s failed: %s", relay_url, e)
+                await self._drop_relay(relay_url, ws)
+                return (False, f"{relay_url} auth retry: {e}")
+
+        if not accepted:
+            logger.error("Nostr: %s rejected event %s: %s",
+                         relay_url, str(event["id"])[:12], reason)
+        return (accepted, reason)
+
+    async def _publish_and_wait(self, relay_url: str, ws,
+                                event: Dict[str, Any], msg: str) -> tuple:
+        """Send an EVENT frame and wait for the relay's OK acknowledgement.
+
+        Registers a future in _pending_oks keyed by (event_id, relay_url);
+        the OK handler on the listener task resolves it. Returns
+        (accepted, reason); raises asyncio.TimeoutError if the relay stays
+        silent past ok_timeout.
+        """
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        event_id = event["id"]
+        waiters = self._pending_oks.setdefault(event_id, {})
+        waiters[relay_url] = fut
+        try:
+            await ws.send(msg)
+            return await asyncio.wait_for(fut, self._ok_timeout)
+        finally:
+            waiters.pop(relay_url, None)
+            if not waiters:
+                self._pending_oks.pop(event_id, None)
+
+    async def _drop_relay(self, relay_url: str, ws) -> None:
+        """Close a suspect connection; the reconnect watcher re-establishes it."""
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        if self._ws.get(relay_url) is ws:
+            self._ws.pop(relay_url, None)
+        self._fail_pending_oks(relay_url, RuntimeError("connection dropped"))
+
+    def _fail_pending_oks(self, relay_url: str, exc: Exception) -> None:
+        """Fail all pending publish confirmations for a relay."""
+        for event_id, waiters in list(self._pending_oks.items()):
+            fut = waiters.pop(relay_url, None)
+            if fut is not None and not fut.done():
+                fut.set_exception(exc)
+            if not waiters:
+                self._pending_oks.pop(event_id, None)
 
     # ------------------------------------------------------------------
     # Health
