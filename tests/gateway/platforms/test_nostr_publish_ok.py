@@ -7,6 +7,7 @@ once on auth-required rejections (NIP-42).
 """
 
 import asyncio
+import hashlib
 import json
 from unittest import mock
 
@@ -241,3 +242,35 @@ def test_fail_pending_oks_fails_waiters():
     assert fut.done()
     assert isinstance(fut.exception(), RuntimeError)
     assert not a._pending_oks
+
+
+def test_event_id_hashes_raw_utf8_not_ascii_escapes():
+    """NIP-01: the ID hashes compact JSON over raw UTF-8 text.
+
+    Regression guard for relays rejecting publishes with
+    "invalid event id" when content contains non-ASCII (e.g. emoji).
+    The expected digest is built WITHOUT json.dumps: the canonical
+    string is assembled by hand from its parts.
+    """
+    pubkey = "ab" * 32
+    created_at = 1700000000
+    kind = 9
+    tags = [["h", "grp"]]
+    content = "héllo 😀 \"quoted\""
+    canonical = (
+        f'[0,"{pubkey}",{created_at},{kind},'
+        '[["h","grp"]],"héllo 😀 \\"quoted\\""]'
+    )
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    got = nostr_mod._compute_event_id(pubkey, created_at, kind, tags, content)
+    assert got == expected
+
+    ascii_content = "plain ascii"
+    canonical_ascii = (
+        f'[0,"{pubkey}",{created_at},{kind},'
+        '[["h","grp"]],"plain ascii"]'
+    )
+    assert nostr_mod._compute_event_id(
+        pubkey, created_at, kind, tags, ascii_content) == (
+        hashlib.sha256(canonical_ascii.encode("utf-8")).hexdigest())

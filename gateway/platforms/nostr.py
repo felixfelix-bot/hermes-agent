@@ -82,10 +82,16 @@ def _pubkey_from_privkey(privkey: bytes) -> str:
 
 def _compute_event_id(pubkey: str, created_at: int, kind: int,
                       tags: List, content: str) -> str:
-    """Compute Nostr event ID = sha256 of canonical JSON array."""
+    """Compute Nostr event ID = sha256 of canonical JSON array.
+
+    NIP-01 canonical form is compact JSON over the raw UTF-8 text:
+    ensure_ascii MUST be False, otherwise non-ASCII content (emoji,
+    etc.) is escaped as \\uXXXX before hashing and relays reject the
+    event with "invalid event id".
+    """
     canonical = json.dumps([0, pubkey, created_at, kind, tags, content],
-                           separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest()
+                           separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _sign_event_id(privkey: bytes, event_id: str) -> str:
