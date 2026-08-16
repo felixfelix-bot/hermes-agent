@@ -185,6 +185,77 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     )
 
 
+def _resolve_effective_default_assignee() -> "tuple[Optional[str], int]":
+    """Resolve ``(kanban.default_assignee, dispatch_interval_seconds)``.
+
+    Reads the same profile-scoped config, with the same normalization, that
+    the gateway-embedded dispatcher reads at boot (gateway/kanban_watchers.py:
+    ``default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None``) —
+    so the CLI create-time warning and the dispatcher agree on the value the
+    operator will actually see applied. Profile scoping matters: a gateway
+    running under profile P reads ``profiles/P/config.yaml``, not the root
+    config; the CLI runs under the same active profile and ``load_config()``
+    resolves the same file.
+
+    Fail-open: on any config error return ``(None, 60)`` — the create-time
+    warning degrades to the idle note instead of blocking card creation.
+    The dispatcher log remains the source of truth.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        try:
+            interval = int(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        except (TypeError, ValueError):
+            interval = 60
+        return default_assignee, interval
+    except Exception:
+        return None, 60
+
+
+def _warn_unassigned_ready(task_id: str) -> None:
+    """stderr note when a ``ready`` card is created without an assignee.
+
+    Two cases, mirroring ``dispatch_once``'s unassigned-ready branch:
+
+    - ``kanban.default_assignee`` set: warn that the dispatcher will
+      auto-assign + spawn the card on its next tick (#27145) — the operator
+      who intended "unassigned = won't dispatch" (manager gates, human
+      reviews) finds out at creation time, not after a worker spawns.
+    - unset: the card is skipped every tick (``skipped_unassigned``); say so
+      and point at the two ways to make it dispatchable.
+
+    stderr-only so stdout (and ``--json``) stays machine-parseable.
+    """
+    default_assignee, interval = _resolve_effective_default_assignee()
+    if default_assignee:
+        print(
+            f"\n⚠  Card created unassigned, but kanban.default_assignee="
+            f"'{default_assignee}' is set for this profile — the dispatcher "
+            f"will\n"
+            f"   auto-assign this card to '{default_assignee}' and spawn a "
+            f"worker on the next tick (~{interval}s).\n"
+            f"     Hold it for a human/manager gate: hermes kanban create ... "
+            f"--initial-status blocked\n"
+            f"       (already created? hermes kanban block {task_id})\n"
+            f"     Route it deliberately:      hermes kanban create ... "
+            f"--assignee <profile>\n"
+            f"     Stop auto-assignment:       unset kanban.default_assignee "
+            f"in this profile's config.yaml",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"\n⚠  Card created unassigned — it will NOT be dispatched "
+            f"(kanban.default_assignee is not set).\n"
+            f"   Assign it with `hermes kanban assign {task_id} <profile>` "
+            f"or `hermes kanban claim {task_id}` when ready.",
+            file=sys.stderr,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
@@ -1358,12 +1429,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # expected to sit idle until promoted, and unassigned tasks
         # can't be dispatched. Skipped in --json mode so the stdout
         # stream stays strictly machine-parseable for callers (the JSON
-        # response itself carries enough info for them to decide if
-        # they want to check dispatcher presence separately).
+        # response itself carries enough info for them to decide if they
+        # want to check dispatcher presence separately).
         if task.status == "ready" and task.assignee:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+
+        # Dispatch transparency for the complementary case: an UNASSIGNED
+        # ready card. kanban.default_assignee (#27145) lets the dispatcher's
+        # config silently re-route such cards to a fallback profile on the
+        # next tick — surface that at creation time so operators who intend
+        # "unassigned = won't dispatch" (manager gates, human reviews) find
+        # out now, not after a worker spawns. Also skipped in --json mode.
+        if task.status == "ready" and task.assignee is None:
+            _warn_unassigned_ready(task_id)
     return 0
 
 
