@@ -16,8 +16,14 @@ These tests pin the create-time contracts:
 
 2. **Warning when default_assignee is set.** With the config set, the
    same create prints a stderr warning naming the fallback profile and
-   recommending ``--initial-status blocked`` for gate-style cards.
-   ``--json`` output stays silent on stderr.
+   recommending ``--hold`` for gate-style cards. ``--json`` output
+   stays silent on stderr.
+
+3. **``--hold`` alias.** ``--hold`` parks the card sticky-blocked at
+   creation with blocked-event reason 'held' (vs 'initial-status' for
+   the explicit long form); a plain ``--initial-status running`` must
+   still create a normal ready card; contradicting flags are a usage
+   error (exit 2).
 """
 
 from __future__ import annotations
@@ -139,8 +145,8 @@ def test_unassigned_create_warns_when_default_assignee_set(
     assert "worker-x" in err, (
         f"warning must name the fallback profile, got stderr={err!r}"
     )
-    assert "--initial-status blocked" in err, (
-        f"warning must recommend --initial-status blocked, got stderr={err!r}"
+    assert "--hold" in err, (
+        f"warning must recommend --hold, got stderr={err!r}"
     )
     tid = _task_id_from_stdout(out)
 
@@ -203,3 +209,86 @@ def test_blocked_create_gets_no_default_assignee_warning(kanban_home):
     rc, out, err = _run_create(["--initial-status", "blocked"])
     assert rc == 0, f"create failed: {err}"
     assert "default_assignee" not in err, f"unexpected warning: {err!r}"
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — --hold alias (Fix B)
+# ---------------------------------------------------------------------------
+
+
+def _blocked_events(tid: str) -> list[dict]:
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (tid,),
+        ).fetchall()
+    return [json.loads(r["payload"]) for r in rows]
+
+
+def test_hold_creates_sticky_blocked_with_held_reason(kanban_home):
+    _write_profile_config(kanban_home, {"default_assignee": "worker-x"})
+    rc, out, err = _run_create(["--hold"])
+    assert rc == 0, f"create failed: {err}"
+    tid = _task_id_from_stdout(out)
+
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["status"] == "blocked"
+    assert row["assignee"] is None
+    evs = _blocked_events(tid)
+    assert len(evs) == 1
+    assert evs[0]["reason"] == "held"
+
+    # A held card is invisible to the dispatcher even with default_assignee
+    # set — the whole point of the alias.
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False,
+            default_assignee="worker-x",
+        )
+    assert res.auto_assigned_default == []
+    assert not res.spawned
+    assert res.skipped_unassigned == []
+
+
+def test_explicit_initial_status_blocked_reason_is_initial_status(kanban_home):
+    """The long form keeps its generic 'initial-status' reason — only
+    --hold records 'held'."""
+    rc, out, err = _run_create(["--initial-status", "blocked"])
+    assert rc == 0, f"create failed: {err}"
+    tid = _task_id_from_stdout(out)
+    evs = _blocked_events(tid)
+    assert len(evs) == 1
+    assert evs[0]["reason"] == "initial-status"
+
+
+def test_hold_conflicts_with_explicit_initial_status(kanban_home):
+    rc, out, err = _run_create(["--hold", "--initial-status", "running"])
+    assert rc == 2, f"contradictory flags must exit 2, got {rc}; err={err!r}"
+    assert "--hold" in err
+
+
+def test_hold_plus_initial_status_blocked_is_accepted(kanban_home):
+    """--hold --initial-status blocked is redundant but not contradictory."""
+    rc, out, err = _run_create(["--hold", "--initial-status", "blocked"])
+    assert rc == 0, f"create failed: {err}"
+    tid = _task_id_from_stdout(out)
+    evs = _blocked_events(tid)
+    assert len(evs) == 1
+    assert evs[0]["reason"] == "held"
+
+
+def test_explicit_initial_status_running_still_makes_ready(kanban_home):
+    """Regression: argparse default is now None so 'not given' and an
+    explicit 'running' can be told apart; the explicit form must still
+    create a normal ready card."""
+    rc, out, err = _run_create(["--initial-status", "running"])
+    assert rc == 0, f"create failed: {err}"
+    tid = _task_id_from_stdout(out)
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["status"] == "ready"

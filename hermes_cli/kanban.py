@@ -237,8 +237,7 @@ def _warn_unassigned_ready(task_id: str) -> None:
             f"will\n"
             f"   auto-assign this card to '{default_assignee}' and spawn a "
             f"worker on the next tick (~{interval}s).\n"
-            f"     Hold it for a human/manager gate: hermes kanban create ... "
-            f"--initial-status blocked\n"
+            f"     Hold it for a human/manager gate: hermes kanban create ... --hold\n"
             f"       (already created? hermes kanban block {task_id})\n"
             f"     Route it deliberately:      hermes kanban create ... "
             f"--assignee <profile>\n"
@@ -428,10 +427,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Ignored without --goal.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
-                          default="running",
+                          default=None,
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "to skip the brief running-to-blocked transition. "
+                               "Defaults to 'running'.")
+    p_create.add_argument("--hold", action="store_true",
+                          help="Park the card sticky-blocked at creation "
+                               "(alias for --initial-status blocked; the "
+                               "blocked event records reason 'held'). A held "
+                               "card is never dispatched, never auto-assigned "
+                               "by kanban.default_assignee, and never "
+                               "auto-promoted — release it explicitly with "
+                               "`hermes kanban unblock <id>`.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1396,6 +1404,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # --hold is the intent-revealing alias for --initial-status blocked: the
+    # card lands sticky-blocked (never dispatched, never auto-assigned by
+    # kanban.default_assignee, never auto-promoted) until an explicit
+    # `hermes kanban unblock <id>`. Resolve it BEFORE create_task so the
+    # sticky blocked event can carry reason "held" for diagnostic clarity.
+    # argparse's default is None (not "running") so an explicit
+    # --initial-status running can be told apart from "not given": only an
+    # EXPLICIT non-blocked value contradicts --hold (and is a usage error).
+    raw_initial_status = getattr(args, "initial_status", None)
+    if getattr(args, "hold", False):
+        if raw_initial_status not in (None, "blocked"):
+            print(
+                f"kanban: --hold parks the card blocked, but "
+                f"--initial-status {raw_initial_status} says otherwise — pick one",
+                file=sys.stderr,
+            )
+            return 2
+        initial_status = "blocked"
+        blocked_reason: Optional[str] = "held"
+    else:
+        initial_status = raw_initial_status or "running"
+        blocked_reason = None
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1416,7 +1446,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            blocked_reason=blocked_reason,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

@@ -2150,6 +2150,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    blocked_reason: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
@@ -2366,9 +2367,15 @@ def create_task(
                 # sees it and ``recompute_ready`` won't auto-promote it on
                 # the next dispatch tick. Must run after the INSERT above
                 # (task_events.task_id is FK-checked with foreign_keys=ON).
+                # ``blocked_reason`` lets intent-specific callers (the CLI's
+                # ``--hold`` alias) distinguish themselves from a plain
+                # ``--initial-status blocked`` in the event trail.
                 if initial_status == "blocked":
                     _append_event(
-                        conn, task_id, "blocked", {"reason": "initial-status"}
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": blocked_reason or "initial-status"},
                     )
             return task_id
         except sqlite3.IntegrityError:
