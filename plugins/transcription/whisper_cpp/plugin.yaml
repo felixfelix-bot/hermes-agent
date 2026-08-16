@@ -1,0 +1,5 @@
+name: whisper_cpp
+version: 1.0.0
+description: "Local whisper.cpp (whisper-cli) transcription backend for the audio bridge — audio never leaves the host. Selected via transcription.provider: whisper_cpp; ggml model path via transcription.whisper_model (default /opt/whisper/ggml-base.bin, must be provisioned separately)."
+author: NousResearch
+kind: backend

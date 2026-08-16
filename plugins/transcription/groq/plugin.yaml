@@ -1,0 +1,5 @@
+name: groq
+version: 1.0.0
+description: "Groq Whisper large-v3 REST transcription backend for the audio bridge. Registers as 'groq_bridge' ('groq' is a reserved built-in name). Selected via transcription.provider: groq; API key env var configurable via transcription.api_key_env (default GROQ_API_KEY)."
+author: NousResearch
+kind: backend
