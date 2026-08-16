@@ -9,13 +9,19 @@ Requires: websockets, coincurve (both in the Hermes venv).
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
+import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
+
+import httpx
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -120,6 +126,270 @@ def _build_event(privkey: bytes, kind: int, tags: List, content: str) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Audio-ingest bridge (Blossom media, design AB-2)
+# ---------------------------------------------------------------------------
+
+# Exact reply copy for the soft failure modes (design §F).
+_F1_NO_PROVIDER = (
+    "I received an audio clip but can't transcribe it yet — tell Felix to "
+    "enable transcription."
+)
+_F2_TRANSCRIBE_FAILED = "couldn't transcribe that, try again"
+_F5_FETCH_AUTH = (
+    "I couldn't fetch that audio clip (authentication failed) — my relay "
+    "membership may have lapsed; tell Felix."
+)
+_F6_MISSING = "that audio clip has expired"
+_LONG_CLIP_WARNING = "(warning: long voice note)"
+
+_BLOSSOM_GET_KIND = 24242
+_BLOSSOM_AUTH_TTL_SECONDS = 300
+_DEFAULT_AUDIO_MAX_BYTES = 26_214_400  # 25 MB
+_DEFAULT_AUDIO_MAX_SECONDS = 300.0     # hard cap (design F#4)
+_DEFAULT_AUDIO_SOFT_SECONDS = 600.0    # soft warn (dormant until the hard
+                                       # cap is configured above it)
+
+# Audio extensions the bridge is allowed to fetch (matches the relay's
+# /media/<sha256>.<ext> route).
+_AUDIO_EXTS = frozenset({"mp3", "m4a", "ogg", "opus", "wav", "flac", "aac"})
+
+# Bare-URL fallback: an absolute or relative /media/<64-hex>.<ext> reference.
+# The sha256 is embedded in the path, which is what makes the BUD-11
+# x-scoped auth token possible — so nothing else is detected.
+_AUDIO_MEDIA_URL_RE = re.compile(
+    r"(?:(https?)://([^/\s\"'<>]+))?/media/([0-9a-f]{64})"
+    r"\.(mp3|m4a|ogg|opus|wav|flac|aac)\b",
+    re.IGNORECASE,
+)
+
+# NIP-92 imeta keys we understand (superset check keeps parsing tolerant).
+_IMETA_KEYS = frozenset({
+    "url", "m", "x", "size", "dim", "blurhash", "thumb", "image",
+    "fallback", "duration", "bitrate", "alt", "filename",
+})
+
+_EXT_TO_MIME = {
+    "mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg",
+    "opus": "audio/ogg", "wav": "audio/wav", "flac": "audio/flac",
+    "aac": "audio/aac",
+}
+_MIME_TO_EXT = {
+    "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a",
+    "audio/m4a": "m4a", "audio/x-m4a": "m4a", "audio/aac": "aac",
+    "audio/ogg": "ogg", "audio/opus": "opus", "audio/wav": "wav",
+    "audio/x-wav": "wav", "audio/wave": "wav", "audio/flac": "flac",
+}
+
+
+def _is_sha256_hex(value: str) -> bool:
+    return bool(value) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value.lower())
+
+
+@dataclass
+class AudioAttachment:
+    """A detected audio blob reference on an incoming kind-9 event."""
+
+    url: str                # absolute https URL to fetch
+    sha256: str             # 64-hex blob hash (BUD-11 x tag)
+    mime: str               # audio/* mime
+    ext: str                # file extension without dot
+    size: Optional[int] = None       # bytes, from imeta (absent on regex path)
+    duration: Optional[float] = None  # seconds, from imeta
+    bitrate: Optional[int] = None
+    filename: Optional[str] = None
+
+
+def _parse_imeta_pairs(payload: str) -> Dict[str, str]:
+    """Parse an NIP-92 ``imeta`` payload into key -> value pairs.
+
+    The payload is a space-separated list of key/value pairs. Unknown
+    leading tokens are skipped rather than desyncing the pairing, and a
+    duplicate key keeps its last occurrence.
+    """
+    tokens = payload.split()
+    pairs: Dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        key = tokens[i]
+        if key in _IMETA_KEYS and i + 1 < len(tokens):
+            pairs[key] = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+    return pairs
+
+
+def _attachment_from_imeta(payload: str) -> Optional[AudioAttachment]:
+    """Build an :class:`AudioAttachment` from one imeta payload.
+
+    Audio only (``m`` must start with ``audio/``); requires a usable
+    ``url`` and a 64-hex ``x``. Anything else returns None (the message
+    passes through untouched — design F#10).
+    """
+    pairs = _parse_imeta_pairs(payload)
+    mime = pairs.get("m", "")
+    if not mime.lower().startswith("audio/"):
+        return None
+    url = pairs.get("url", "")
+    sha = pairs.get("x", "")
+    if not url or not _is_sha256_hex(sha):
+        return None
+
+    ext = ""
+    path = urlsplit(url).path.lower()
+    for candidate in _AUDIO_EXTS:
+        if path.endswith("." + candidate):
+            ext = candidate
+            break
+    if not ext:
+        ext = _MIME_TO_EXT.get(mime.lower().split(";")[0].strip(), "mp3")
+
+    def _to_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return AudioAttachment(
+        url=url,
+        sha256=sha.lower(),
+        mime=mime,
+        ext=ext,
+        size=_to_int(pairs.get("size")),
+        duration=_to_float(pairs.get("duration")),
+        bitrate=_to_int(pairs.get("bitrate")),
+        filename=pairs.get("filename"),
+    )
+
+
+def _parse_imeta_audio_all(tags: List) -> List[AudioAttachment]:
+    """Return every audio attachment declared via imeta tags, in order."""
+    attachments: List[AudioAttachment] = []
+    for tag in tags or []:
+        if (isinstance(tag, (list, tuple)) and len(tag) >= 2
+                and tag[0] == "imeta"):
+            attachment = _attachment_from_imeta(str(tag[1]))
+            if attachment is not None:
+                attachments.append(attachment)
+    return attachments
+
+
+def _parse_imeta_audio(tags: List) -> Optional[AudioAttachment]:
+    """Return the first audio attachment from imeta tags, if any."""
+    attachments = _parse_imeta_audio_all(tags)
+    return attachments[0] if attachments else None
+
+
+def _relay_hosts_and_bases(relays: List[str]) -> Tuple[Set[str], List[str]]:
+    """Derive (https hosts, base URLs) from the configured relay URLs.
+
+    ``wss://relay.example`` yields the host ``relay.example`` and the media
+    base ``https://relay.example``; plain-ws relays map to http. Used to
+    resolve relative ``/media/...`` paths and to enforce the anti-exfil
+    host allowlist on the bare-URL fallback.
+    """
+    hosts: Set[str] = set()
+    bases: List[str] = []
+    for relay in relays or []:
+        parts = urlsplit(relay)
+        if not parts.hostname:
+            continue
+        hosts.add(parts.hostname.lower())
+        scheme = "https" if parts.scheme in ("ws", "wss", "https") else "http"
+        bases.append(f"{scheme}://{parts.netloc}")
+    return hosts, bases
+
+
+def _find_audio_url_in_content(content: str, allowed_hosts: Set[str],
+                               relay_bases: List[str]) -> Optional[AudioAttachment]:
+    """Bare-URL fallback: find a ``/media/<sha256>.<ext>`` audio reference.
+
+    Absolute URLs are only accepted on a configured relay host (anti-exfil:
+    the bot must never fetch an arbitrary host from message text). Relative
+    paths resolve against the first configured relay base.
+    """
+    for match in _AUDIO_MEDIA_URL_RE.finditer(content or ""):
+        scheme, host, sha, ext = match.group(1), match.group(2), \
+            match.group(3), match.group(4)
+        if scheme:
+            if (host or "").lower() not in allowed_hosts:
+                continue
+            url = match.group(0)
+        else:
+            if not relay_bases:
+                continue
+            url = relay_bases[0] + match.group(0)
+        return AudioAttachment(
+            url=url,
+            sha256=sha.lower(),
+            mime=_EXT_TO_MIME.get(ext.lower(), "audio/mpeg"),
+            ext=ext.lower(),
+        )
+    return None
+
+
+def _format_duration(seconds: Optional[float]) -> Optional[str]:
+    """Render seconds as ``M:SS`` (or ``H:MM:SS``); None when unknown."""
+    if seconds is None or seconds < 0:
+        return None
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _build_blossom_get_auth_event(privkey: bytes, sha256_hex: str) -> Dict:
+    """Build a BUD-11 kind-24242 'get' auth event for one blob hash."""
+    tags = [
+        ["t", "get"],
+        ["x", sha256_hex],
+        ["expiration", str(int(time.time()) + _BLOSSOM_AUTH_TTL_SECONDS)],
+    ]
+    return _build_event(privkey, _BLOSSOM_GET_KIND, tags, "get audio")
+
+
+def _blossom_auth_header(auth_event: Dict) -> str:
+    """Encode a signed auth event as an unpadded base64url header value."""
+    raw = json.dumps(auth_event, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"Nostr {encoded}"
+
+
+def _stt_provider_available() -> bool:
+    """Return True when a transcription backend is configured.
+
+    Dispatches through the same provider resolution the STT tool uses
+    (``stt.provider`` in config.yaml, plugin registry included — AB-3).
+    Only consulted when an audio attachment was detected, never on the
+    plain-text hot path.
+    """
+    try:
+        from tools.transcription_tools import _get_provider, _load_stt_config
+        return _get_provider(_load_stt_config()) != "none"
+    except Exception:
+        return False
+
+
+def _transcribe_file(path: str) -> Dict[str, Any]:
+    """Transcribe a local audio file via the configured STT provider.
+
+    Thin module-level indirection so tests (and future provider swaps)
+    can patch one seam instead of the whole STT stack.
+    """
+    from tools.transcription_tools import transcribe_audio
+    return transcribe_audio(path)
+
+
+# ---------------------------------------------------------------------------
 # Requirements check
 # ---------------------------------------------------------------------------
 
@@ -180,6 +450,31 @@ class NostrAdapter(BasePlatformAdapter):
         # await relay acknowledgement instead of fire-and-forget.
         self._pending_oks: Dict[str, Dict[str, asyncio.Future]] = {}
         self._ok_timeout: float = float(extra.get("ok_timeout", 10.0))
+
+        # --- audio-ingest bridge (nostr.audio_ingest, design AB-2) ------
+        # Read ONCE here at adapter init — per-message config reads are
+        # forbidden (prompt-cache rule). Defaults leave the bridge off.
+        self._audio_ingest_enabled = bool(extra.get("audio_ingest", False))
+        try:
+            self._audio_max_bytes = int(
+                extra.get("audio_max_bytes", _DEFAULT_AUDIO_MAX_BYTES))
+        except (TypeError, ValueError):
+            self._audio_max_bytes = _DEFAULT_AUDIO_MAX_BYTES
+        try:
+            self._audio_max_seconds = float(
+                extra.get("audio_max_seconds", _DEFAULT_AUDIO_MAX_SECONDS))
+        except (TypeError, ValueError):
+            self._audio_max_seconds = _DEFAULT_AUDIO_MAX_SECONDS
+        try:
+            self._audio_soft_seconds = float(
+                extra.get("audio_soft_seconds",
+                          _DEFAULT_AUDIO_SOFT_SECONDS))
+        except (TypeError, ValueError):
+            self._audio_soft_seconds = _DEFAULT_AUDIO_SOFT_SECONDS
+        # Anti-exfil allowlist + relative-path resolution targets, derived
+        # from the configured relay URLs (wss://host -> https://host).
+        self._audio_relay_hosts, self._audio_relay_bases = \
+            _relay_hosts_and_bases(self.relays)
 
         logger.info("Nostr adapter initialized: relays=%s groups=%s",
                      self.relays, self.groups)
@@ -522,6 +817,17 @@ class NostrAdapter(BasePlatformAdapter):
         if not content:
             return
 
+        # --- audio-ingest bridge (``nostr.audio_ingest``, default false) ---
+        # A pure content transform BEFORE handle_message: session keying,
+        # system prompt, toolset, and routing are untouched, so an audio
+        # message and a plain-text message from the same sender land on an
+        # identical prompt prefix (prompt-cache rule, design §E).
+        if self._audio_ingest_enabled:
+            content = await self._maybe_extract_audio_attachment(content, tags)
+            if not content:
+                return
+        # -------------------------------------------------------------------
+
         pubkey = event.get("pubkey", "unknown")
         created_at = event.get("created_at", int(time.time()))
 
@@ -549,6 +855,131 @@ class NostrAdapter(BasePlatformAdapter):
 
         # Route to gateway
         await self.handle_message(msg_event)
+
+    # ------------------------------------------------------------------
+    # Audio-ingest bridge (design AB-2)
+    # ------------------------------------------------------------------
+
+    async def _maybe_extract_audio_attachment(self, content: str,
+                                              tags: List) -> str:
+        """Replace voice-note content with its transcript (or a failure note).
+
+        A pure content transform: never raises into ``_process_event`` and
+        never mutates adapter state. All network I/O is the single Blossom
+        GET (NIP-24242 auth); transcription dispatches through
+        ``tools.transcription_tools`` (which consults the plugin
+        transcription registry). Failure modes follow design §F.
+        """
+        prefix = "[voice note]"
+
+        def _reply(text: str) -> str:
+            return f"{prefix} {text}"
+
+        # ---- detection: NIP-92 imeta first, regex fallback second (F#10)
+        attachments = _parse_imeta_audio_all(tags)
+        skipped = max(0, len(attachments) - 1)
+        attachment = attachments[0] if attachments else None
+        if attachment is None:
+            attachment = _find_audio_url_in_content(
+                content, self._audio_relay_hosts, self._audio_relay_bases)
+        if attachment is None:
+            return content  # not an audio message — byte-identical passthrough
+
+        # ---- F#1: no STT provider configured — do not fetch at all
+        if not _stt_provider_available():
+            return _reply(_F1_NO_PROVIDER)
+
+        # ---- F#3: size gate from imeta (skip the fetch entirely)
+        if attachment.size is not None and attachment.size > self._audio_max_bytes:
+            return _reply(
+                f"clip too large — keep voice notes under "
+                f"{self._audio_max_bytes // (1024 * 1024)} MB")
+
+        # ---- F#4: hard duration cap from imeta
+        if attachment.duration is not None and \
+                attachment.duration > self._audio_max_seconds:
+            return _reply(
+                f"clip too long — keep voice notes under "
+                f"{int(self._audio_max_seconds) // 60} minutes")
+        soft_over = (attachment.duration is not None and
+                     attachment.duration > self._audio_soft_seconds)
+
+        # ---- F5 fetch: single GET with BUD-11 x-scoped Blossom auth
+        if not self._privkey:
+            # Keyless adapter cannot sign the kind-24242 GET event.
+            return _reply(_F5_FETCH_AUTH)
+        auth_header = _blossom_auth_header(
+            _build_blossom_get_auth_event(self._privkey, attachment.sha256))
+        try:
+            async with httpx.AsyncClient(timeout=30.0,
+                                         follow_redirects=False) as client:
+                resp = await client.get(
+                    attachment.url, headers={"Authorization": auth_header})
+        except Exception as e:
+            logger.warning("Nostr audio: fetch failed for %s: %s",
+                           attachment.url, e)
+            return _reply(_F2_TRANSCRIBE_FAILED)
+
+        if resp.status_code in (401, 403):
+            return _reply(_F5_FETCH_AUTH)
+        if resp.status_code == 404:
+            return _reply(_F6_MISSING)
+        if resp.status_code != 200:
+            logger.warning("Nostr audio: HTTP %s fetching %s",
+                           resp.status_code, attachment.url)
+            return _reply(_F2_TRANSCRIBE_FAILED)
+
+        # ---- F#3: size gate from Content-Length / actual body
+        try:
+            declared = int(resp.headers.get("content-length", ""))
+        except ValueError:
+            declared = 0
+        if declared > self._audio_max_bytes or \
+                len(resp.content) > self._audio_max_bytes:
+            return _reply(
+                f"clip too large — keep voice notes under "
+                f"{self._audio_max_bytes // (1024 * 1024)} MB")
+
+        # ---- integrity: sha256 must match the imeta ``x`` / URL hash
+        if hashlib.sha256(resp.content).hexdigest() != attachment.sha256:
+            logger.warning("Nostr audio: sha256 mismatch for %s — "
+                           "not transcribing", attachment.url)
+            return _reply(_F2_TRANSCRIBE_FAILED)
+
+        # ---- transcribe via tempfile (0600, unlinked in finally)
+        fd = tempfile.NamedTemporaryFile(
+            prefix="nostr-audio-", suffix=f".{attachment.ext}", delete=False)
+        tmp_path = fd.name
+        try:
+            fd.write(resp.content)
+            fd.close()
+            os.chmod(tmp_path, 0o600)
+            try:
+                result = _transcribe_file(tmp_path)
+            except Exception as e:
+                logger.warning("Nostr audio: transcription raised: %s", e)
+                result = None
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        transcript = ""
+        if isinstance(result, dict) and result.get("success"):
+            transcript = str(result.get("transcript") or "").strip()
+        if not transcript:
+            return _reply(_F2_TRANSCRIBE_FAILED)
+
+        # ---- assemble replacement content (spec §F/#9 note appended)
+        duration = _format_duration(attachment.duration)
+        parts = [f"[voice note, {duration}]"] if duration else [prefix]
+        if soft_over:
+            parts.append(_LONG_CLIP_WARNING)
+        parts.append(transcript)
+        if skipped:
+            parts.append(f"(+{skipped} more clips skipped)")
+        return " ".join(parts)
 
     # ------------------------------------------------------------------
     # Reconnection
