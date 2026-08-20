@@ -3647,7 +3647,10 @@ class TestRunConversation:
             {"role": "assistant", "content": "old answer"},
         ]
 
-        # 6 responses: original + 2 prefill + 3 retries after prefill exhaustion
+        # 6 responses supplied: original + 2 prefill + 3 retries after prefill exhaustion.
+        # Unified empty-recovery budget (max_empty_recovery_total=3, 2026-08-21)
+        # bounds the COMBINED prefill+retry count to 3, so only 1 retry fires
+        # after 2 prefills → 4 calls total (1 + 2 + 1).
         with (
             patch.object(agent, "_interruptible_api_call", side_effect=[empty_resp] * 6),
             patch.object(agent, "_compress_context") as mock_compress,
@@ -3664,7 +3667,8 @@ class TestRunConversation:
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        # Unified budget (3): 1 original + 2 prefills + 1 retry (cap hit) = 4.
+        assert result["api_calls"] == 4
 
     def test_reasoning_only_response_prefill_then_empty(self, agent):
         """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
@@ -3674,7 +3678,9 @@ class TestRunConversation:
             finish_reason="stop",
             reasoning_content="structured reasoning answer",
         )
-        # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
+        # 6 responses supplied: 1 original + 2 prefill + 3 retries after prefill
+        # exhaustion. Unified empty-recovery budget (3) bounds combined
+        # prefill+retry to 3, so only 1 retry fires after 2 prefills → 4 calls.
         agent.client.chat.completions.create.side_effect = [empty_resp] * 6
         with (
             patch.object(agent, "_persist_session"),
@@ -3686,7 +3692,8 @@ class TestRunConversation:
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
-        assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+        # Unified budget (3): 1 original + 2 prefills + 1 retry (cap hit) = 4.
+        assert result["api_calls"] == 4
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""

@@ -4174,11 +4174,22 @@ def run_conversation(
                         and getattr(agent, "_post_tool_nudge_count", 0) < max(
                             getattr(agent, "_max_post_tool_nudges", 2), 0
                         )
+                        # Unified empty-recovery budget (agent.max_empty_
+                        # recovery_total, default 3): shared across nudges +
+                        # bare empty-retries + thinking-prefills so the
+                        # combined full-context resend count per turn is
+                        # bounded regardless of how many fallbacks fire.
+                        and getattr(agent, "_empty_recovery_count", 0) < max(
+                            getattr(agent, "_max_empty_recovery_total", 3), 0
+                        )
                         and not _has_inline_thinking  # thinking model still working — let prefill handle
                     ):
                         agent._post_tool_empty_retried = True
                         agent._post_tool_nudge_count = (
                             getattr(agent, "_post_tool_nudge_count", 0) + 1
+                        )
+                        agent._empty_recovery_count = (
+                            getattr(agent, "_empty_recovery_count", 0) + 1
                         )
                         # Clear stale narration so it doesn't resurface
                         # on a later empty response after the nudge.
@@ -4227,8 +4238,13 @@ def run_conversation(
                         or getattr(assistant_message, "reasoning_details", None)
                         or _has_inline_thinking
                     )
-                    if _has_structured and agent._thinking_prefill_retries < 2:
+                    if _has_structured and agent._thinking_prefill_retries < 2 and getattr(
+                        agent, "_empty_recovery_count", 0
+                    ) < max(getattr(agent, "_max_empty_recovery_total", 3), 0):
                         agent._thinking_prefill_retries += 1
+                        agent._empty_recovery_count = (
+                            getattr(agent, "_empty_recovery_count", 0) + 1
+                        )
                         logger.info(
                             "Thinking-only response (no visible content) — "
                             "prefilling to continue (%d/2)",
@@ -4262,8 +4278,13 @@ def run_conversation(
                         _has_structured
                         and agent._thinking_prefill_retries >= 2
                     )
-                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
+                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3 and getattr(
+                        agent, "_empty_recovery_count", 0
+                    ) < max(getattr(agent, "_max_empty_recovery_total", 3), 0):
                         agent._empty_content_retries += 1
+                        agent._empty_recovery_count = (
+                            getattr(agent, "_empty_recovery_count", 0) + 1
+                        )
                         logger.warning(
                             "Empty response (no content or reasoning) — "
                             "retry %d/3 (model=%s)",
@@ -4293,7 +4314,14 @@ def run_conversation(
                             "switching to fallback provider..."
                         )
                         if agent._try_activate_fallback():
-                            agent._empty_content_retries = 0
+                            # NO reset of _empty_content_retries /
+                            # _empty_recovery_count here (2026-08-21): a flaky
+                            # primary cascading through N fallbacks used to get
+                            # N fresh (3 empty-retries + 2 prefills) budgets =
+                            # ~7N full-context resends per turn. The unified
+                            # _empty_recovery_count carries over so the new
+                            # provider gets only the REMAINDER of the shared
+                            # per-turn budget.
                             agent._buffer_status(
                                 f"↻ Switched to fallback: {agent.model} "
                                 f"({agent.provider})"

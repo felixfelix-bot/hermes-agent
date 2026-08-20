@@ -925,6 +925,18 @@ DEFAULT_CONFIG = {
         # 0 disables nudging entirely; the previous behavior (nudge every
         # tool round, unbounded per turn) is restored by setting this high.
         "max_post_tool_nudges": 2,
+        # Unified per-turn budget across ALL empty-response recovery
+        # ladders (post-tool nudges + bare empty-retries + thinking-
+        # prefills).  Each ladder re-sends the FULL conversation context;
+        # without a shared bound a model that empties on every turn gets
+        # (2 nudges + 3 empty-retries + 2 prefills) × N-fallbacks full-
+        # context resends per turn.  The empty-retry/prefill counters
+        # also reset to 0 on each fallback activation, so a flaky primary
+        # cascading through N fallbacks burned ~7N resends.  This single
+        # counter is the source of truth; the per-ladder counters stay
+        # for telemetry only.  0 disables all empty-recovery → immediate
+        # "(empty)" terminal; default 3 bounds the worst case.
+        "max_empty_recovery_total": 3,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

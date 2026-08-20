@@ -1294,6 +1294,20 @@ def init_agent(
         _max_nudges = 2
     agent._max_post_tool_nudges = _max_nudges
 
+    # Unified per-turn budget across all empty-response recovery ladders
+    # (post-tool nudges + bare empty-retries + thinking-prefills). See
+    # agent.max_empty_recovery_total in config.yaml. The per-ladder
+    # counters (_post_tool_nudge_count, _empty_content_retries,
+    # _thinking_prefill_retries) remain for telemetry; this single
+    # counter is the gate that bounds total full-context resends/turn.
+    try:
+        _raw_max_total = _agent_section.get("max_empty_recovery_total", 3)
+        _max_total = int(_raw_max_total)
+        _max_total = max(_max_total, 0)  # 0 = all recovery disabled
+    except (TypeError, ValueError):
+        _max_total = 3
+    agent._max_empty_recovery_total = _max_total
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

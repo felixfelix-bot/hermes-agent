@@ -160,6 +160,11 @@ def build_turn_context(
     # agent.max_post_tool_nudges) — reset alongside the flag above so the
     # cap bounds nudges per turn, not per conversation.
     agent._post_tool_nudge_count = 0
+    # Unified empty-recovery budget (see agent.max_empty_recovery_total):
+    # one counter shared across nudges + bare empty-retries + thinking-
+    # prefills, NOT reset on fallback activation (a flaky primary
+    # cascading through N fallbacks should not get N fresh budgets).
+    agent._empty_recovery_count = 0
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False

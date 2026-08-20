@@ -139,11 +139,61 @@ def test_nudge_cap_zero_disables_nudging(agent):
 
 
 def test_nudge_cap_configurable(agent):
-    """The cap honors agent._max_post_tool_nudges (from config.yaml)."""
+    """The cap honors agent._max_post_tool_nudges (from config.yaml), bounded
+    by the unified _max_empty_recovery_total budget."""
     agent._max_post_tool_nudges = 5
+    agent._max_empty_recovery_total = 5
     result = _run_alternating(agent)
     assert _count_nudges(result) == 5
     assert result["api_calls"] <= 21
+
+
+def test_unified_budget_bounds_all_ladders(agent):
+    """The unified _max_empty_recovery_total (default 3) is the single source
+    of truth: nudges + bare empty-retries + thinking-prefills together cannot
+    exceed it per turn, even though each ladder has its own (larger) per-
+    ladder counter. With the default 3, the alternating model emits exactly 2
+    nudges (nudge cap) then 1 bare empty-retry (unified cap) then terminates."""
+    assert agent._max_empty_recovery_total == 3
+    result = _run_alternating(agent)
+    # 2 nudges (per-ladder cap) + 1 bare empty-retry (unified cap hit) = 3
+    assert _count_nudges(result) == 2
+    assert agent._empty_recovery_count == 3
+    assert result.get("turn_exit_reason") == "empty_response_exhausted"
+
+
+def test_unified_budget_no_reset_on_fallback(agent):
+    """A flaky primary cascading through fallback providers must NOT get a
+    fresh recovery budget per provider. The _empty_recovery_count carries
+    over, so the combined resend count per turn stays bounded regardless of
+    how many fallbacks fire. Regression for the ~7N-resend burn."""
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        {"provider": "deepinfra", "model": "deepseek-ai/DeepSeek-V4-Pro"},
+    ]
+    agent._fallback_index = 0
+    agent._fallback_activated = False
+    fallback_calls = {"n": 0}
+
+    def _mock_fallback():
+        if agent._fallback_index >= len(agent._fallback_chain):
+            return False
+        agent._fallback_index += 1
+        agent._fallback_activated = True
+        agent.model = agent._fallback_chain[agent._fallback_index - 1]["model"]
+        agent.provider = agent._fallback_chain[agent._fallback_index - 1]["provider"]
+        fallback_calls["n"] += 1
+        return True
+
+    with patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback):
+        result = _run_alternating(agent)
+    # At least one fallback fired (else the test is trivial).
+    assert fallback_calls["n"] >= 1, "fallback should have activated"
+    # Unified budget (3) is shared across ALL providers — NOT reset on
+    # fallback activation. Old code reset _empty_content_retries=0 each
+    # fallback, giving ~7N resends; the unified counter carries over.
+    assert agent._empty_recovery_count <= 3
+    assert result.get("turn_exit_reason") == "empty_response_exhausted"
 
 
 def test_nudge_counter_resets_per_turn(agent):
