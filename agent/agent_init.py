@@ -1280,6 +1280,20 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Per-turn cap on "post-tool empty response" nudge resends.  Each nudge
+    # re-sends the full conversation context; without a bound, a model that
+    # alternates tool-call → empty gets a fresh nudge every tool round (the
+    # _post_tool_empty_retried flag re-arms after each successful tool round)
+    # and can burn the entire iteration budget on full-context resends.
+    # Default 2, overridable via agent.max_post_tool_nudges in config.yaml.
+    try:
+        _raw_max_nudges = _agent_section.get("max_post_tool_nudges", 2)
+        _max_nudges = int(_raw_max_nudges)
+        _max_nudges = max(_max_nudges, 0)  # 0 = nudging disabled
+    except (TypeError, ValueError):
+        _max_nudges = 2
+    agent._max_post_tool_nudges = _max_nudges
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)

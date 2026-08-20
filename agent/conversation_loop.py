@@ -4163,9 +4163,23 @@ def run_conversation(
                     if (
                         _prior_was_tool
                         and not getattr(agent, "_post_tool_empty_retried", False)
+                        # Per-turn nudge budget (agent.max_post_tool_nudges,
+                        # default 2): the _post_tool_empty_retried flag re-arms
+                        # after every successful tool round, so without this
+                        # bound an empty-looping model gets a full-context
+                        # nudge resend every tool round until the iteration
+                        # budget dies.  Once the budget is spent the turn
+                        # falls through to empty-retries → fallback → the
+                        # "(empty)" terminal below.
+                        and getattr(agent, "_post_tool_nudge_count", 0) < max(
+                            getattr(agent, "_max_post_tool_nudges", 2), 0
+                        )
                         and not _has_inline_thinking  # thinking model still working — let prefill handle
                     ):
                         agent._post_tool_empty_retried = True
+                        agent._post_tool_nudge_count = (
+                            getattr(agent, "_post_tool_nudge_count", 0) + 1
+                        )
                         # Clear stale narration so it doesn't resurface
                         # on a later empty response after the nudge.
                         agent._last_content_with_tools = None

@@ -916,6 +916,15 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Max "model returned empty after tool calls" nudge resends per
+        # conversation turn.  Each nudge re-sends the FULL context, so an
+        # empty-looping model can burn enormous prompt tokens (measured
+        # ~13% of daily fleet burn on ollama_cloud glm-5.2).  After this
+        # many nudges the turn falls through to the existing exhaustion
+        # machinery (empty-retries → fallback → "(empty)" terminal).
+        # 0 disables nudging entirely; the previous behavior (nudge every
+        # tool round, unbounded per turn) is restored by setting this high.
+        "max_post_tool_nudges": 2,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
