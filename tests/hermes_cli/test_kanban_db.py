@@ -1093,6 +1093,51 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         assert kb.get_task(conn, t).status == "running"
 
 
+def test_max_runtime_timeout_salvages_heartbeat_notes_as_summary(
+    kanban_home, monkeypatch,
+):
+    """A timed-out worker's heartbeat notes become the run summary so the
+    retry's build_worker_context() shows partial progress instead of
+    restarting blind."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="timeout-notes", assignee="a", max_runtime_seconds=10,
+        )
+        kb.claim_task(conn, t)
+        run_id = kb.latest_run(conn, t).id
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, run_id),
+        )
+        assert kb.heartbeat_worker(conn, t, note="benchmarks compiled")
+        assert kb.heartbeat_worker(conn, t, note="cargo test 60% done")
+
+        timed_out = kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None
+        )
+        assert timed_out == [t]
+
+        run = kb.latest_run(conn, t)
+        assert run.outcome == "timed_out"
+        assert run.summary and "Last worker progress" in run.summary
+        # Notes presented oldest → newest
+        assert "benchmarks compiled" in run.summary
+        assert run.summary.index("benchmarks compiled") < run.summary.index(
+            "cargo test 60% done"
+        )
+
+        # The retry context surfaces the salvaged progress.
+        ctx = kb.build_worker_context(conn, t)
+        assert "cargo test 60% done" in ctx
+
+
 def test_heartbeat_extends_claim(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

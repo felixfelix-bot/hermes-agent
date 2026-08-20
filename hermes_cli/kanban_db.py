@@ -5434,9 +5434,41 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                # Salvage partial progress: surface the run's last
+                # heartbeat notes as the run summary so the RETRY's
+                # build_worker_context() shows what was already done
+                # instead of restarting blind (workers mid-`cargo test`
+                # etc. had their progress vanish with them).
+                _notes: list[str] = []
+                try:
+                    for _erow in conn.execute(
+                        "SELECT payload FROM task_events "
+                        "WHERE task_id = ? AND kind = 'heartbeat' "
+                        "AND payload IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 10",
+                        (tid,),
+                    ):
+                        try:
+                            _note = (json.loads(_erow["payload"]) or {}).get("note")
+                        except (ValueError, TypeError):
+                            continue
+                        if _note and str(_note).strip():
+                            _notes.append(str(_note).strip())
+                        if len(_notes) >= 3:
+                            break
+                except Exception:
+                    _notes = []
+                _timeout_summary = (
+                    f"Timed out after {int(elapsed)}s (limit "
+                    f"{int(row['max_runtime_seconds'])}s). Last worker progress: "
+                    + (" | ".join(reversed(_notes)))
+                    if _notes
+                    else None
+                )
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
+                    summary=_timeout_summary,
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
                 )
@@ -6192,6 +6224,35 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def normalize_per_profile_cap(raw) -> int | dict[str, int] | None:
+    """Normalize kanban.max_in_progress_per_profile from config.
+
+    Accepts an int (one cap for every profile) or a mapping of
+    {profile_name: cap}. Invalid entries are dropped; returns None when
+    nothing usable remains. Callers previously int-coerced the dict shape
+    (which always fails) and silently dropped the whole cap.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, dict):
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(v, bool):
+                continue
+            if iv >= 1:
+                out[str(k)] = iv
+        return out or None
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -6204,7 +6265,7 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: int | dict[str, int] | None = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6306,12 +6367,36 @@ def dispatch_once(
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
+    # The setting accepts TWO shapes in config.yaml:
+    #   int  → one cap applied to every profile
+    #   dict → {profile_name: cap} per-profile overrides
+    # (The dict shape is what ~/.hermes/config.yaml documents; int-coercing
+    # it at the call sites silently dropped the whole cap — 277 crash-loop
+    # spawns in one week traced to profile session limits being overrun.)
+    _pp_global: int | None = None
+    _pp_map: dict[str, int] = {}
+    if isinstance(max_in_progress_per_profile, int) and not isinstance(
+        max_in_progress_per_profile, bool
+    ):
+        if max_in_progress_per_profile > 0:
+            _pp_global = max_in_progress_per_profile
+    elif isinstance(max_in_progress_per_profile, dict):
+        for _k, _v in max_in_progress_per_profile.items():
+            try:
+                _iv = int(_v)
+            except (TypeError, ValueError):
+                continue
+            if _iv >= 1:
+                _pp_map[str(_k)] = _iv
+
+    def _cap_for(assignee: str | None) -> int | None:
+        if assignee and assignee in _pp_map:
+            return _pp_map[assignee]
+        return _pp_global
+
+    _any_per_profile_cap = _pp_global is not None or bool(_pp_map)
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _any_per_profile_cap:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -6410,13 +6495,15 @@ def dispatch_once(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
+        if _any_per_profile_cap:
+            _cap = _cap_for(row_assignee)
+            if _cap is not None:
+                current = _per_profile_running.get(row_assignee, 0)
+                if current >= _cap:
+                    result.skipped_per_profile_capped.append(
+                        (row["id"], row_assignee, current)
+                    )
+                    continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -6444,7 +6531,7 @@ def dispatch_once(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if _any_per_profile_cap and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -6493,7 +6580,7 @@ def dispatch_once(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            if _any_per_profile_cap and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )

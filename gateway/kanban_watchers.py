@@ -768,33 +768,31 @@ class GatewayKanbanWatchersMixin:
             )
 
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
+        # cap (#21582). Accepts TWO shapes:
+        #   int  → one cap for every profile
+        #   dict → {profile_name: cap} per-profile overrides (the shape
+        #          documented in ~/.hermes/config.yaml)
+        # When set, no single profile gets more than N workers running at
+        # once, even if the global max_in_progress would allow it. Prevents
+        # one profile's local model / API quota / browser pool from being
+        # overwhelmed by a fan-out.
         raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
-        max_in_progress_per_profile = None
-        if raw_per_profile is not None:
-            try:
-                max_in_progress_per_profile = int(raw_per_profile)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
-                    raw_per_profile,
-                )
-                max_in_progress_per_profile = None
-            else:
-                if max_in_progress_per_profile < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
-                        raw_per_profile,
-                    )
-                    max_in_progress_per_profile = None
-                else:
-                    logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
-                        max_in_progress_per_profile,
-                    )
+        max_in_progress_per_profile = _kb.normalize_per_profile_cap(raw_per_profile)
+        if max_in_progress_per_profile is None and raw_per_profile is not None:
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
+                raw_per_profile,
+            )
+        elif isinstance(max_in_progress_per_profile, dict):
+            logger.info(
+                "kanban dispatcher: max_in_progress_per_profile=%s",
+                max_in_progress_per_profile,
+            )
+        elif max_in_progress_per_profile is not None:
+            logger.info(
+                "kanban dispatcher: max_in_progress_per_profile=%d",
+                max_in_progress_per_profile,
+            )
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify

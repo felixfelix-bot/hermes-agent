@@ -2122,7 +2122,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 return None
             return ival if ival >= 1 else None
 
-        max_in_progress_per_profile = _coerce_positive_int(
+        max_in_progress_per_profile = kb.normalize_per_profile_cap(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))

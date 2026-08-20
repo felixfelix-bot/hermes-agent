@@ -100,6 +100,48 @@ def test_pre_existing_running_counts_against_cap(isolated_kanban_home_with_profi
     assert capped_assignees.count("beta") == 1
 
 
+def test_dict_cap_applies_per_profile(isolated_kanban_home_with_profiles):
+    """The dict shape ({profile: cap} — what config.yaml documents) applies
+    each cap to its own profile only. Regression: call sites used to
+    int-coerce the whole dict, which always failed and silently dropped
+    the entire cap (277 session-limit crash-loop spawns traced to this)."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(4):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+        for i in range(2):
+            kb.create_task(conn, title=f"b{i}", assignee="beta")
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile={"alpha": 1, "beta": 2},
+        )
+    spawn_assignees = [s[1] for s in res.spawned]
+    capped_assignees = [c[1] for c in res.skipped_per_profile_capped]
+    assert spawn_assignees.count("alpha") == 1
+    assert spawn_assignees.count("beta") == 2
+    assert capped_assignees.count("alpha") == 3
+    assert capped_assignees.count("beta") == 0
+
+
+def test_normalize_per_profile_cap_shapes():
+    """normalize_per_profile_cap contract: int passes through, dict entries
+    are coerced with invalid entries dropped, anything unusable → None."""
+    kb_none = None
+    from hermes_cli.kanban_db import normalize_per_profile_cap
+    assert normalize_per_profile_cap(None) is kb_none
+    assert normalize_per_profile_cap(3) == 3
+    assert normalize_per_profile_cap(0) is None
+    assert normalize_per_profile_cap(-2) is None
+    assert normalize_per_profile_cap({"alpha": "1", "beta": 2}) == {"alpha": 1, "beta": 2}
+    # invalid entries dropped, valid ones kept
+    assert normalize_per_profile_cap({"alpha": "x", "beta": True, "gamma": 2}) == {"gamma": 2}
+    # all-invalid dict → None (treated as no cap)
+    assert normalize_per_profile_cap({"alpha": "x"}) is None
+    assert normalize_per_profile_cap("not-a-cap") is None
+
+
 @pytest.mark.parametrize("cap", [0, -1, "abc", None])
 def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     """Cap values that don't represent a positive int should be treated as
