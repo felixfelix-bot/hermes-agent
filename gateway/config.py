@@ -1298,6 +1298,40 @@ def load_gateway_config() -> GatewayConfig:
                 if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
                     os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
 
+            # Nostr settings → bridge to platforms_data + env vars
+            # The nostr: top-level YAML section carries relays, groups, and
+            # nsec_path.  None of these are in the shared-key bridge list
+            # (require_mention, allow_from, …), so without this explicit
+            # bridge the platform never gets added to platforms_data and the
+            # gateway skips it entirely.
+            nostr_cfg = yaml_cfg.get("nostr", {})
+            if isinstance(nostr_cfg, dict) and nostr_cfg:
+                _nostr_plat, _nostr_extra = _ensure_platform_extra_dict(
+                    platforms_data, Platform.NOSTR.value
+                )
+                if "relays" in nostr_cfg:
+                    _nostr_extra["relays"] = nostr_cfg["relays"]
+                    if not os.getenv("NOSTR_RELAYS"):
+                        os.environ["NOSTR_RELAYS"] = ",".join(
+                            str(r) for r in nostr_cfg["relays"] if r
+                        )
+                if "groups" in nostr_cfg:
+                    _nostr_extra["groups"] = nostr_cfg["groups"]
+                    if not os.getenv("NOSTR_GROUPS"):
+                        os.environ["NOSTR_GROUPS"] = ",".join(
+                            str(g) for g in nostr_cfg["groups"] if g
+                        )
+                if "nsec_path" in nostr_cfg:
+                    _nostr_path = str(nostr_cfg["nsec_path"])
+                    _nostr_extra["nsec_path"] = _nostr_path
+                    if not os.getenv("NOSTR_NSEC_PATH"):
+                        os.environ["NOSTR_NSEC_PATH"] = os.path.expanduser(_nostr_path)
+                # Mark as enabled unless the user explicitly set enabled: false
+                if "enabled" in nostr_cfg:
+                    _nostr_plat["enabled"] = _coerce_bool(nostr_cfg["enabled"], False)
+                else:
+                    _nostr_plat["enabled"] = True
+
     except Exception as e:
         logger.warning(
             "Failed to process config.yaml — falling back to .env / gateway.json values. "
@@ -2047,6 +2081,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # Nostr
+    nostr_relays_env = os.getenv("NOSTR_RELAYS", "")
+    nostr_nsec_env = os.getenv("NOSTR_NSEC_PATH", "")
+    if nostr_relays_env and nostr_nsec_env:
+        nostr_config = _enable_from_env(Platform.NOSTR)
+        nostr_config.extra.setdefault("relays", [
+            r.strip() for r in nostr_relays_env.split(",") if r.strip()
+        ])
+        nostr_config.extra.setdefault("nsec_path", nostr_nsec_env)
+        nostr_groups_env = os.getenv("NOSTR_GROUPS", "")
+        if nostr_groups_env:
+            nostr_config.extra.setdefault("groups", [
+                g.strip() for g in nostr_groups_env.split(",") if g.strip()
+            ])
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
