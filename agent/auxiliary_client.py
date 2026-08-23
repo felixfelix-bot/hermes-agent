@@ -5285,6 +5285,10 @@ def call_llm(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         base_url=_base_info or resolved_base_url)
 
+    if task:
+        _existing_headers = kwargs.get("extra_headers") or {}
+        kwargs["extra_headers"] = {**_existing_headers, "X-Task-Type": task}
+
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
