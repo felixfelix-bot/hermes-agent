@@ -2795,5 +2795,129 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestModelPinning(unittest.TestCase):
+    """Regression: an explicitly requested model must reach the child agent.
+
+    Symptom that motivated this (model-pinning failure): 8/8 delegate_task
+    calls composed with model='kimi-k3' all executed on the parent's glm-5.2
+    because the tool schema declared no ``model`` parameter and the registry
+    handler dropped it, so children always inherited the parent model.
+    """
+
+    def _run_delegate(self, parent, **kwargs):
+        """Call delegate_task with child construction + run mocked out.
+
+        Returns the kwargs _build_child_agent was called with (first call).
+        """
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("tools.delegate_tool._load_config", return_value={}):
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "ok", "api_calls": 0, "duration_seconds": 0.1,
+            }
+            result = json.loads(delegate_task(parent_agent=parent, **kwargs))
+            self.assertIn("results", result)
+            self.assertEqual(result["results"][0]["status"], "completed")
+        mock_build.assert_called_once()
+        return mock_build.call_args.kwargs
+
+    def test_call_model_param_reaches_child(self):
+        """Top-level model='kimi-k3' pins the child, not the parent model."""
+        parent = _make_mock_parent()
+        kwargs = self._run_delegate(parent, goal="pin me", model="kimi-k3")
+        self.assertEqual(kwargs["model"], "kimi-k3")
+
+    def test_per_task_model_beats_top_level(self):
+        """tasks[i].model overrides the top-level model for that task."""
+        parent = _make_mock_parent()
+        kwargs = self._run_delegate(
+            parent,
+            model="kimi-k3",
+            tasks=[{"goal": "a", "model": "deepseek/deepseek-v4-pro"}],
+        )
+        self.assertEqual(kwargs["model"], "deepseek/deepseek-v4-pro")
+
+    def test_no_model_inherits_none_not_parent_model(self):
+        """No pin anywhere → model=None → _build_child_agent inherits parent."""
+        parent = _make_mock_parent()
+        kwargs = self._run_delegate(parent, goal="inherit")
+        self.assertIsNone(kwargs["model"])
+
+    def test_blank_model_string_treated_as_absent(self):
+        parent = _make_mock_parent()
+        kwargs = self._run_delegate(parent, goal="blank", model="   ")
+        self.assertIsNone(kwargs["model"])
+
+    def test_config_delegation_model_used_when_no_call_pin(self):
+        """delegation.model from config fills in when the call doesn't pin."""
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("tools.delegate_tool._load_config",
+                   return_value={"model": "qwen3-max"}):
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "ok", "api_calls": 0, "duration_seconds": 0.1,
+            }
+            result = json.loads(delegate_task(goal="cfg", parent_agent=parent))
+            self.assertIn("results", result)
+        self.assertEqual(mock_build.call_args.kwargs["model"], "qwen3-max")
+
+    def test_call_pin_beats_config_delegation_model(self):
+        """An explicit per-call pin must win over delegation.model config."""
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("tools.delegate_tool._load_config",
+                   return_value={"model": "qwen3-max"}):
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "ok", "api_calls": 0, "duration_seconds": 0.1,
+            }
+            result = json.loads(
+                delegate_task(goal="override", model="kimi-k3",
+                              parent_agent=parent))
+            self.assertIn("results", result)
+        self.assertEqual(mock_build.call_args.kwargs["model"], "kimi-k3")
+
+    def test_registry_dispatch_passes_model_through(self):
+        """End-to-end through the registry handler: args['model'] is honored.
+
+        This is the exact dispatch path a model-emitted delegate_task call
+        takes (registry.dispatch → handler lambda → delegate_task).
+        """
+        from tools.registry import registry
+
+        parent = _make_mock_parent()
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("tools.delegate_tool._load_config", return_value={}):
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0, "status": "completed",
+                "summary": "ok", "api_calls": 0, "duration_seconds": 0.1,
+            }
+            out = registry.dispatch(
+                "delegate_task",
+                {"goal": "via registry", "model": "kimi-k3"},
+                parent_agent=parent,
+            )
+            payload = json.loads(out)
+            self.assertIn("results", payload)
+        self.assertEqual(mock_build.call_args.kwargs["model"], "kimi-k3")
+
+    def test_schema_declares_model_parameter(self):
+        """The schema must declare what the handler accepts — the original
+        bug was partly that models had to guess an undocumented parameter."""
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("model", props)
+        task_item_props = props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_item_props)
+
+
 if __name__ == "__main__":
     unittest.main()

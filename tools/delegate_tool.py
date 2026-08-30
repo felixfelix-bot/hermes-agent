@@ -2072,6 +2072,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2102,6 +2103,13 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+
+    # Normalise the caller-requested model pin once. Empty/whitespace strings
+    # count as absent so a stray model="" never pins a bogus name. None means
+    # "no per-call pin" — children then fall back to delegation.model config
+    # and finally to the parent agent's model (resolved in _build_child_agent).
+    requested_model = str(model).strip() if model is not None else None
+    requested_model = requested_model or None
 
     # Async (background) delegation is single-task only in v1. A batch carries
     # fan-out semantics (N handles, partial completion) that double the state
@@ -2225,7 +2233,7 @@ def delegate_task(
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=_effective_task_model(t, requested_model, creds.get("model")),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
@@ -2307,7 +2315,7 @@ def delegate_task(
                 context=_t.get("context"),
                 toolsets=_t.get("toolsets") or toolsets,
                 role=_normalize_role(_t.get("role") or top_role),
-                model=creds["model"],
+                model=_effective_task_model(_t, requested_model, creds.get("model")),
                 session_key=_session_key,
                 runner=_async_runner,
                 interrupt_fn=_async_interrupt,
@@ -2762,6 +2770,37 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _effective_task_model(
+    task: Dict[str, Any],
+    call_model: Optional[str],
+    creds_model: Optional[str],
+) -> Optional[str]:
+    """Resolve the model a delegated child agent should run on.
+
+    Priority (first non-empty wins):
+
+    1. Per-task ``model`` field in the ``tasks`` batch array
+    2. The delegate_task call's top-level ``model`` argument
+    3. ``delegation.model`` from config (the ``creds_model`` resolved by
+       ``_resolve_delegation_credentials``)
+    4. None — meaning "inherit the parent agent's model", which
+       ``_build_child_agent`` resolves via ``effective_model = model or
+       parent_agent.model``.
+
+    Regression context (model-pinning failure, 8/8 delegate_task calls with
+    model='kimi-k3' silently executing on the parent's glm-5.2): the tool
+    schema previously declared no ``model`` parameter at all and the registry
+    handler dropped it, so per-call pins never reached ``_build_child_agent``
+    and children always inherited the parent model. An explicitly requested
+    model must now reach the provider verbatim — never silently substituted.
+    """
+    per_task = task.get("model") if isinstance(task, dict) else None
+    for candidate in (per_task, call_model, creds_model):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
 def _load_config() -> dict:
     """Load delegation config from CLI_CONFIG or persistent config.
 
@@ -3042,6 +3081,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Model for this specific task (e.g. 'kimi-k3'). "
+                                "Overrides the top-level 'model' for this task "
+                                "only. Sent verbatim to the provider endpoint."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3054,6 +3101,19 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Pin the model the child agent(s) run on (e.g. 'kimi-k3', "
+                    "'deepseek/deepseek-v4-pro'). Sent verbatim to your "
+                    "provider endpoint — only pin models the endpoint actually "
+                    "serves. When omitted, children use delegation.model from "
+                    "config if set, else inherit your model. An explicit pin "
+                    "is honored: it is never silently swapped for the parent "
+                    "model. Per-task 'model' in the tasks array overrides this "
+                    "top-level value for that task."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3118,6 +3178,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         background=args.get("background"),
+        model=args.get("model"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
