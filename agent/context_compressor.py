@@ -624,6 +624,20 @@ class ContextCompressor(ContextEngine):
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        """Stash the originating session id for per-session attribution.
+
+        The gateway calls this with the live session's id (run_agent wires
+        it at conversation start). The id is threaded into the compression
+        summarization call so the loopback proxy can attribute
+        ``task_type='compression'`` rows to the session that paid for them
+        (``api_calls.session_id``) — without it, compaction events are
+        unattributable and the growth governor's pressure feedback (and any
+        incident detection on compaction rate) is blind for this session.
+        """
+        super().on_session_start(session_id, **kwargs)
+        self._session_id = session_id
+
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Clear per-session compaction state at a real session boundary.
 
@@ -639,6 +653,7 @@ class ContextCompressor(ContextEngine):
         owning session ends.
         """
         self._previous_summary = None
+        self._session_id = None
 
     def update_model(
         self,
@@ -1511,6 +1526,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
+            if getattr(self, "_session_id", None):
+                call_kwargs["session_id"] = self._session_id
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)

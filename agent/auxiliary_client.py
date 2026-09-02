@@ -5165,6 +5165,23 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+_SESSION_HEADER_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_loopback_endpoint(url: str) -> bool:
+    """True when *url* points at a loopback host (the local proxy).
+
+    Used to gate attachement of the internal ``X-Hermes-Session`` header so
+    the session identifier never leaks to an external provider.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(url or "")).hostname or "").lower()
+        return host in _SESSION_HEADER_LOOPBACK_HOSTS
+    except Exception:
+        return False
+
+
 def call_llm(
     task: str = None,
     *,
@@ -5179,6 +5196,7 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    session_id: str = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -5197,6 +5215,9 @@ def call_llm(
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
         extra_body: Additional request body fields.
+        session_id: Originating agent session id. When set AND the effective
+              endpoint is loopback, ``X-Hermes-Session`` is attached so the
+              proxy can attribute the call to the session (api_calls.session_id).
 
     Returns:
         Response object with .choices[0].message.content
@@ -5288,6 +5309,19 @@ def call_llm(
     if task:
         _existing_headers = kwargs.get("extra_headers") or {}
         kwargs["extra_headers"] = {**_existing_headers, "X-Task-Type": task}
+
+    # Session attribution (productivity-gate Phase 1): when the caller knows
+    # the originating agent session (e.g. the context compressor stashes it
+    # from on_session_start), attach ``X-Hermes-Session`` so the loopback
+    # proxy can attribute auxiliary-call token burn — compression rows
+    # without it are logged with ``session_id NULL`` and every per-session
+    # consumer (growth-governor pressure feedback, incident detection)
+    # is blind. Loopback-gated so the internal id never leaks to an
+    # external provider — mirrors the zai provider plugin's header logic.
+    if session_id and _is_loopback_endpoint(_base_info or resolved_base_url or ""):
+        _existing_headers = kwargs.get("extra_headers") or {}
+        kwargs["extra_headers"] = {
+            **_existing_headers, "X-Hermes-Session": session_id}
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
