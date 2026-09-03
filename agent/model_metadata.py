@@ -543,7 +543,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
 
     Returns one of: "ollama", "lm-studio", "vllm", "llamacpp", or None.
     """
-    import httpx
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        return None
 
     normalized = _normalize_base_url(base_url)
     server_url = normalized
@@ -1143,7 +1146,10 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     This is the value that should be passed as ``num_ctx`` in Ollama chat
     requests to override the default 2048.
     """
-    import httpx
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        return None
 
     bare_model = _strip_provider_prefix(model)
     server_url = base_url.rstrip("/")
@@ -1207,7 +1213,10 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     The order is flipped vs ``query_ollama_num_ctx()`` because local users
     control ``num_ctx`` themselves; hosted users can't.
     """
-    import httpx
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        return None
 
     server_url = base_url.rstrip("/")
     if server_url.endswith("/v1"):
@@ -1287,7 +1296,10 @@ def _model_name_suggests_grok_4_3(model: str) -> bool:
 
 def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query a local server for the model's context length."""
-    import httpx
+    try:
+        import httpx
+    except ModuleNotFoundError:
+        return None
 
     # Strip recognised provider prefix (e.g., "local:model-name" → "model-name").
     # Ollama "model:tag" colons (e.g. "qwen3.5:27b") are intentionally preserved.
