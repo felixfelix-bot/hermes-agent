@@ -108,6 +108,47 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
 
 
+def _cap_output(payload: str, max_chars: Optional[int] = None) -> str:
+    """Bound a session-search response to ``tool_output.max_bytes``.
+
+    Session-search payloads (anchored windows + full message content per
+    hit) bypassed the centralized tool_output cap that terminal, file, and
+    code-execution tools honor — observed discover payloads reached ~96k
+    chars, refilling conversation contexts and driving compaction thrash
+    (2026-09-02 incident). This brings the tool family in line: when the
+    serialized response exceeds the cap, entries are dropped from the tail
+    of the largest list field until it fits, and the truncation is marked
+    in-band so the model knows to narrow its query. Fast path (under cap)
+    is a length check. Defensive: any error returns the original payload.
+    """
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        cap = max_chars if max_chars is not None else get_max_bytes()
+        if len(payload) <= cap:
+            return payload
+        resp = json.loads(payload)
+        biggest_key, biggest_len = None, 0
+        for key in ("results", "messages", "sessions"):
+            val = resp.get(key)
+            if isinstance(val, list) and len(val) > biggest_len:
+                biggest_key, biggest_len = key, len(val)
+        if biggest_key is None:
+            return payload
+        while resp[biggest_key] and len(json.dumps(resp, ensure_ascii=False)) > cap:
+            resp[biggest_key].pop()
+        resp["output_truncated"] = True
+        resp["message"] = (
+            f"Output capped at {cap} chars "
+            f"(dropped {biggest_len - len(resp[biggest_key])} entries "
+            f"from '{biggest_key}'). Narrow the query, lower limit, or pass "
+            "session_id to read one session."
+        )
+        return json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        return payload
+
+
 def _resolve_profile_db(profile: str):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
@@ -553,18 +594,18 @@ def session_search(
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
-        return _scroll(
+        return _cap_output(_scroll(
             db=db,
             session_id=session_id,
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
-        )
+        ))
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid)
+        result = _cap_output(_read_session(db, sid))
         if json.loads(result).get("success"):
             return result
 
@@ -574,7 +615,7 @@ def session_search(
         located, owner = _locate_session_db(sid)
         if located is not None:
             try:
-                found = json.loads(_read_session(located, sid))
+                found = json.loads(_cap_output(_read_session(located, sid)))
             finally:
                 located.close()
             if found.get("success"):
@@ -592,7 +633,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _cap_output(_list_recent_sessions(db, limit, current_session_id))
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -606,14 +647,14 @@ def session_search(
         if candidate in ("newest", "oldest"):
             sort_norm = candidate
 
-    return _discover(
+    return _cap_output(_discover(
         db=db,
         query=query.strip(),
         role_filter=role_list,
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
-    )
+    ))
 
 
 def check_session_search_requirements() -> bool:

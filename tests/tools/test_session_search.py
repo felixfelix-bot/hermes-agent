@@ -520,3 +520,83 @@ class TestCrossProfileRead:
             assert result["success"] is True, kwargs
             assert result["mode"] == "read"
             assert result["session_id"] == "s_other"
+
+
+# =========================================================================
+# Output-size cap (FIX-2b, 2026-09-02)
+# =========================================================================
+
+class TestCapOutput:
+    """_cap_output bounds tool responses to tool_output.max_bytes.
+
+    Contract: under-cap payloads pass through unchanged; over-cap payloads
+    keep valid JSON, drop entries from the tail of the largest list field,
+    and set output_truncated=True with an explanatory message. Anything it
+    cannot parse (browse-mode prose) or cannot shrink returns unchanged.
+    """
+
+    def _payload(self, n_results=3, content="x" * 5000):
+        return json.dumps({
+            "success": True,
+            "mode": "discover",
+            "query": "q",
+            "count": n_results,
+            "results": [
+                {"session_id": f"s{i}", "messages": [{"role": "user", "content": content}]}
+                for i in range(n_results)
+            ],
+        }, ensure_ascii=False)
+
+    def test_under_cap_passthrough(self):
+        from tools.session_search_tool import _cap_output
+
+        payload = self._payload(content="short")
+        assert _cap_output(payload, max_chars=10_000) == payload
+
+    def test_over_cap_drops_entries_and_marks_truncation(self):
+        from tools.session_search_tool import _cap_output
+
+        payload = self._payload(n_results=6)  # ~30k chars
+        capped = _cap_output(payload, max_chars=10_000)
+        parsed = json.loads(capped)  # still valid JSON
+        assert parsed["output_truncated"] is True
+        assert "message" in parsed
+        assert len(parsed["results"]) < 6
+        assert len(capped) <= 10_000 + 500  # headroom for the truncation notice
+
+    def test_keeps_first_entries_drops_from_tail(self):
+        from tools.session_search_tool import _cap_output
+
+        payload = self._payload(n_results=6)
+        capped = json.loads(_cap_output(payload, max_chars=10_000))
+        kept_ids = [r["session_id"] for r in capped["results"]]
+        assert kept_ids == [f"s{i}" for i in range(len(kept_ids))]  # prefix, in order
+        assert kept_ids[0] == "s0"
+
+    def test_non_json_passthrough(self):
+        from tools.session_search_tool import _cap_output
+
+        prose = "- session one\n- session two\n"
+        assert _cap_output(prose, max_chars=5) == prose
+
+    def test_no_list_field_passthrough(self):
+        from tools.session_search_tool import _cap_output
+
+        payload = json.dumps({"success": True, "note": "y" * 10_000})
+        assert _cap_output(payload, max_chars=100) == payload
+
+    def test_live_discover_respects_cap(self):
+        """E2E contract against a real DB: discover output stays bounded."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            d = SessionDB(Path(td) / "state.db")
+            d.create_session("s_big", source="cli")
+            for i in range(40):
+                d.append_message("s_big", role="assistant", content=f"filler {i} " + "z" * 3000)
+            d._conn.commit()
+            out = session_search(db=d, query="filler", limit=10)
+            assert len(out) <= 60_000, len(out)
+            parsed = json.loads(out)
+            assert parsed["success"] is True
