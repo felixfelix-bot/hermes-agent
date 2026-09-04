@@ -3807,10 +3807,25 @@ def delegate_task(
                 "delegation.max_concurrent_children in config.yaml to allow "
                 "more concurrent background delegations."
             )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        from tools.tool_output_limits import cap_json_output as _capjo
+
+        return _capjo(
+            json.dumps(_cap_result, ensure_ascii=False),
+            list_fields=("results",),
+        )
 
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    from tools.tool_output_limits import cap_json_output
+
+    return cap_json_output(
+        json.dumps(_execute_and_aggregate(), ensure_ascii=False),
+        list_fields=("results",),
+        truncation_message=(
+            "Output capped at {cap} chars (dropped {dropped} of the worker "
+            "results from '{field}'). Narrow the fan-out or request specific "
+            "task_index values to inspect individual results."
+        ),
+    )
 
 
 def _resolve_child_credential_pool(
