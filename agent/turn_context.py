@@ -958,14 +958,21 @@ def build_turn_context(
                 agent.model,
                 f"{_compressor.context_length:,}",
             )
+            _real = getattr(_compressor, "last_real_prompt_tokens", 0) or 0
+            if _real > 0:
+                _shown = f"{_real:,} real"
+            else:
+                _shown = f"~{_preflight_tokens:,} est."
             _preflight_status = automatic_compaction_status_message(
                 _compressor,
                 phase="preflight",
-                default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=_preflight_tokens,
-                    threshold=_compressor.threshold_tokens,
+                default_message=(
+                    f"📦 Preflight compression: {_shown} tokens "
+                    f">= {_compressor.threshold_tokens:,} threshold. "
+                    "This may take a moment."
                 ),
                 approx_tokens=_preflight_tokens,
+                real_tokens=_real,
                 threshold_tokens=_compressor.threshold_tokens,
                 context_length=_compressor.context_length,
                 model=agent.model,
