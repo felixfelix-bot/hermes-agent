@@ -259,3 +259,66 @@ def test_between_turns_refresh_no_churn_when_unchanged():
 
     assert agent.tools is same  # not replaced → no churn
 
+
+# ── Preflight compression notice (FIX-1, 2026-09-04) ────────────────────────
+#
+# The preflight notice used to print the rough estimate (chars÷4 + tool
+# schemas), which inflates the real provider prompt_tokens ~3.1x (observed
+# "339,622 >= 109,280" while the real figure was ~109K). The notice must show
+# the real last-known prompt_tokens when available (label "real"), falling
+# back to the rough estimate (label "est.") only when no real figure exists.
+
+
+def _make_compressing_agent():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent.context_compressor = types.SimpleNamespace(
+        protect_first_n=2,
+        protect_last_n=2,
+        threshold_tokens=109_280,
+        context_length=200_000,
+        last_prompt_tokens=0,
+        last_real_prompt_tokens=0,
+        should_compress=lambda tokens: tokens >= 109_280,
+        should_defer_preflight_to_real_usage=lambda tokens: False,
+    )
+    agent._compress_context = lambda *a, **k: (a[0], a[1])
+    agent._emit_status = lambda msg: agent._statuses.append(msg)
+    agent._statuses = []
+    return agent
+
+
+# The preflight branch only arms once the conversation has grown past
+# protect_first_n + protect_last_n + 1 messages (see turn_context.py), so
+# these tests seed enough history to reach it.
+def _seed_history():
+    return [
+        {"role": "user", "content": "turn 0"},
+        {"role": "assistant", "content": "reply 0"},
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+
+
+def test_preflight_notice_shows_real_tokens_when_available():
+    agent = _make_compressing_agent()
+    agent.context_compressor.last_real_prompt_tokens = 109_000
+    with patch("agent.turn_context.estimate_request_tokens_rough", return_value=339_622):
+        _build(agent, conversation_history=_seed_history())
+    notice = agent._statuses[0]
+    assert "real" in notice
+    assert "109,000" in notice
+    assert "339,622" not in notice
+
+
+def test_preflight_notice_falls_back_to_estimate_when_no_real_figure():
+    agent = _make_compressing_agent()
+    agent.context_compressor.last_real_prompt_tokens = 0
+    with patch("agent.turn_context.estimate_request_tokens_rough", return_value=339_622):
+        _build(agent, conversation_history=_seed_history())
+    notice = agent._statuses[0]
+    assert "est." in notice
+    assert "339,622" in notice
+

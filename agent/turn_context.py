@@ -315,8 +315,13 @@ def build_turn_context(
                 agent.model,
                 f"{_compressor.context_length:,}",
             )
+            _real = getattr(_compressor, "last_real_prompt_tokens", 0) or 0
+            if _real > 0:
+                _shown = f"{_real:,} real"
+            else:
+                _shown = f"~{_preflight_tokens:,} est."
             agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                f"📦 Preflight compression: {_shown} tokens "
                 f">= {_compressor.threshold_tokens:,} threshold. "
                 "This may take a moment."
             )
