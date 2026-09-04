@@ -332,7 +332,12 @@ class TestDelegateTask(unittest.TestCase):
             for i in range(n)
         ]
         parent = _make_mock_parent()
-        tasks = [{"goal": f"Task {i}"} for i in range(n)]
+        # Concrete goals: the batch quality gate rejects placeholder goals
+        # like "Task {i}", which would never reach the capped return.
+        tasks = [
+            {"goal": f"Analyze dataset shard {i} and report anomalies"}
+            for i in range(n)
+        ]
         raw = delegate_task(tasks=tasks, parent_agent=parent)
         assert len(raw) <= get_max_bytes() + 500, len(raw)
         result = json.loads(raw)
@@ -423,14 +428,20 @@ class TestDelegateTask(unittest.TestCase):
             "summary": "Done", "api_calls": 1, "duration_seconds": 1.0
         }
         parent = _make_mock_parent()
+        # 2 tasks: single-task batches are rejected by the batch quality gate.
         result = json.loads(delegate_task(
             goal="This should be ignored",
-            tasks=[{"goal": "Actual task"}],
+            tasks=[{"goal": "Actual task"}, {"goal": "Second real task"}],
             parent_agent=parent,
         ))
-        # The mock was called with the tasks array item, not the top-level goal
-        call_args = mock_run.call_args
-        self.assertEqual(call_args.kwargs.get("goal") or call_args[1].get("goal", call_args[0][1] if len(call_args[0]) > 1 else None), "Actual task")
+        # The mock was called with the tasks array items, not the top-level goal
+        first_call = mock_run.call_args_list[0]
+        first_goal = (
+            first_call.kwargs.get("goal")
+            if hasattr(first_call, "kwargs") and first_call.kwargs.get("goal")
+            else (first_call.args[1] if len(first_call.args) > 1 else None)
+        )
+        self.assertEqual(first_goal, "Actual task")
 
     @patch("tools.delegate_tool._run_single_child")
     def test_failed_child_included_in_results(self, mock_run):
