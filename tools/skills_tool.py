@@ -1504,7 +1504,17 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        return json.dumps(result, ensure_ascii=False)
+        from tools.tool_output_limits import cap_json_output
+
+        return cap_json_output(
+            json.dumps(result, ensure_ascii=False),
+            string_fields=("content",),
+            truncation_message=(
+                "Output capped at {cap} chars (tail-truncated '{field}' by "
+                "{dropped} chars). Use skill_view(name, file_path) to read a "
+                "specific linked file, or narrow the skill's content."
+            ),
+        )
 
     except Exception as e:
         return tool_error(str(e), success=False)
