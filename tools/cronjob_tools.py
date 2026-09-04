@@ -1167,7 +1167,17 @@ def cronjob(
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
-            return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+            payload = json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+            from tools.tool_output_limits import cap_json_output
+            return cap_json_output(
+                payload,
+                list_fields=("jobs",),
+                truncation_message=(
+                    "Output capped at {cap} chars (dropped {dropped} of the "
+                    "board's jobs from '{field}'). Use job_id to inspect a "
+                    "specific job, or narrow with include_disabled."
+                ),
+            )
 
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
