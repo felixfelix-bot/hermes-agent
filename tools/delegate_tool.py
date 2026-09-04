@@ -2562,12 +2562,22 @@ def delegate_task(
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
-    return json.dumps(
-        {
-            "results": results,
-            "total_duration_seconds": total_duration,
-        },
-        ensure_ascii=False,
+    from tools.tool_output_limits import cap_json_output
+
+    return cap_json_output(
+        json.dumps(
+            {
+                "results": results,
+                "total_duration_seconds": total_duration,
+            },
+            ensure_ascii=False,
+        ),
+        list_fields=("results",),
+        truncation_message=(
+            "Output capped at {cap} chars (dropped {dropped} of the worker "
+            "results from '{field}'). Narrow the fan-out or request specific "
+            "task_index values to inspect individual results."
+        ),
     )
 
 

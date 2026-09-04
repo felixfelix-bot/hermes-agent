@@ -217,6 +217,40 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("total_duration_seconds", result)
 
     @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._get_max_concurrent_children", return_value=40)
+    def test_results_output_respects_cap(self, mock_max, mock_run):
+        """delegate_task results array must honor tool_output.max_bytes.
+
+        A large fan-out with full worker summaries serializes to ~64K chars,
+        refilling the parent's context. The aggregate results payload must be
+        bounded to the centralized cap while keeping the results list shape.
+        """
+        from tools.tool_output_limits import get_max_bytes
+
+        n = 40
+        mock_run.side_effect = [
+            {
+                "task_index": i,
+                "status": "completed",
+                "summary": f"Worker {i} summary " + "y" * 2000,
+                "api_calls": 3,
+                "duration_seconds": 1.0,
+            }
+            for i in range(n)
+        ]
+        parent = _make_mock_parent()
+        tasks = [{"goal": f"Task {i}"} for i in range(n)]
+        raw = delegate_task(tasks=tasks, parent_agent=parent)
+        assert len(raw) <= get_max_bytes() + 500, len(raw)
+        result = json.loads(raw)
+        self.assertIn("results", result)
+        self.assertIsInstance(result["results"], list)
+        self.assertTrue(result["truncated"])
+        self.assertGreater(result["truncated_count"], 0)
+        # Prefix order preserved: first worker still present.
+        self.assertEqual(result["results"][0]["task_index"], 0)
+
+    @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
         mock_run.side_effect = [
             {
