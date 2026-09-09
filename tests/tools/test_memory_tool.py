@@ -1,6 +1,7 @@
 """Tests for tools/memory_tool.py — MemoryStore, security scanning, and tool dispatcher."""
 
 import json
+import os
 import pytest
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    get_memory_dir,
 )
 
 
@@ -665,3 +667,98 @@ class TestBomToleranceInMemoryFiles:
         raw, read_ok = MemoryStore._read_raw_checked(path)
         assert read_ok is False
         assert raw == ""
+
+
+# =========================================================================
+# Per-context-window (per-signal-group) memory scoping — 2026-09-09
+# =========================================================================
+
+_SESSION_ENV_KEYS = [
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_CRON_SESSION",
+]
+
+
+@pytest.fixture
+def mem_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for k in _SESSION_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    return tmp_path
+
+
+class TestMemoryGroupScoping:
+    def test_default_root_when_no_session(self, mem_home):
+        assert get_memory_dir() == mem_home / "memories"
+
+    def test_messaging_group_is_namespaced(self, mem_home, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Plebeian Manager")
+        assert get_memory_dir() == mem_home / "memories" / "plebeian-manager"
+
+    def test_cli_source_never_grouped(self, mem_home, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Plebeian Manager")
+        assert get_memory_dir() == mem_home / "memories"
+
+    def test_cron_never_grouped(self, mem_home, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Plebeian Manager")
+        assert get_memory_dir() == mem_home / "memories"
+
+    def test_chat_id_fallback_slug(self, mem_home, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "group:AbC/+xYz=")
+        assert get_memory_dir().name.startswith("abc")
+
+
+class TestGroupSeedFromDefault:
+    def test_fresh_group_seeded_from_default(self, mem_home, monkeypatch):
+        """A brand-new group memory dir inherits the default baseline once."""
+        default = mem_home / "memories"
+        default.mkdir(parents=True)
+        (default / "MEMORY.md").write_text("baseline fact\n", encoding="utf-8")
+        (default / "USER.md").write_text("user baseline\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Plebeian Manager")
+        group_dir = mem_home / "memories" / "plebeian-manager"
+
+        s = MemoryStore()
+        s.load_from_disk()
+        assert (group_dir / "MEMORY.md").exists()
+        assert (group_dir / "USER.md").exists()
+        assert s.memory_entries == ["baseline fact"]
+        assert s.user_entries == ["user baseline"]
+
+    def test_group_diverges_after_seed(self, mem_home, monkeypatch):
+        """After seeding, writes go to the group dir only — default untouched."""
+        default = mem_home / "memories"
+        default.mkdir(parents=True)
+        (default / "MEMORY.md").write_text("baseline\n", encoding="utf-8")
+        (default / "USER.md").write_text("user baseline\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "signal")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "Plebeian Manager")
+        group_dir = mem_home / "memories" / "plebeian-manager"
+
+        s = MemoryStore()
+        s.load_from_disk()
+        res = s.add("memory", "GROUP SPECIFIC NOTE")
+        assert res["success"] is True
+        assert "GROUP SPECIFIC NOTE" in (group_dir / "MEMORY.md").read_text(encoding="utf-8")
+        assert "GROUP SPECIFIC NOTE" not in (default / "MEMORY.md").read_text(encoding="utf-8")
+
+    def test_default_dir_not_seeded_into_itself(self, mem_home):
+        default = mem_home / "memories"
+        default.mkdir(parents=True)
+        (default / "MEMORY.md").write_text("only fact\n", encoding="utf-8")
+        s = MemoryStore()
+        s.load_from_disk()
+        assert s.memory_entries == ["only fact"]
+        assert (default / "MEMORY.md").read_text(encoding="utf-8").count("only fact") == 1

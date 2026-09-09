@@ -50,9 +50,99 @@ logger = logging.getLogger(__name__)
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
+# Session surfaces that are NOT a human messaging context window. Kept local
+# so this tool stays import-light; mirrors
+# gateway.session_context.NON_MESSAGING_SESSION_SURFACES (note: the empty
+# string is deliberately absent here — empty platform is handled separately).
+_NON_MESSAGING_SURFACES = frozenset(
+    {
+        "api_server",
+        "cli",
+        "codex",
+        "desktop",
+        "gateway",
+        "kanban",
+        "local",
+        "msgraph_webhook",
+        "tool",
+        "tui",
+        "webhook",
+    }
+)
+
+
+def _slugify_group(name: str) -> str:
+    """Filesystem-safe slug for a context-window (chat/group) display name.
+
+    Same rule as ``scripts/append_note.py`` so a CW's notes file
+    (``state/notes/<group>.md``) and its memory dir (``memories/<group>/``)
+    always use the identical slug for a given chat name.
+    """
+    if not name:
+        return ""
+    import re
+
+    s = re.sub(r"[^a-z0-9]+", "-", str(name).lower().strip()).strip("-")
+    return s[:80].strip("-")
+
+
+def _current_group_slug() -> str:
+    """Return a stable slug for the current context window, or ``""``.
+
+    Messaging gateway sessions (Signal groups/DMs, Telegram, ...) are
+    namespaced so each context window keeps its OWN MEMORY.md / USER.md — a
+    note the agent saves in group A can never be injected into group B's system
+    prompt. CLI, cron, kanban workers, the API server and other non-messaging
+    surfaces return ``""`` and share the profile-default memories dir (existing
+    behaviour unchanged).
+
+    Resolution is identical to ``scripts/append_note.py``: the gateway bridges
+    the per-task session ContextVars into this process, so a MemoryStore built
+    inside group A's turn resolves group A's dir even when several CWs are
+    served concurrently by one gateway process.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # pragma: no cover - import guards
+        get_session_env = None
+
+    def _env(key):
+        if get_session_env is not None:
+            return (get_session_env(key, "") or "")
+        import os
+
+        return os.environ.get(key, "") or ""
+
+    if _env("HERMES_CRON_SESSION") == "1":
+        return ""
+    source = _env("HERMES_SESSION_SOURCE").strip().lower()
+    platform = _env("HERMES_SESSION_PLATFORM").strip().lower()
+    if source in _NON_MESSAGING_SURFACES:
+        return ""
+    if platform in _NON_MESSAGING_SURFACES or platform == "":
+        return ""
+    chat_name = _env("HERMES_SESSION_CHAT_NAME").strip()
+    chat_id = _env("HERMES_SESSION_CHAT_ID").strip()
+    slug = _slugify_group(chat_name) if chat_name else ""
+    if not slug and chat_id:
+        raw = chat_id.split(":", 1)[-1] if ":" in chat_id else chat_id
+        slug = _slugify_group(raw)
+    return slug
+
+
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the profile- and context-window-scoped memories directory.
+
+    ``<hermes_home>/memories`` by default; when the session is a messaging
+    context window it becomes ``<hermes_home>/memories/<group-slug>`` so each
+    Signal group / DM keeps its own MEMORY.md and USER.md (no cross-CW bleed).
+    """
+    base = get_hermes_home() / "memories"
+    try:
+        slug = _current_group_slug()
+    except Exception:
+        slug = ""
+    return base / slug if slug else base
 
 # Stable header prefixes for the system-prompt memory blocks rendered by
 # MemoryStore._render_block. Exported so compression's prompt-retention check
@@ -219,6 +309,7 @@ class MemoryStore:
         """
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
+        self._seed_group_from_default(mem_dir)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
@@ -318,6 +409,34 @@ class MemoryStore:
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
+
+    @staticmethod
+    def _seed_group_from_default(mem_dir):
+        """One-time seed of a fresh per-group memory dir from the profile default.
+
+        When a context window first boots its own ``memories/<group>/`` (from
+        the 2026-09-09 per-group isolation change), copy the accumulated
+        default ``MEMORY.md``/``USER.md`` as the starting baseline so no CW
+        loses the operator profile / durable cross-project reference. The
+        group then diverges independently — later notes never bleed across
+        groups. No-op when the dir is the default itself, the default has no
+        content, or a target file already exists.
+        """
+        try:
+            base = get_hermes_home() / "memories"
+            if base == mem_dir:
+                return
+            if not base.is_dir():
+                return
+            import shutil
+
+            for fn in ("MEMORY.md", "USER.md"):
+                src = base / fn
+                dst = mem_dir / fn
+                if src.is_file() and not dst.exists():
+                    shutil.copyfile(src, dst)
+        except Exception:
+            logger.debug("Memory group seed skipped", exc_info=True)
 
     def _reload_target(self, target: str, *, skip_drift: bool = False):
         """Re-read entries from disk into in-memory state.
