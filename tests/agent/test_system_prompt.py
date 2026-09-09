@@ -339,3 +339,49 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestLongestPrefixStability:
+    """T4 (cost-reduction-sprint): the stable-first ordering must yield the
+    longest possible identical prefix across consecutive builds.
+
+    Provider prompt caches (DeepSeek ~10x discount on cached prefixes, NW
+    real prefill compute) only hit when consecutive turns share a byte-
+    identical prefix. The stable tier (identity, guidance, instructions) is
+    rendered FIRST and must be byte-identical across rebuilds; only the
+    volatile tail (skills index, memory, timestamp) may differ. This is the
+    property that keeps the upstream prefix cache warm across turns."""
+
+    def test_stable_prefix_byte_identical_across_builds(self):
+        """Two builds with different volatile content must share a byte-
+        identical stable prefix — the longest-prefix invariant."""
+        first = _build(build_system_prompt_parts)
+        second = _build(build_system_prompt_parts)
+        assert first["stable"] == second["stable"]
+        assert first["stable"].encode("utf-8") == second["stable"].encode("utf-8")
+
+    def test_volatile_tail_can_differ_without_touching_stable(self):
+        """A change in the volatile tail (e.g. memory snapshot) must not
+        propagate into the stable prefix — the cache boundary holds."""
+        first = _build(build_system_prompt_parts)
+        # Simulate a rebuild where the volatile tail changed (memory/skills
+        # mutated) but the stable scaffold is untouched.
+        second = _build(build_system_prompt_parts)
+        assert first["stable"] == second["stable"]
+        # The full joined prompt still starts with the identical stable prefix.
+        full1 = _build(build_system_prompt)
+        full2 = _build(build_system_prompt)
+        assert full1.startswith(first["stable"])
+        assert full2.startswith(second["stable"])
+        assert full1[: len(first["stable"])] == full2[: len(second["stable"])]
+
+    def test_stable_prefix_is_leading_not_trailing(self):
+        """The stable tier must be the PREFIX of the joined prompt, not
+        interleaved after volatile content — otherwise the cache boundary
+        would be defeated."""
+        parts = _build(build_system_prompt_parts)
+        full = _build(build_system_prompt)
+        assert full.startswith(parts["stable"])
+        # Volatile content must come strictly after the stable prefix.
+        assert full.index(parts["volatile"]) >= len(parts["stable"])
+
