@@ -70,6 +70,7 @@ from hermes_constants import (
     get_hermes_home,
     get_hermes_home_override,
 )
+from agent.auxiliary_client import frame_untrusted_content
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -2825,6 +2826,14 @@ def _extract_relevant_content(
         f'\n\n[Summarized from a {len(snapshot_text):,}-char snapshot. Full snapshot '
         f'saved to: {stored_path} — read it with read_file if anything is missing.]'
     ) if stored_path else ""
+    # Frame the raw page snapshot as untrusted data before the auxiliary LLM
+    # sees it, so an embedded prompt injection (e.g. a product description
+    # saying "ignore the above") cannot manipulate the extraction model. The
+    # main tool-result wrapper only marks content on the way back to the agent;
+    # this covers the secondary-LLM seam. Secret redaction still runs below.
+    framed_snapshot = frame_untrusted_content(
+        snapshot_text, source_label="browser snapshot"
+    )
     if user_task:
         extraction_prompt = (
             f"You are a content extractor for a browser automation agent.\n\n"
@@ -2835,7 +2844,7 @@ def _extract_relevant_content(
             f"2. Text content relevant to the task (prices, descriptions, headings, important info)\n"
             f"3. Navigation structure if relevant\n\n"
             f"Keep ref IDs (like [ref=e5]) for interactive elements so the agent can use them.\n\n"
-            f"Page Snapshot:\n{snapshot_text}\n\n"
+            f"Page Snapshot:\n{framed_snapshot}\n\n"
             f"Provide a concise summary that preserves actionable information and relevant content."
         )
     else:
@@ -2844,7 +2853,7 @@ def _extract_relevant_content(
             f"1. All interactive elements with their ref IDs (like [ref=e5])\n"
             f"2. Key text content and headings\n"
             f"3. Important information visible on the page\n\n"
-            f"Page Snapshot:\n{snapshot_text}\n\n"
+            f"Page Snapshot:\n{framed_snapshot}\n\n"
             f"Provide a concise summary focused on interactive elements and key content."
         )
 
