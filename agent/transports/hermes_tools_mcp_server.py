@@ -151,6 +151,45 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _frame_untrusted_mcp_result(tool_name: str, result: str) -> str:
+    """Wrap results from attacker-controllable tools before they cross the
+    MCP boundary to Codex.
+
+    Codex builds its own tool-result messages from the plain strings this
+    server returns, and does NOT apply Hermes' ``_maybe_wrap_untrusted``
+    framing — that wrapper only runs in the main agent's
+    ``make_tool_result_message`` path. Browser / web / MCP tool output can
+    therefore reach Codex's model with no untrusted-data marker, so an
+    indirect prompt injection embedded in a scraped page (e.g. a product
+    description that says "ignore the above instructions") would be obeyed.
+
+    This closes that seam with the SAME architectural framing the main path
+    uses (``<untrusted_tool_result>`` delimiters), so both runtimes treat
+    scraped content identically. Framing — not brittle regex blocklisting —
+    is the codebase's chosen defense; the delimiters change how the model
+    interprets the content rather than attempting to catch every payload.
+
+    Delegates the wrap/no-wrap decision to ``_maybe_wrap_untrusted``, so
+    non-untrusted tools (skill_view, text_to_speech, ...), short outputs and
+    non-string values pass through unchanged.
+
+    There is deliberately NO "already wrapped" fast-path. A check for the
+    opening tag is attacker-forgeable: scraped text that merely begins with
+    ``<untrusted_tool_result ...>`` would then cross the boundary with no data
+    framing at all. Every high-risk result is instead re-wrapped and any
+    embedded delimiter token is defanged, so hostile content cannot close the
+    trust boundary early. This mirrors ``_maybe_wrap_untrusted`` exactly.
+    """
+    try:
+        from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
+
+        wrapped = _maybe_wrap_untrusted(tool_name, result)
+    except Exception as exc:  # never let the framing layer break a tool call
+        logger.debug("untrusted framing skipped for %s: %s", tool_name, exc)
+        return result
+    return wrapped if isinstance(wrapped, str) else result
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -213,7 +252,13 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    result = handle_function_call(tool_name, args or {})
+                    # Frame attacker-controllable output (browser_*/web_*/mcp_*)
+                    # before it reaches Codex — see _frame_untrusted_mcp_result.
+                    # Only the success-path result is framed; the JSON error
+                    # blob from the except branch below is our own diagnostic,
+                    # not scraped content, so it stays unwrapped.
+                    return _frame_untrusted_mcp_result(tool_name, result)
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
