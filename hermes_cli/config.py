@@ -4602,6 +4602,84 @@ def cron_model_drift_guard_enabled(
     return cron_config.get("model_drift_guard", True) is not False
 
 
+def cron_model_drift_equivalences(
+    config: Optional[Dict[str, Any]] = None,
+) -> list:
+    """Return operator-declared model/provider equivalence groups.
+
+    The spend-safety drift guard compares the model/provider a job resolved
+    to at creation against what it resolves to at fire time. A pure RENAME of
+    the same underlying model (a provider alias migration, e.g.
+    ``deepseek/deepseek-v4-flash`` -> ``deepseek-flash``) is not new spend,
+    but the guard cannot know that from the bare strings. Operators can
+    declare equivalence groups so a rename does not fail-closed a fleet of
+    unpinned jobs::
+
+        cron:
+          model_drift_equivalences:
+            - ["deepseek/deepseek-v4-flash", "deepseek-flash"]
+
+    Returns a list of normalized name sets. Never raises; malformed entries
+    are ignored so the fail-closed default is preserved.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return []
+    if not isinstance(config, dict):
+        return []
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return []
+    raw = cron_config.get("model_drift_equivalences")
+    # `hermes config set` stores structured values as JSON text, and hand
+    # edits may quote the value — accept both a native list and a JSON string
+    # so a correctly-intentioned config never silently degrades to no groups.
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            raw = _json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+    groups: list = []
+    for entry in raw:
+        if isinstance(entry, str):
+            import json as _json
+            try:
+                entry = _json.loads(entry)
+            except Exception:
+                entry = [entry]
+        if isinstance(entry, (list, tuple, set)):
+            names = {str(x).strip().lower() for x in entry if str(x).strip()}
+            if len(names) >= 2:
+                groups.append(names)
+    return groups
+
+
+def drift_names_equivalent(a: str, b: str, groups: Optional[list] = None) -> bool:
+    """True when *a* and *b* name the same model/provider.
+
+    Exact match, or both names sit in the same operator-declared
+    equivalence group (see :func:`cron_model_drift_equivalences`).
+    """
+    na = (a or "").strip().lower()
+    nb = (b or "").strip().lower()
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    for group in groups or ():
+        try:
+            if na in group and nb in group:
+                return True
+        except TypeError:
+            continue
+    return False
+
+
 def _cron_fleet_default_covers_axis(
     axis: str,
     config: Optional[Dict[str, Any]] = None,

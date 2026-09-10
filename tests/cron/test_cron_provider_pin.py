@@ -220,6 +220,7 @@ def _run_with_current_provider_and_model(
     model_drift_guard=None,
     cron_model=None,
     cron_model_provider=None,
+    model_drift_equivalences=None,
 ):
     """Drive run_job with resolved provider pinned and config.yaml model.default
     set to ``current_model`` (the unpinned-model fire-time source)."""
@@ -231,6 +232,13 @@ def _run_with_current_provider_and_model(
         cron_lines.append(f"  model: {cron_model}")
     if cron_model_provider is not None:
         cron_lines.append(f"  model_provider: {cron_model_provider}")
+    if model_drift_equivalences is not None:
+        import json as _json
+
+        cron_lines.append(
+            "  model_drift_equivalences: "
+            + _json.dumps(model_drift_equivalences)
+        )
     if cron_lines:
         config_yaml += "cron:\n" + "\n".join(cron_lines) + "\n"
     (tmp_path / "config.yaml").write_text(config_yaml)
@@ -394,3 +402,107 @@ class TestRuntimeResolutionTargetModel:
 
         assert captured.get("target_model") == "my-pinned-model"
         assert captured.get("requested") == "openrouter"
+
+
+class TestModelDriftEquivalences:
+    """cron.model_drift_equivalences: a pure RENAME of the same underlying
+    model must not fail-close an unpinned job as if it were new spend.
+
+    Repro (2026-09-11): DeepSeek V4.1 Flash became canonical as
+    ``deepseek-flash``; every unpinned job snapshotted months earlier as
+    ``deepseek/deepseek-v4-flash`` began failing closed on every tick even
+    though the resolved model was unchanged.
+    """
+
+    def test_equivalent_rename_does_not_fail_closed(self, tmp_path):
+        job = _base_job(
+            provider_snapshot="zai",
+            model_snapshot="deepseek/deepseek-v4-flash",
+        )
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job,
+                "zai",
+                "deepseek-flash",
+                tmp_path,
+                model_drift_equivalences=[
+                    ["deepseek-flash", "deepseek/deepseek-v4-flash",
+                     "deepseek-v4-flash"],
+                ],
+            )
+        assert agent_constructed is True, "a rename is not new spend"
+        assert success is True
+        assert final_response == "ok"
+
+    def test_rename_still_fails_closed_without_declared_equivalence(self, tmp_path):
+        """Baseline: without the equivalence group the same rename DOES skip."""
+        job = _base_job(
+            provider_snapshot="zai",
+            model_snapshot="deepseek/deepseek-v4-flash",
+        )
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job, "zai", "deepseek-flash", tmp_path
+            )
+        assert agent_constructed is False
+        assert success is False
+
+    def test_unrelated_model_change_still_fails_closed(self, tmp_path):
+        """Equivalence groups must not blanket-allow real model changes."""
+        job = _base_job(
+            provider_snapshot="zai",
+            model_snapshot="deepseek/deepseek-v4-flash",
+        )
+        success, output, final_response, error, agent_constructed = \
+            _run_with_current_provider_and_model(
+                job,
+                "zai",
+                "glm-5.2",
+                tmp_path,
+                model_drift_equivalences=[
+                    ["deepseek-flash", "deepseek/deepseek-v4-flash"],
+                ],
+            )
+        assert agent_constructed is False
+        assert success is False
+
+    def test_json_string_value_is_accepted(self, tmp_path):
+        """`hermes config set` stores structured values as JSON text."""
+        job = _base_job(
+            provider_snapshot="zai",
+            model_snapshot="deepseek-v4-flash",
+        )
+        # Force the string form by writing it directly.
+        config_yaml = (
+            "model:\n  default: deepseek-flash\n"
+            "cron:\n"
+            '  model_drift_equivalences: '
+            '[["deepseek-flash","deepseek-v4-flash"]]\n'
+        )
+        (tmp_path / "config.yaml").write_text(config_yaml)
+        fake_db = MagicMock()
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "zai",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+            agent_constructed = mock_agent_cls.called
+
+        assert agent_constructed is True
+        assert success is True
+

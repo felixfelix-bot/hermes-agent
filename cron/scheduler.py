@@ -3995,6 +3995,34 @@ def run_job(
         # unpinned cron jobs there, so the guard is skipped for that axis.
         if cron_model_drift_guard_enabled(_cfg):
             _drift: list[str] = []
+            # Operator-declared equivalences: a pure RENAME of the same
+            # underlying model (alias migration, e.g.
+            # `deepseek/deepseek-v4-flash` -> `deepseek-flash`) is not new
+            # spend and must not fail-close every unpinned job. See
+            # cron.model_drift_equivalences.
+            try:
+                from hermes_cli.config import (
+                    cron_model_drift_equivalences as _drift_equivs,
+                    drift_names_equivalent as _drift_eq,
+                )
+                _equiv_groups = _drift_equivs(_cfg)
+            except Exception:
+                _equiv_groups = []
+                _drift_eq = None
+
+            def _names_equivalent(_a: str, _b: str) -> bool:
+                """Exact match, or both names in one declared equiv group."""
+                _na, _nb = (_a or "").strip().lower(), (_b or "").strip().lower()
+                if not _na or not _nb:
+                    return False
+                if _na == _nb:
+                    return True
+                if _drift_eq is not None:
+                    try:
+                        return bool(_drift_eq(_na, _nb, _equiv_groups))
+                    except Exception:
+                        pass
+                return False
             _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
             if (
                 _provider_snapshot
@@ -4004,7 +4032,9 @@ def run_job(
                 _current_provider = str(
                     primary_provider_for_drift or runtime.get("provider") or ""
                 ).strip().lower()
-                if _current_provider and _current_provider != _provider_snapshot:
+                if _current_provider and not _names_equivalent(
+                    _provider_snapshot, _current_provider
+                ):
                     _drift.append(
                         f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                     )
@@ -4015,7 +4045,9 @@ def run_job(
                 and not _cron_default_model
             ):
                 _current_model = str(primary_model_for_drift or "").strip().lower()
-                if _current_model and _current_model != _model_snapshot:
+                if _current_model and not _names_equivalent(
+                    _model_snapshot, _current_model
+                ):
                     _drift.append(
                         f"model '{_model_snapshot}' -> '{_current_model}'"
                     )
