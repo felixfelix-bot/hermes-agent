@@ -22,17 +22,65 @@ two enabled levels — ``high`` and ``max`` — on the OpenAI-compatible endpoin
 (per Z.AI / BigModel docs).  Hermes' richer effort scale is collapsed onto
 those two so the user's effort preference actually reaches the model instead
 of being silently dropped.
+
+The same hook also carries productivity-gate §1.4 session attribution: when
+the effective endpoint is the loopback zai-proxy, the request gets an
+``X-Hermes-Session: <session id>`` header so the proxy can stamp
+``api_calls.session_id`` and token burn becomes attributable to a task/profile.
+Loopback-only — real Z.AI endpoints never receive the header.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
+
+# ---------------------------------------------------------------------------
+# Productivity-gate §1.4 — session attribution for the loopback zai-proxy.
+#
+# Provider-side half of the fix: the local zai-proxy
+# (``~/.hermes/bot/zai_proxy.py``) logs ``api_calls.session_id`` from the
+# ``X-Hermes-Session`` request header; this hook is what makes the client
+# actually send it. Header injection replaces the earlier orphaned version of
+# this patch that a fork sync on 2026-09-04 reset away (attribution had been
+# live 2026-08-16 → 2026-09-05, then dropped to ~0%).
+#
+# Loopback-only by design (design doc §7 risk #5): the header is an internal
+# attribution channel and must never leave the machine, so it is attached only
+# when the *effective* endpoint host is literal loopback. Anything else —
+# including the profile's own ``https://api.z.ai/api/paas/v4`` default and any
+# relay/aggregator — gets no header. Mirrors the OpenRouter plugin's
+# ``x-grok-conv-id`` precedent: a per-request header injected through the
+# ``build_api_kwargs_extras`` hook, no core transport change.
+# ---------------------------------------------------------------------------
+_SESSION_HEADER = "X-Hermes-Session"
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _endpoint_is_loopback(base_url: str | None) -> bool:
+    """True when ``base_url``'s host is literal loopback (never DNS-resolved).
+
+    A schemeless value (``localhost:9099``) is normalised first so it can't
+    slip past the guard, and unparseable input is treated as non-loopback —
+    fail closed, never leak the header.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "//" + raw
+    try:
+        host = (urlparse(raw).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOOPBACK_HOSTS
 
 
 def _model_supports_thinking(model: str | None) -> bool:
@@ -83,27 +131,50 @@ def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
 
 
 class ZaiProfile(ProviderProfile):
-    """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+    """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort.
+
+    Also carries the productivity-gate §1.4 session-attribution header when —
+    and only when — the effective endpoint is the loopback proxy.
+    """
 
     def build_api_kwargs_extras(
-        self, *, reasoning_config: dict | None = None, model: str | None = None, **context
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        model: str | None = None,
+        session_id: str | None = None,
+        base_url: str | None = None,
+        **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
-        if not _model_supports_thinking(model) and not _is_glm_5_2(model):
-            return extra_body, top_level
+        # Reasoning wiring — model-gated. NOTE: this block must not early-return
+        # any more: the session header below applies to every model, including
+        # ones that take no ``thinking`` field (glm-4-9b and earlier).
+        if _model_supports_thinking(model) or _is_glm_5_2(model):
+            # Only emit when the user expressed a preference; omitting the
+            # field keeps the server default (enabled) exactly as before.
+            if isinstance(reasoning_config, dict):
+                enabled = reasoning_config.get("enabled") is not False
+                extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
 
-        # Only emit when the user expressed a preference; omitting the field
-        # keeps the server default (enabled) exactly as before.
-        if isinstance(reasoning_config, dict):
-            enabled = reasoning_config.get("enabled") is not False
-            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            if _is_glm_5_2(model):
+                effort = _glm_5_2_reasoning_effort(reasoning_config)
+                if effort is not None:
+                    top_level["reasoning_effort"] = effort
 
-        if _is_glm_5_2(model):
-            effort = _glm_5_2_reasoning_effort(reasoning_config)
-            if effort is not None:
-                top_level["reasoning_effort"] = effort
+        # Session attribution (§1.4). Resolution: transport-supplied
+        # ``session_id`` (``agent.session_id``) first, then the process-wide
+        # ``HERMES_SESSION_ID`` export — that fallback covers paths which pass
+        # only the endpoint (aux client) and any client that sets only the env
+        # var. No session id, or a non-loopback endpoint → header omitted, so
+        # an unattributed call is always preferable to a leaked one.
+        sid = (session_id or os.environ.get("HERMES_SESSION_ID") or "").strip()
+        if sid and _endpoint_is_loopback(base_url or self.base_url):
+            headers = dict(top_level.get("extra_headers") or {})
+            headers[_SESSION_HEADER] = sid
+            top_level["extra_headers"] = headers
 
         return extra_body, top_level
 
