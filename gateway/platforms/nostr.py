@@ -190,7 +190,7 @@ class NostrAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to all configured relays and start listening."""
         if not self.relays or not self.groups:
             logger.error("Nostr: relays and groups are required")
@@ -246,7 +246,7 @@ class NostrAdapter(BasePlatformAdapter):
         logger.info("Nostr: connected to %d/%d relays", connected, len(self.relays))
         return True
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, is_reconnect: bool = False) -> None:
         """Disconnect from all relays and clean up."""
         self._running = False
 
@@ -348,9 +348,16 @@ class NostrAdapter(BasePlatformAdapter):
         if not group or group not in self.groups:
             return
 
-        # Skip our own messages (published by this adapter)
+        # Skip our own messages (published by this adapter) UNLESS they were
+        # injected by the relay bridge (marker tag) — those carry operator
+        # messages from Nostr and must be processed.
         if event.get("pubkey") == self._pubkey:
-            return
+            _bridged = any(
+                len(t) >= 2 and t[0] == "client" and t[1] == "hermes-relay-bridge"
+                for t in event.get("tags", [])
+            )
+            if not _bridged:
+                return
 
         content = event.get("content", "")
         if not content:
