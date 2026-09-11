@@ -48,6 +48,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -151,6 +152,25 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+_FALLBACK_DELIMITER_RE = re.compile(
+    r"untrusted[_\- ]?tool[_\- ]?result", re.IGNORECASE
+)
+
+
+def _fallback_defang(text: str) -> str:
+    """Defang ``untrusted_tool_result`` delimiter tokens without the shared
+    helper (used only when importing/calling that helper failed).
+
+    Mirrors ``agent.tool_dispatch_helpers._neutralize_delimiters``: the token
+    is rewritten rather than deleted, so embedded content cannot close the
+    fallback frame early while the text stays readable. A superset of the real
+    pattern (optional/dash separators) is matched deliberately — the fallback
+    has no shared constant to lean on, and over-matching here only costs
+    readability in an exceptional path.
+    """
+    return _FALLBACK_DELIMITER_RE.sub("untrusted-tool-result", text)
+
+
 def _frame_untrusted_mcp_result(tool_name: str, result: str) -> str:
     """Wrap results from attacker-controllable tools before they cross the
     MCP boundary to Codex.
@@ -184,10 +204,26 @@ def _frame_untrusted_mcp_result(tool_name: str, result: str) -> str:
         from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
 
         wrapped = _maybe_wrap_untrusted(tool_name, result)
-    except Exception as exc:  # never let the framing layer break a tool call
-        logger.debug("untrusted framing skipped for %s: %s", tool_name, exc)
-        return result
-    return wrapped if isinstance(wrapped, str) else result
+        return wrapped if isinstance(wrapped, str) else result
+    except Exception as exc:  # pragma: no cover - defensive
+        # Fail CLOSED. The framing helper is the only thing standing between
+        # attacker-controllable tool output and Codex's model, so silently
+        # returning the raw string here would hand an injection payload a free
+        # pass (`result` is the attacker's text, not ours). Apply a local
+        # fallback frame of identical shape instead: the call still succeeds,
+        # but the content is still marked as untrusted data. Over-framing a
+        # benign result in this exceptional path is the safe direction.
+        logger.warning(
+            "untrusted framing helper unavailable for %s (%s); "
+            "applying local fallback frame",
+            tool_name,
+            exc,
+        )
+        return (
+            f'<untrusted_tool_result source="{tool_name}">\n'
+            f"{_fallback_defang(result)}\n"
+            f"</untrusted_tool_result>"
+        )
 
 
 def _build_server() -> Any:
