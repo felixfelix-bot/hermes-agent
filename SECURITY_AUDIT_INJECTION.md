@@ -25,9 +25,15 @@ every value resolved from an external payload through `_sanitize_untrusted`
 (neutralizes chat-template escape tokens — `<|im_start|>`, `[INST]`,
 `</system>` — instruction-override phrases, and our own `<untrusted>`
 delimiter into a visible `[BLOCKED]` marker) before it is interpolated into a
-prompt. In agent mode (the default) values are additionally wrapped in
-`<untrusted>…</untrusted>` markers with a preamble instructing the model to
-treat them strictly as data. `deliver_only` routes and `_render_delivery_extra`
+prompt. In agent mode (the default) the *rendered prompt as a whole* is
+additionally enclosed in a single `<untrusted>…</untrusted>` frame with a
+preamble instructing the model to treat everything inside it strictly as data.
+Framing the rendered prompt once (rather than wrapping each substituted value)
+keeps legitimate template prose readable — `"Action: opened, PR: 7"` instead of
+`"Action: <untrusted>opened</untrusted>, PR: <untrusted>7</untrusted>"` — and
+costs nothing in coverage: every substituted token is payload-derived, so there
+is nothing an attacker can reach outside the frame. `deliver_only` routes and
+`_render_delivery_extra`
 render with `wrap_untrusted=False` — those outputs are user-facing messages
 or delivery routing parameters, not agent prompts — but sanitization still
 applies (defense-in-depth). The regex layer is justified here (unlike the
@@ -68,6 +74,37 @@ Tests: 27 new — 7 in `tests/agent/transports/test_hermes_tools_mcp_server.py`,
 2 in `tests/tools/test_browser_tool_untrusted.py` (added during the re-land;
 the original stash had no direct browser-seam coverage), and 18 in
 `tests/gateway/test_webhook_adapter.py` — all passing.
+
+## Cold-review round (2026-09-11, t_b36e7d7f)
+
+The re-landed series was put through a COLD cross-family review (kimi-k2.7-code,
+no shared context with the implementer). Verdict: **NO-GO** with three blocking
+findings. All three were real defects in the re-land, not false alarms, and all
+three are fixed in follow-up commits on the same branch:
+
+| Finding | Disposition |
+|---------|-------------|
+| MCP boundary failed **open**: `_frame_untrusted_mcp_result` returned the raw result on any exception from the shared framer | Fixed — the exceptional path now logs a warning and applies an equivalent *local* frame with defanged delimiters. Least-framed content still carries the untrusted marker; the call still succeeds |
+| Auxiliary frame did **not defang its own delimiters**: content containing `END UNTRUSTED CONTENT` could close the trust boundary early | Fixed — embedded `BEGIN/END UNTRUSTED CONTENT` markers have their spaces rewritten to hyphens (`_neutralize_aux_delimiters`), the same neutralize-don't-delete approach the tool-result path uses |
+| Reported broken assertion in `test_sanitize_strips_chat_template_tokens` | **Not reproducible** — a diff-rendering artifact of the reviewer's input: the angle-bracket/piped token (`<|im_end|>`) survives into the review prompt as bare `end_of_text`. The committed assertion is `assert "<|im_end|>" not in _sanitize_untrusted("end<|im_end|>")` and passes |
+
+Non-blocking findings were also acted on: the browser seam now imports the
+shared framer lazily and falls back to a local frame if the import fails (the
+previous top-level import broke a module-stub test); the webhook preamble now
+describes the single outer frame instead of per-value markers; and the review's
+coverage gaps (exception path, delimiters embedded in scraped text, the frame
+itself) are now pinned by tests in `tests/agent/test_auxiliary_untrusted_framing.py`,
+`tests/tools/test_browser_tool_untrusted.py`, and
+`tests/agent/transports/test_hermes_tools_mcp_server.py`.
+
+Known limits, deliberately not fixed here (documented rather than silently
+claimed away): the webhook regex layer is *defense-in-depth only* — it matches
+literal patterns, so encoded/novel forms evade it, and it will replace benign
+text (`"You are now a member"`, `"system: foo"`) with `[BLOCKED]`. Framing is
+the real control at every seam; the regex exists because webhook values are
+spliced into a *user-role* prompt, where delimiters alone cannot neutralize
+chat-template tokens. Entity/Unicode normalization is out of scope for this
+card and tracked separately.
 
 ### t_e9285c64 — Fix 4 flaky e2e tests (Plebeian)
 ### t_18b6f82f — Fix 26 failing e2e-infra smoke tests (Plebeian)
