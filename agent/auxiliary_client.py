@@ -108,6 +108,28 @@ _UNTRUSTED_AUXILIARY_PREAMBLE = (
 )
 
 
+_AUX_DELIMITER_RE = re.compile(
+    r"(?:BEGIN|END)\s+UNTRUSTED\s+CONTENT", re.IGNORECASE
+)
+
+
+def _neutralize_aux_delimiters(text: str) -> str:
+    """Defang boundary markers embedded in untrusted content.
+
+    The auxiliary frame below is delimited by literal ``BEGIN/END UNTRUSTED
+    CONTENT`` lines. A scraped page that contains ``END UNTRUSTED CONTENT``
+    would otherwise close the trustworthy part of the frame early, so anything
+    an attacker writes after it reads as text *outside* the data block. Spaces
+    inside the marker are rewritten to hyphens: the text stays readable, but it
+    no longer matches the real (space-separated) delimiter — the same
+    neutralize-don't-delete approach ``_neutralize_delimiters`` uses for
+    ``untrusted_tool_result`` in the main tool-result path.
+    """
+    return _AUX_DELIMITER_RE.sub(
+        lambda m: m.group(0).replace(" ", "-"), text
+    )
+
+
 def frame_untrusted_content(content: str, source_label: str = "web page") -> str:
     """Wrap external/untrusted text before feeding it to an auxiliary LLM.
 
@@ -115,6 +137,11 @@ def frame_untrusted_content(content: str, source_label: str = "web page") -> str
     model to treat it as data and ignore embedded instructions — mitigating
     indirect prompt injection at the secondary-LLM seam that the main
     tool-result wrapper does not cover.
+
+    Embedded copies of our own boundary marker are defanged first (see
+    ``_neutralize_aux_delimiters``), so the content cannot close the frame
+    early. The payload itself is never modified beyond that: this is framing,
+    not pattern blocklisting.
 
     Use for any secondary LLM call whose input includes raw page/scrape text
     (e.g. browser snapshot extraction, web_extract summarization). Pass the
@@ -126,7 +153,7 @@ def frame_untrusted_content(content: str, source_label: str = "web page") -> str
     return (
         f"{_UNTRUSTED_AUXILIARY_PREAMBLE}\n\n"
         f"--- BEGIN UNTRUSTED CONTENT (source: {source_label}) ---\n"
-        f"{content}\n"
+        f"{_neutralize_aux_delimiters(content)}\n"
         f"--- END UNTRUSTED CONTENT ---"
     )
 
