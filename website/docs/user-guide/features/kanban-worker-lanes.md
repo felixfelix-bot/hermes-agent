@@ -105,6 +105,7 @@ So lane authors don't have to reimplement these:
 - **Run-level retry** — when a task is retried (post-block, post-crash, post-reclaim), the worker can use the `expected_run_id` parameter on terminating tools to fail fast if its own run was already superseded.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
+- **Unassigned-card routing warning** — an unassigned `ready` card on a board whose host config sets `kanban.default_assignee` shows up as an `unassigned_default_assignee` warning the moment you inspect it (`hermes kanban show`, `hermes kanban diagnostics`): the dispatcher is about to hand that card to a profile you did not choose. The detail names the fallback profile and the remediation (`--hold` / `--initial-status blocked`, assign explicitly, or unset the key in the HOST profile's config).
 
 ## Related
 
