@@ -201,7 +201,7 @@ def test_profile_cap_wins_over_higher_dispatcher_cap(isolated_kanban_home_with_s
 
 def test_default_assignee_still_applies_and_clamp_holds(isolated_kanban_home_with_session_caps):
     """Incident repro: kanban.default_assignee points at the 1-slot profile
-    and four unassigned ready cards exist. #27145 semantics are untouched
+    and three unassigned ready cards exist. #27145 semantics are untouched
     (the cards still get assigned), but the clamp keeps the spawn count at
     one per tick instead of firing four workers into a one-slot profile."""
     kb = isolated_kanban_home_with_session_caps
@@ -219,3 +219,19 @@ def test_default_assignee_still_applies_and_clamp_holds(isolated_kanban_home_wit
             "SELECT assignee FROM tasks WHERE id = ?", (ids[0],)
         ).fetchone()
     assert rows["assignee"] == "worker-y"
+
+
+def test_default_profile_cap_comes_from_the_root_config(isolated_kanban_home_with_session_caps):
+    """``get_profile_dir("default")`` IS the hermes root, so the ``default``
+    profile's cap lives in <HERMES_HOME>/config.yaml — it must bind too."""
+    kb = isolated_kanban_home_with_session_caps
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    _seed(kb, "default", 3)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+    assert len(res.spawned) == 1, res.spawned
+    assert len(res.skipped_per_profile_session_capped) == 2
+    assert res.skipped_per_profile_capped == []
