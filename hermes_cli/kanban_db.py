@@ -4997,6 +4997,21 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_per_profile_session_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks deferred this tick because their assignee is already at the
+    ceiling implied by the TARGET profile's own
+    ``max_concurrent_sessions`` (the gateway's active-session cap) —
+    i.e. the effective ceiling was
+    ``min(kanban.max_in_progress_per_profile, <assignee> max_concurrent_sessions)``
+    and the profile's own slot count was the binding constraint. Each
+    entry is ``(task_id, assignee, current_running_count)``.
+
+    This is the guard that stops the dispatcher from firing N workers at
+    a profile that can only accept M < N sessions: those extra workers
+    exit immediately with "max_concurrent_sessions reached", their cards
+    loop back to ready, and the dispatcher crash-loops on them. Same
+    not-actionable semantics as ``skipped_per_profile_capped`` — the
+    task is picked up on a later tick once a slot frees."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -6199,6 +6214,64 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def resolve_profile_session_cap(profile: Optional[str]) -> Optional[int]:
+    """Session ceiling declared by a TARGET profile's own config.
+
+    Reads ``<profile home>/config.yaml`` using the same semantics the gateway
+    applies to its own ``max_concurrent_sessions``
+    (:func:`hermes_cli.active_sessions.resolve_max_concurrent_sessions`): a
+    positive int caps that profile's simultaneous sessions, while
+    ``null``/``0``/absent means UNCAPPED (never 0).
+
+    The embedded dispatcher runs under the *host* profile (typically
+    ``manager``) but spawns workers for OTHER profiles, whose session limits
+    live in their own config file — ``profiles/<assignee>/config.yaml`` (or
+    the root ``config.yaml`` for the ``default`` profile). Without this, a
+    fan-out can hand a one-slot profile several workers at once; the extras
+    exit immediately with ``max_concurrent_sessions reached``, their cards
+    bounce back to ready, and the dispatcher crash-loops on them
+    (plebeian-adr incident, Fix C).
+
+    Returns ``None`` (= uncapped) when the profile name is empty, the profile
+    directory or its config file is missing, the key is absent, or the file
+    cannot be parsed: a config read must never wedge dispatch.
+    """
+    if not profile:
+        return None
+    try:
+        # Local imports: avoids a module-level cycle (hermes_cli.profiles
+        # pulls in a large chunk of the CLI startup path).
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_cli.active_sessions import resolve_max_concurrent_sessions
+
+        cfg_path = get_profile_dir(profile) / "config.yaml"
+        if not cfg_path.is_file():
+            return None
+        # Read the profile's config.yaml raw, the same way
+        # ``hermes_cli.profiles._read_config_model`` does — no defaults merge,
+        # because we only care whether the operator declared a cap. The KEY
+        # PRECEDENCE (top-level ``max_concurrent_sessions`` with
+        # ``gateway.max_concurrent_sessions`` fallback, ``null``/``0`` =
+        # disabled) is delegated to the gateway's own resolver, so the clamp
+        # can never disagree with the limit the worker process enforces.
+        import yaml
+
+        with open(cfg_path, encoding="utf-8") as fh:
+            raw_cfg = yaml.safe_load(fh) or {}
+        if not isinstance(raw_cfg, dict):
+            return None
+        return resolve_max_concurrent_sessions(raw_cfg)
+    except Exception:
+        # Fail-open: an unreadable target config must never block dispatch.
+        _log.debug(
+            "kanban dispatch: could not resolve max_concurrent_sessions for "
+            "profile %r; treating it as uncapped",
+            profile,
+            exc_info=True,
+        )
+        return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -6318,13 +6391,50 @@ def dispatch_once(
         and max_in_progress_per_profile > 0
     ) else None
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Always count in-flight workers per assignee — the target profile's own
+    # ``max_concurrent_sessions`` can impose a ceiling even when the
+    # dispatcher-side ``kanban.max_in_progress_per_profile`` is unset. One
+    # cheap aggregate query per tick.
+    for prow in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Fix C: the TARGET profile's own session cap. ``max_concurrent_sessions``
+    # caps simultaneous gateway sessions for that profile; spawning more
+    # workers than that makes the extras exit immediately with
+    # "max_concurrent_sessions reached", which bounces the card back to ready
+    # and crash-loops the dispatcher (plebeian-adr incident). Resolved lazily
+    # per assignee, only for profiles that actually reach the cap check.
+    _profile_session_caps: dict[str, Optional[int]] = {}
+
+    def _profile_session_cap(assignee: str) -> Optional[int]:
+        if assignee not in _profile_session_caps:
+            _profile_session_caps[assignee] = resolve_profile_session_cap(assignee)
+        return _profile_session_caps[assignee]
+
+    def _effective_profile_cap(assignee: str) -> Optional[int]:
+        """min(dispatcher cap, target profile's session cap); None = uncapped."""
+        caps = []
+        if _per_profile_cap is not None:
+            caps.append(_per_profile_cap)
+        prof_cap = _profile_session_cap(assignee)
+        if prof_cap is not None:
+            caps.append(prof_cap)
+        return min(caps) if caps else None
+
+    def _cap_bucket(assignee: str, current: int):
+        """Pick the bucket + ceiling for a deferred (capped) spawn.
+
+        The profile-session bucket wins when the profile's own limit is the
+        binding constraint (that is the new signal operators need to see);
+        otherwise the pre-existing #21582 bucket is used, unchanged.
+        """
+        prof_cap = _profile_session_cap(assignee)
+        if prof_cap is not None and current >= prof_cap:
+            return result.skipped_per_profile_session_capped, prof_cap
+        return result.skipped_per_profile_capped, _per_profile_cap
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -6411,18 +6521,26 @@ def dispatch_once(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        # Per-profile concurrency cap: even if there's global headroom,
+        # refuse to spawn for an assignee that's already at its in-flight
+        # cap. Prevents one profile's local model / API quota / browser
+        # pool from being overwhelmed by a fan-out while the global
+        # max_in_progress / max_spawn caps still allow work on OTHER
+        # profiles.
+        #
+        # Two ceilings apply: the dispatcher-side
+        # ``kanban.max_in_progress_per_profile`` (#21582) and, since Fix C,
+        # the TARGET profile's own ``max_concurrent_sessions`` (the gateway
+        # slot count — a worker spawned past it dies on startup with
+        # "max_concurrent_sessions reached" and the card crash-loops). The
+        # effective ceiling is the lower of the two, and the bucket records
+        # which limit was binding.
+        effective_cap = _effective_profile_cap(row_assignee)
+        if effective_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
+            if current >= effective_cap:
+                bucket, _binding_cap = _cap_bucket(row_assignee, current)
+                bucket.append((row["id"], row_assignee, current))
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -6451,7 +6569,7 @@ def dispatch_once(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -6499,8 +6617,9 @@ def dispatch_once(
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            # (#21582 + the target-profile session clamp, Fix C).
+            # Subsequent ticks re-query from the DB.
+            if claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )

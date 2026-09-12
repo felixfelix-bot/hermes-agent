@@ -2326,6 +2326,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_per_profile_session_capped": [
+                {"task_id": tid, "assignee": who, "current": current}
+                for (tid, who, current) in res.skipped_per_profile_session_capped
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2358,6 +2362,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_per_profile_session_capped:
+        for tid, who, current in res.skipped_per_profile_session_capped:
+            print(
+                f"Deferred ({who} at its own max_concurrent_sessions cap, "
+                f"{current} running): {tid}"
             )
     if res.skipped_nonspawnable:
         print(
