@@ -1653,7 +1653,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    # Pass the runtime config so config-aware rules (triage-aux,
+    # unassigned-default-assignee) can fire here too — `show` is where an
+    # operator looks right after creating a card.
+    try:
+        from hermes_cli.config import load_config as _show_load_config
+        _show_diag_cfg = kd.config_from_runtime_config(_show_load_config())
+    except Exception:
+        _show_diag_cfg = None
+    diags = kd.compute_task_diagnostics(task, events, runs, config=_show_diag_cfg)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")

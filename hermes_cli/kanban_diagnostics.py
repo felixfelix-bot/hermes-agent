@@ -974,6 +974,83 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_unassigned_default_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """An unassigned ``ready`` card on a host with ``kanban.default_assignee``
+    set is about to be grabbed by the dispatcher.
+
+    This is the config-hygiene half of the plebeian-adr incident: the
+    operator's ``kanban.default_assignee`` pointed at a one-slot profile, so
+    every unassigned card — including gate/review cards created without an
+    assignee — was auto-routed there and crash-looped. ``stranded_in_ready``
+    deliberately stays silent for unassigned cards (its own docstring says the
+    operator response differs); this rule covers exactly that gap by warning
+    while the card is still unassigned AND a fallback profile is configured.
+
+    Fires only for a ready card with no assignee and no live claim. The
+    remediation is in the detail text: create such cards held
+    (``--initial-status blocked`` / ``--hold``) or unset
+    ``kanban.default_assignee`` in the HOST profile's config.
+    """
+    status = _task_field(task, "status")
+    if status != "ready":
+        return []
+    if _task_field(task, "claim_lock"):
+        return []
+    assignee = (_task_field(task, "assignee") or "").strip()
+    if assignee:
+        return []
+
+    kanban_cfg = cfg.get("kanban")
+    if not isinstance(kanban_cfg, dict):
+        return []
+    default_assignee = (kanban_cfg.get("default_assignee") or "").strip()
+    if not default_assignee:
+        return []
+
+    ts = int(_task_field(task, "created_at", default=0) or 0) or now
+    return [Diagnostic(
+        kind="unassigned_default_assignee",
+        severity="warning",
+        title=f"Unassigned ready card will be auto-assigned to {default_assignee}",
+        detail=(
+            f"This card has no assignee, but kanban.default_assignee="
+            f"{default_assignee!r} is set, so the dispatcher will assign and "
+            f"spawn it as soon as it ticks — you do not get to choose the "
+            f"worker. If that is intended, ignore this. If this card is a "
+            f"gate/hold placeholder that must NOT be dispatched, create it "
+            f"with `--initial-status blocked` (or the `--hold` alias) so it "
+            f"parks outside the dispatcher's reach, or unset "
+            f"`kanban.default_assignee` in the HOST profile's config (the "
+            f"profile the gateway runs as — the root config is not merged)."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Recreate the card held: hermes kanban create --hold \"<title>\"",
+                payload={"command": 'hermes kanban create --hold "<title>"'},
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Assign it to a specific profile",
+                payload={"command": f"hermes kanban assign {_task_field(task, 'id')} <profile>"},
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Or unset kanban.default_assignee in the host profile config",
+                payload={"command": "hermes config unset kanban.default_assignee"},
+            ),
+        ],
+        first_seen_at=ts,
+        last_seen_at=ts,
+        count=1,
+        data={
+            "default_assignee": default_assignee,
+            "suggested_config": "kanban.default_assignee",
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -985,6 +1062,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_unassigned_default_assignee,
 ]
 
 
@@ -999,6 +1077,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "unassigned_default_assignee",
 )
 
 

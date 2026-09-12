@@ -75,6 +75,81 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def kanban_config_source(key: str = "default_assignee") -> dict:
+    """Resolve WHICH config file supplied a ``kanban.<key>`` value.
+
+    The gateway reads exactly ONE config file — ``<HERMES_HOME>/config.yaml``,
+    which under a profile gateway is ``profiles/<profile>/config.yaml``. The
+    root ``~/.hermes/config.yaml`` is NOT merged in. Operators who edit the
+    root file therefore see no effect and no error: the root value is silently
+    shadowed (this was the plebeian-adr incident's Cause A — the operator's
+    ``worker-tollgate`` lived in the root file while the live dispatcher read
+    ``profiles/manager/config.yaml``).
+
+    Returns a dict:
+
+    * ``key`` — the ``kanban.<key>`` name that was probed.
+    * ``value`` — the winning value, or ``None`` when no candidate declares it.
+    * ``source`` — path (str) of the file that won, or ``None``.
+    * ``shadowed`` — list of path strings for other candidates that declare a
+      DIFFERENT value for the same key (the "you edited the wrong file" list).
+    * ``shadowed_values`` — ``{path: value}`` for those candidates, so a caller
+      can name the ignored value in a log line.
+    * ``consulted`` — every candidate path inspected, in precedence order.
+
+    Never raises: an unreadable candidate is skipped (this runs at gateway
+    boot and must not be able to break the dispatcher).
+    """
+    candidates: list[Path] = []
+    try:
+        from hermes_cli.config import get_config_path
+
+        candidates.append(Path(get_config_path()))
+        from hermes_constants import get_default_hermes_root
+
+        root_cfg = Path(get_default_hermes_root()) / "config.yaml"
+        if root_cfg not in candidates and root_cfg.exists():
+            candidates.append(root_cfg)
+    except Exception:
+        logger.debug("kanban dispatcher: config source probe unavailable", exc_info=True)
+
+    info: dict = {
+        "key": f"kanban.{key}",
+        "value": None,
+        "source": None,
+        "shadowed": [],
+        "shadowed_values": {},
+        "consulted": [str(p) for p in candidates],
+    }
+    declared: list[tuple[Path, Any]] = []
+    for path in candidates:
+        try:
+            import yaml
+
+            with open(path, encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            if not isinstance(raw, dict):
+                continue
+            kanban_cfg = raw.get("kanban")
+            if not isinstance(kanban_cfg, dict) or key not in kanban_cfg:
+                continue
+            declared.append((path, kanban_cfg.get(key)))
+        except Exception:
+            continue
+
+    if not declared:
+        return info
+
+    winner_path, winner_value = declared[0]
+    info["source"] = str(winner_path)
+    info["value"] = winner_value
+    for path, value in declared[1:]:
+        if value != winner_value:
+            info["shadowed"].append(str(path))
+            info["shadowed_values"][str(path)] = value
+    return info
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -761,11 +836,27 @@ class GatewayKanbanWatchersMixin:
         # backward-compatible with existing installs.
         default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
         if default_assignee:
+            # Fix D: name the config file the value came from. Under a profile
+            # gateway the winner is profiles/<profile>/config.yaml and the
+            # root ~/.hermes/config.yaml is NOT merged — operators who edit the
+            # root file need to see that in the log (plebeian-adr Cause A).
+            source_info = kanban_config_source("default_assignee")
             logger.info(
                 "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
-                "will route to this profile)",
+                "will route to this profile) [config source: %s]",
                 default_assignee,
+                source_info.get("source") or "unknown",
             )
+            for shadowed_path in source_info.get("shadowed") or []:
+                logger.warning(
+                    "kanban dispatcher: kanban.default_assignee=%r in %s is "
+                    "SHADOWED by %s=%r — the active config wins; edit the "
+                    "active file to change the fallback profile",
+                    (source_info.get("shadowed_values") or {}).get(shadowed_path),
+                    shadowed_path,
+                    source_info.get("source"),
+                    default_assignee,
+                )
 
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
         # cap (#21582). When set, no single profile gets more than N
@@ -1094,14 +1185,20 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                session_capped = 0
                 for slug, res in (results or []):
+                    if res is not None:
+                        session_capped += len(
+                            getattr(res, "skipped_per_profile_session_capped", None) or []
+                        )
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
                             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d "
+                            "session_capped=%d",
                             slug,
                             len(res.spawned),
                             res.reclaimed,
@@ -1109,6 +1206,9 @@ class GatewayKanbanWatchersMixin:
                             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            len(
+                                getattr(res, "skipped_per_profile_session_capped", None) or []
+                            ),
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
@@ -1126,6 +1226,16 @@ class GatewayKanbanWatchersMixin:
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
                         )
+                        if session_capped:
+                            logger.warning(
+                                "kanban dispatcher: %d ready card(s) are deferred "
+                                "this tick by the per-profile session clamp (the "
+                                "target profile's own max_concurrent_sessions). "
+                                "Raise that profile's max_concurrent_sessions or "
+                                "lower kanban.max_in_progress_per_profile if this "
+                                "queue should drain faster.",
+                                session_capped,
+                            )
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
