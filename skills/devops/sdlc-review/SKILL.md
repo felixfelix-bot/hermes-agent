@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -34,6 +34,38 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 - Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
 - Workspace access through `read_file`, `search_files`, and `terminal` when the deliverable is code.
 - The task's original specification, acceptance criteria, handoff summary, and prior run history must be available through `kanban_show`.
+
+## Live CI evidence (mandatory)
+
+Before choosing any verdict — and before trusting a handoff that claims "tests pass" or "CI green" — obtain the **live CI evidence for the exact head under review**. A handoff summary, a green PR status rollup, or a passing local run is not CI evidence.
+
+Resolve the head SHA from the artifact under review (e.g. `git rev-parse HEAD` in the checked-out worktree), then query the ngit CI kind-9842 workflow-result events:
+
+```bash
+python3 ~/.hermes/profiles/manager/scripts/ngit_ci_evidence.py REPO_IDENTIFIER --commit SHA
+```
+
+`REPO_IDENTIFIER` is the repo-id part of the ngit coordinate (`30617:<maintainer-hex>:<repo-id>`) or a distinctive substring of it. The helper is read-only — it never pushes, publishes or triggers. The raw relay query it wraps is:
+
+```bash
+nak req -k 9842 -l 100 wss://relay.ngit.dev wss://gitnostr.com
+```
+
+Exit codes are gate-meaningful:
+
+| Exit | Meaning |
+|---|---|
+| 0 | results found, every conclusion is `success` |
+| 1 | results found, at least one non-success conclusion |
+| 2 | **no results found** — no evidence |
+
+Rules — all mandatory:
+
+- **No results is not green.** Exit 2 means there is no CI evidence for that head. Never treat it as a pass and never accept a claim of CI success in its place.
+- **An empty GitHub status rollup is not green.** A PR status showing no checks (or checks absent / `pending` for the head) is an absence of evidence, not evidence of success.
+- **A verdict must cite per-workflow conclusions** — the workflow path plus its conclusion, e.g. `ngit CI .github/workflows/ci.yml -> success` — **or** state the documented absence verbatim: `no CI evidence available (reason: <...>)`.
+- A non-`success` conclusion (exit 1) must be named in the verdict together with why it is unrelated, or the verdict is request-changes / escalate. Never silently approve a red or unknown head.
+- Record the citation in the terminal Kanban transition metadata so the fleet `ci_evidence` gate (D-128) can read it, using the structured form `ci_evidence: workflow=<path> conclusion=<success|failure|timed_out>`. A documented absence is recorded but does **not** satisfy the `code` (code/risky) tier.
 
 ## How to Run
 
@@ -171,6 +203,7 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 Before submitting the verdict, confirm:
 
 - [ ] `kanban_show` was read for the current task and run.
+- [ ] Live CI evidence for the exact head under review was obtained (or its documented absence recorded); "no results" (exit 2) was not treated as green.
 - [ ] Every acceptance criterion was mapped to evidence.
 - [ ] The actual deliverable was inspected.
 - [ ] Relevant focused checks were run or an explicit reason was recorded when execution was impossible.
