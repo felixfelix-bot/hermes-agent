@@ -57,6 +57,8 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
+**Run ownership is explicit — never re-derive it from the task id alone.** Every lifecycle write is pinned to the *run* that owns it, not just to the card: workers carry `HERMES_KANBAN_RUN_ID`, and the kernel refuses a failure or termination whose id is no longer `tasks.current_run_id`. That matters because a worker can outlive its own run — a process that keeps turning after `kanban_complete` / `kanban_request_review` closed its run (a *zombie*) would otherwise attribute its late write to whatever run is current *then*, i.e. the **next** worker's: closing it, releasing its claim (so the successor's own `kanban_complete` is refused as "unknown id or already terminal") and inflating `consecutive_failures` on a card with no real defect. With the pin, such a write is a no-op: nothing is recorded, no claim is touched, and the refusal is logged. Options that only narrow the window (killing the CLI right after a terminal transition, refusing to dispatch while the previous PID lives) do not close it; the run pin does.
+
 ## Outputs and the review handoff
 
 For code-changing tasks, pick the review model encoded by the task graph:

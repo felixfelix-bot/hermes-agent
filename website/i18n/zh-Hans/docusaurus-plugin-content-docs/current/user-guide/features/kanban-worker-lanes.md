@@ -57,6 +57,8 @@ Hermes Kanban 拥有生命周期的真实状态——`ready` → `running` → `
 
 kanban 内核强制要求每次运行恰好由其中一项终止。既未调用任何终止工具又正常退出的 worker 将被视为崩溃。
 
+**运行归属是显式的——绝不可只依据任务 id 推断。**每次生命周期写入都绑定到拥有它的 *run*，而不仅仅是卡片：worker 携带 `HERMES_KANBAN_RUN_ID`，内核会拒绝任何 id 已不等于 `tasks.current_run_id` 的失败/终止写入。这一点至关重要，因为 worker 可能比自己的 run 存活更久——一个在 `kanban_complete` / `kanban_request_review` 关闭其 run 之后仍在继续运转的进程（*僵尸*）否则会把它迟到的写入记到"当时"的当前 run 上，也就是**下一个** worker 的 run：关闭该 run、释放其 claim（于是继任者自己的 `kanban_complete` 会被以"unknown id or already terminal"拒绝），并在毫无真实缺陷的卡片上抬高 `consecutive_failures`。有了这个绑定，此类写入将成为空操作：不记录任何内容、不触碰任何 claim，并记录一条拒绝日志。只缩小窗口的方案（终止转换后立刻杀掉 CLI、上一个 PID 仍存活时拒绝派发）并不能消除该问题；run 绑定才能。
+
 ## 输出与审查交接
 
 代码变更任务必须按照任务图选择审查模型：

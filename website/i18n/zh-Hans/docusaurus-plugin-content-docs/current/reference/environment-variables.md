@@ -549,6 +549,7 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 | `HERMES_QUIET` | 抑制非必要输出（`true`/`false`） |
 | `CODEX_HOME` | 启用 [Codex 应用服务器运行时](../user-guide/features/codex-app-server-runtime)时，覆盖 Codex CLI 读取其配置 + 认证的目录（默认：`~/.codex`）。Hermes 的迁移将托管块写入 `<CODEX_HOME>/config.toml`。 |
 | `HERMES_KANBAN_TASK` | kanban 调度器生成工作进程时设置（任务 UUID）。工作进程和生成的 `hermes-tools` MCP 子进程继承它，以便 kanban 工具正确门控。请勿手动设置。 |
+| `HERMES_KANBAN_RUN_ID` | 由 kanban 调度器与 `HERMES_KANBAN_TASK` 一并设置——即所生成工作进程拥有的 `task_runs` 行。它是工作进程的运行归属绑定：任何生命周期写入（失败/超时/终止）若其 id 已不等于任务的 `current_run_id` 就会被拒绝，因此比自身 run 存活更久的进程无法关闭继任者的 run。请勿手动设置。 |
 | `HERMES_API_TIMEOUT` | LLM API 调用超时（秒，默认：`1800`） |
 | `HERMES_API_CALL_STALE_TIMEOUT` | 非流式过期调用超时（秒，默认：`300`）。未设置时对本地提供商自动禁用。也可通过 `config.yaml` 中的 `providers.<id>.stale_timeout_seconds` 或 `providers.<id>.models.<model>.stale_timeout_seconds` 配置。 |
 | `HERMES_STREAM_READ_TIMEOUT` | 流式 socket 读取超时（秒，默认：`120`）。对本地提供商自动增大到 `HERMES_API_TIMEOUT`。如果本地 LLM 在长代码生成期间超时，请增大此值。 |

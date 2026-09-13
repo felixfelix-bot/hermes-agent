@@ -152,7 +152,31 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
+        #
+        # Run ownership is passed EXPLICITLY (``HERMES_KANBAN_RUN_ID`` →
+        # ``expected_run_id``). ``HERMES_KANBAN_TASK`` alone identifies the
+        # CARD, and by the time this budget-exhausted path fires the process
+        # may already have handed the card off (``kanban_request_review`` /
+        # ``kanban_complete`` closed its run) and kept turning — a zombie.
+        # Keyed on the task id only, this write closed whatever run happened
+        # to be current *then*: on 2026-09-13 it killed a 42-second review run
+        # on t_87e5657d, released the reviewer's claim (so its
+        # ``kanban_complete`` was refused as "unknown id or already
+        # terminal") and inflated ``consecutive_failures`` on a card with no
+        # defect. ``_record_task_failure`` now refuses the write when
+        # ``expected_run_id`` is not the current run. Never re-derive run
+        # ownership from the task id alone.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        _kanban_run_id = None
+        _raw_kanban_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        if _raw_kanban_run_id:
+            try:
+                _kanban_run_id = int(_raw_kanban_run_id)
+            except ValueError:
+                logger.warning(
+                    "invalid HERMES_KANBAN_RUN_ID=%r — recording without a "
+                    "run-ownership pin", _raw_kanban_run_id,
+                )
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
@@ -170,15 +194,36 @@ def finalize_turn(
                         outcome="timed_out",
                         release_claim=True,
                         end_run=True,
+                        expected_run_id=_kanban_run_id,
                         event_payload_extra={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
                     )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    # The ownership guard inside ``_record_task_failure`` is
+                    # authoritative and may have refused this write (stale
+                    # run). Report what the board actually shows rather than
+                    # claiming a write that may not have happened.
+                    if (
+                        _kanban_run_id is None
+                        or _kb._current_run_id(_conn, _kanban_task)
+                        != _kanban_run_id
+                    ):
+                        logger.info(
+                            "recorded budget-exhausted failure for task %s "
+                            "(run %s, %d/%d)",
+                            _kanban_task, _kanban_run_id,
+                            api_call_count, agent.max_iterations,
+                        )
+                    else:
+                        logger.warning(
+                            "refused budget-exhausted failure for task %s: "
+                            "this process owns run %s but run %s is current "
+                            "(superseded worker must not close a successor's "
+                            "run)",
+                            _kanban_task, _kanban_run_id,
+                            _kb._current_run_id(_conn, _kanban_task),
+                        )
                 finally:
                     try:
                         _conn.close()

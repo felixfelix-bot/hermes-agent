@@ -8768,6 +8768,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8778,7 +8779,26 @@ def _record_task_failure(
     auto-block threshold stay consistent.
 
     Returns True when the task was auto-blocked (counter reached
-    ``failure_limit``), False when it was just updated in place.
+    ``failure_limit``), False when it was just updated in place (or when
+    the run-ownership guard below refused the write).
+
+    Run-ownership invariant (never re-derive it from the task id alone)
+    ------------------------------------------------------------------
+    ``expected_run_id`` is the run the CALLER owns — for a dispatcher-spawned
+    worker that is ``HERMES_KANBAN_RUN_ID``, which ``_default_spawn`` exports
+    alongside ``HERMES_KANBAN_TASK``. When it is supplied and no longer equals
+    ``tasks.current_run_id``, this function is a deliberate no-op: it records
+    no failure, increments no counter, closes no run, emits no event and
+    releases no claim. ``HERMES_KANBAN_TASK`` identifies the CARD, not the
+    RUN, so a worker that outlives its own run (a kanban worker that kept
+    turning after ``kanban_complete`` / ``kanban_request_review`` closed it)
+    would otherwise close, claim-release and failure-count the NEXT worker's
+    run — the live t_87e5657d incident of 2026-09-13, where a zombie's
+    budget-exhausted write killed a 42-second review run and took
+    ``consecutive_failures`` 1 -> 2 on a card with no real defect. Callers
+    that know their run id MUST pass it; ``None`` preserves the legacy
+    unpinned behaviour for dispatcher-internal callers (spawn/reap paths)
+    that are authoritative by construction.
 
     Modes:
 
@@ -8821,6 +8841,27 @@ def _record_task_failure(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        # Run-ownership guard — see the "Run-ownership invariant" section of
+        # this function's docstring. A caller whose run is no longer the
+        # task's ``current_run_id`` has been superseded (handed off, reclaimed
+        # or already closed); it must not be able to close, claim-release or
+        # failure-count a successor's run. Refuse BEFORE any write, so the
+        # no-op is total: counter, claim, runs and events all stay as they
+        # were. (Read + guard + writes share one BEGIN IMMEDIATE txn, so a
+        # concurrent claim cannot slip in between the check and the update.)
+        if (
+            expected_run_id is not None
+            and row["current_run_id"] != int(expected_run_id)
+        ):
+            _log.warning(
+                "refusing %s for task %s: caller owns run %s but the current "
+                "run is %s — stale worker must not close a successor's run",
+                outcome,
+                task_id,
+                expected_run_id,
+                row["current_run_id"],
+            )
             return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])

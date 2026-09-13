@@ -192,6 +192,10 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         outcome="timed_out",
         release_claim=True,
         end_run=True,
+        # No HERMES_KANBAN_RUN_ID in this env: the legacy unpinned path, kept
+        # for callers that never had a run id (see the run-ownership invariant
+        # in kanban_db._record_task_failure).
+        expected_run_id=None,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
 
