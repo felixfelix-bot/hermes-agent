@@ -3245,6 +3245,11 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # D-136 option B: inject recon tags into the body for recon
+                # boards so board_tags()/classify_tier() resolves the card
+                # to the docs tier without per-card manual steps.
+                body = _maybe_inject_recon_tags(board, body)
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -6875,6 +6880,8 @@ def specify_triage_task(
             params.append(title.strip())
             changed_fields.append("title")
         if body is not None and (body or "") != (existing["body"] or ""):
+            # D-136 option B: inject recon tags for recon-board tasks.
+            body = _maybe_inject_recon_tags(_board_slug_from_conn(conn), body)
             sets.append("body = ?")
             params.append(body)
             changed_fields.append("body")
@@ -6921,6 +6928,113 @@ def specify_triage_task(
     # idling in 'todo' until the next sweep.
     recompute_ready(conn)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Recon-board tag injection (D-136 option B)
+# ---------------------------------------------------------------------------
+# Boards whose every card is read-only recon / inventory / measurement work.
+# Cards created on these boards always get ``tags: no-code,docs`` injected into
+# the body so ``board_tags()`` / ``classify_tier()`` resolves them to the
+# ``docs`` (or ``recon``) tier without per-card manual steps.
+_RECON_BOARDS: frozenset[str] = frozenset({"house-keeping"})
+
+# Mixed boards that *contain* recon cards alongside code-shipping cards (D-136
+# §4 candidates).  Per-card tags are the right instrument here — a board-level
+# ``board_tiers`` mapping would silently downgrade genuinely code-producing
+# cards to an advisory tier.  We inject tags only when the card body looks
+# like read-only recon / inventory / measurement work and NOT like
+# code-shipping work.
+_MIXED_RECON_BOARDS: frozenset[str] = frozenset({
+    "llm-routing",
+    "net4sats-mvp-v2",
+    "plebeian-my-prs",
+    "meshcore",
+    "balloon",
+    "plebeian-pr-reviews",
+    "conwrt",
+    "merchant-routing",
+})
+
+# Heuristic keywords for recon vs code work, used only on mixed boards.
+_RECON_BODY_RE = re.compile(
+    r"\b(?:recon|inventory|measurement|read-only|audit|survey|classify|"
+    r"enumerate|refresh|consolidate|fragment|evidence|inspect|scan|"
+    r"report|baseline|snapshot|verify|identify|collect|gather|"
+    r"read\s+only|no\s+repo|scratch\s+workspace)\b",
+    re.I,
+)
+_CODE_BODY_RE = re.compile(
+    r"\b(?:implement|fix|build|deploy|commit|push|pull\s+request|"
+    r"merge|release|feature|bugfix|patch|firmware|flash|compile|"
+    r"install|upgrade|configure|refactor|write\s+test|lint|format)\b",
+    re.I,
+)
+
+_RECON_TAG_LINE = "tags: no-code,docs"
+
+
+def _board_slug_from_conn(conn: sqlite3.Connection) -> Optional[str]:
+    """Best-effort recovery of the board slug from an open kanban connection.
+
+    The kanban DB path encodes the board: ``<root>/kanban.db`` for the
+    default board, ``<root>/kanban/boards/<slug>/kanban.db`` for named
+    boards.  We parse the path to recover the slug so the recon-tag
+    injection can decide whether the board is a recon board.
+    """
+    try:
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    except Exception:
+        return None
+    if not db_path:
+        return None
+    db_path = Path(db_path).resolve()
+    # default board: <root>/kanban.db
+    if db_path.name == "kanban.db" and db_path.parent.name != "boards":
+        return DEFAULT_BOARD
+    # named board: <root>/kanban/boards/<slug>/kanban.db
+    if db_path.name == "kanban.db" and db_path.parent.parent.name == "boards":
+        return db_path.parent.name
+    return None
+
+
+def _maybe_inject_recon_tags(
+    board: Optional[str],
+    body: Optional[str],
+) -> Optional[str]:
+    """Inject ``tags: no-code,docs`` into *body* for recon-board cards.
+
+    For pure recon boards (``house-keeping``), always inject — every card is
+    read-only recon / inventory / measurement work.
+
+    For mixed boards (D-136 §4 candidates), inject only when the body looks
+    like read-only recon / inventory / measurement work and NOT like
+    code-shipping work.  This prevents a board-level downgrade of genuinely
+    code-producing cards.
+
+    For all other boards, return *body* unchanged.
+
+    The tag line is appended in the exact format ``board_tags()`` already
+    parses: ``tags: no-code,docs``.  If the body already contains the tag
+    line, it is not duplicated.
+    """
+    if not body or not isinstance(body, str):
+        return body
+    try:
+        slug = _normalize_board_slug(board) or get_current_board()
+    except Exception:
+        return body
+    if slug in _RECON_BOARDS:
+        pass  # always inject
+    elif slug in _MIXED_RECON_BOARDS:
+        # Only tag if the body reads like recon AND not like code.
+        if not _RECON_BODY_RE.search(body) or _CODE_BODY_RE.search(body):
+            return body
+    else:
+        return body  # not a recon board
+    if _RECON_TAG_LINE in body:
+        return body  # already tagged
+    return body.rstrip() + "\n\n" + _RECON_TAG_LINE
 
 
 def decompose_triage_task(
@@ -7040,6 +7154,8 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
+            # D-136 option B: inject recon tags for recon-board children.
+            body = _maybe_inject_recon_tags(_board_slug_from_conn(conn), body)
             assignee = _canonical_assignee(child.get("assignee"))
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
