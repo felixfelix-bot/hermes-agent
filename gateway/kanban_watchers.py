@@ -58,19 +58,188 @@ def _resolve_auto_decompose_settings(
 
 
 def _kanban_dispatch_allowed() -> bool:
-    """Return False while the global emergency stop (`hermes pause`) is engaged.
+    """Return False while any fleet freeze sentinel is engaged.
 
-    Checked every dispatcher tick BEFORE spawning new workers so a pause takes
-    effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
-    module is unimportable, dispatch proceeds (the sentinel gate must not
-    become a new crash surface for the dispatcher).
+    Honors, in order: the global emergency stop (`hermes pause` -> ESTOP), the
+    legacy ``~/.hermes/bot/.dispatch_frozen`` flag written by the bleed guard,
+    and the ``~/.hermes/bot/.fleet_quarantine`` sentinel (Phase H). Checked
+    every dispatcher tick BEFORE spawning new workers so a freeze takes effect
+    on the next tick without a gateway restart. In-flight workers are never
+    touched — this only stops NEW spawns.
+
+    Fails open on import/sensor errors so the gate can never wedge dispatch —
+    except the file checks, which are cheap ``os.stat`` calls. (OPERATOR
+    2026-09-11, H.4: previously only ESTOP was honored here; `.dispatch_frozen`
+    was ignored by the embedded dispatcher, so a bleed-guard freeze did not
+    actually stop in-process dispatch.)
     """
     try:
         from agent.estop import check_paused
     except ImportError:
-        return True
-    return not check_paused("kanban", logger)
+        check_paused = None
+    if check_paused is not None and check_paused("kanban", logger):
+        return False
+    try:
+        bot = Path(os.path.expanduser("~/.hermes/bot"))
+        if (bot / ".dispatch_frozen").exists() or (bot / ".fleet_quarantine").exists():
+            return False
+    except OSError:
+        pass
+    return True
+
+
+def _board_no_llm_dispatch(slug: str) -> bool:
+    """True when a board opts out of LLM worker dispatch.
+
+    Read from ``board.json`` ``"no_llm_dispatch": true``. Used for boards whose
+    work is deterministic tooling the LLM only orchestrates (e.g. PCB autoroute
+    via freerouting/krt/DRC) — dispatching agents at those burns slots/tokens
+    for no gain (2026-09-17: a PCB card looped 46x). Fail-open on any error.
+    """
+    try:
+        import json as _json
+        from hermes_constants import get_hermes_home
+        bj = get_hermes_home() / "kanban" / "boards" / slug / "board.json"
+        return bool((_json.loads(bj.read_text()) or {}).get("no_llm_dispatch"))
+    except Exception:
+        return False
+
+
+def _compute_dispatch_headroom(
+    static_cap: "Optional[int]" = None,
+) -> dict:
+    """Compute multi-dimensional dispatch headroom in-process.
+
+    Combines the 6-state resource Kalman (memory/cpu/swap/disk/tokens/workers)
+    with the LLM price/quota gate (``/v1/dispatch_gate`` on the zai proxy) into
+    a single ``{target_workers, per_dimension, reason, can_dispatch}`` decision.
+
+    ``target_workers`` is a throttle (0..static_cap), not a binary gate: each
+    dimension contributes a "how many workers can the box afford" figure and
+    the fleet is limited by the minimum. A floor of 1 is kept unless a
+    dimension is critical.
+
+    Fail-open: any sensor error returns a safe floor (1 worker) so a broken
+    sensor can never wedge dispatch (same contract as the estop gate).
+    """
+    import json as _json
+    import urllib.request as _urllib
+
+    per_dim: dict = {}
+    target = static_cap if static_cap and static_cap >= 1 else 3
+    reason = "no sensors"
+
+    # ── 1. Resource pressure (memory / cpu / swap / disk) ──
+    # Current reality (latest raw sample) drives the hard gate; the Kalman is
+    # used only for an early-warning reduction, so a fast-clearing spike can't
+    # hold dispatch on a lagging filtered estimate. Disk hold relaxed to 90%
+    # (operator 2026-09-11): the box runs near-full by design, so only a
+    # genuine 90% emergency holds dispatch; the preventive cleanup task fires
+    # at the softer warning band well before that.
+    _RAW_THRESHOLDS = {
+        "cpu_load": 8.0,
+        "memory_pct": 85.0,
+        "swap_used_pct": 80.0,
+        "disk_used_pct": 90.0,
+    }
+    raw = {k: 0.0 for k in _RAW_THRESHOLDS}
+    try:
+        import sqlite3 as _sqlite3
+        _c = _sqlite3.connect(
+            f"file:{Path.home()/'.hermes'/'bot'/'zai_usage.db'}?mode=ro",
+            uri=True, timeout=5,
+        )
+        _row = _c.execute(
+            "SELECT cpu_load_1m, memory_used_percent, swap_used_percent, "
+            "disk_used_percent FROM resource_metrics ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        _c.close()
+        if _row:
+            raw = {
+                "cpu_load": float(_row[0] or 0.0),
+                "memory_pct": float(_row[1] or 0.0),
+                "swap_used_pct": float(_row[2] or 0.0),
+                "disk_used_pct": float(_row[3] or 0.0),
+            }
+    except Exception:
+        pass
+
+    # Kalman early-warning: which dimensions are trending toward a breach.
+    kalman_warn = set()
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path.home() / ".hermes" / "bot"))
+        from multi_resource_kalman import (
+            MultiResourceKalmanPredictor,
+            get_resource_history,
+        )
+        history = get_resource_history(hours=2)
+        if len(history) >= 3:
+            pred = MultiResourceKalmanPredictor()
+            for h in history:
+                pred.update({k: h.get(k, 0.0) for k in pred.RESOURCES})
+            for w in pred.get_resource_warnings(minutes_ahead=30):
+                kalman_warn.add(w.get("resource", "").lower())
+    except Exception as exc:
+        logger.warning("kanban dispatcher: resource Kalman unavailable (%s)", exc)
+
+    for _res, _thr in _RAW_THRESHOLDS.items():
+        _rv = raw.get(_res, 0.0)
+        if _rv >= _thr:
+            per_dim[_res] = 0.0            # current breach -> hold
+        elif _rv >= _thr * 0.9:
+            per_dim[_res] = 0.5            # close to threshold -> throttle
+        elif _res in kalman_warn:
+            per_dim[_res] = 0.5            # predicted breach -> early throttle
+        else:
+            per_dim[_res] = 1.0
+
+    # ── 2. LLM price/quota gate (market-based live router) ──
+    llm_headroom = 1.0
+    try:
+        req = _urllib.Request(
+            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
+            headers={"Accept": "application/json"},
+        )
+        with _urllib.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
+        per_dim["llm"] = llm_headroom
+        reason = data.get("reason", reason)
+    except Exception as exc:
+        logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
+        per_dim.setdefault("llm", 1.0)
+
+    # ── 3. Fold to a target worker count (throttle, not binary) ──
+    # Each dimension's headroom (0..1) scales the cap; the fleet is the min.
+    # A critical dimension (headroom 0) forces target 0 unless it's the only
+    # signal we have (fail-open floor of 1).
+    if per_dim:
+        min_headroom = min(per_dim.values())
+        if min_headroom <= 0.0:
+            target = 0
+        else:
+            target = max(1, int(round((static_cap or 3) * min_headroom)))
+    else:
+        target = 1  # no sensors at all -> safe floor
+
+    result = {
+        "target_workers": target,
+        "can_dispatch": target > 0,
+        "per_dimension": per_dim,
+        "reason": reason,
+    }
+    # Persist so the task-lifecycle governor (Phase 7) reads the SAME headroom
+    # signal and never revives into a starved box. Fail-open: a write error
+    # must not affect the dispatch decision.
+    try:
+        import json as _json
+        _p = Path.home() / ".hermes" / "bot" / "dispatch_headroom.json"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.write_text(_json.dumps(result), encoding="utf-8")
+    except Exception:
+        pass
+    return result
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -1134,6 +1303,14 @@ class GatewayKanbanWatchersMixin:
         # pass. Set false to keep orphans frozen for manual forensics.
         reconcile_orphans = bool(kanban_cfg.get("reconcile_orphans", True))
 
+        # kanban.urgency_required (config.yaml, default true): the mandatory
+        # urgency gate. Ready cards with a NULL urgency column are parked in
+        # `scheduled` before the spawn loop sees them, so no spawn path can
+        # dispatch unclassified work. The `urgency-triage` classifier stamps a
+        # now|soon|defer|batch level and releases the card. Boards without the
+        # external urgency migration are left untouched (fail-open per board).
+        urgency_required = bool(kanban_cfg.get("urgency_required", False))
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -1271,6 +1448,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    urgency_required=urgency_required,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1309,20 +1487,155 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
+        def _count_running_across_boards(boards) -> int:
+            """Total 'running' tasks across ALL boards (global in-flight count).
+
+            ``max_in_progress``/``max_spawn`` are per-board caps inside
+            ``dispatch_once``; with many boards the fleet total is unbounded.
+            This is the global limiter the fleet actually needs.
+            """
+            total = 0
+            for b in boards:
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    total += int(conn.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status='running'"
+                    ).fetchone()[0])
+                except Exception:
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            return total
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
             Enumerating boards on every tick keeps the dispatcher honest
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
+
+            The per-board ``max_in_progress``/``max_spawn`` caps do NOT bound
+            the fleet: each board can independently spawn up to the cap. The
+            global (Kalman-smoothed) cap is enforced HERE, inside the loop,
+            by counting running + freshly-spawned workers and stopping once
+            the cap is reached.
             """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # Urgency-first board ordering (operator 2026-09-11): the fleet cap
+            # is small (target≈2) and there are ~60 boards, so alphabetical
+            # iteration starves later boards. Boards holding `urgency='now'`
+            # ready work (e.g. plebeian review/fix) are promoted to the front
+            # so they win the scarce slots. Cheap read-only probe; fail-open.
+            def _board_now_count(_slug: str) -> int:
+                _c = None
+                try:
+                    _c = _kb.connect(board=_slug)
+                    return int(_c.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE status='ready' "
+                        "AND urgency='now'"
+                    ).fetchone()[0])
+                except Exception:
+                    return 0
+                finally:
+                    if _c is not None:
+                        try:
+                            _c.close()
+                        except Exception:
+                            pass
+            boards = sorted(
+                boards,
+                key=lambda b: (
+                    0 if _board_now_count(b.get("slug") or _kb.DEFAULT_BOARD) else 1,
+                    b.get("slug") or "",
+                ),
+            )
+            # Multi-dimensional headroom governor: LLM price/quota + resource
+            # Kalman -> a target worker count (throttle). Hold (target 0) when
+            # any dimension is critical; otherwise dispatch up to the target.
+            headroom = _compute_dispatch_headroom(max_in_progress)
+            target = headroom.get("target_workers", 0)
+            # Mandatory-urgency sweep (Phase N): park unclassified `ready`
+            # cards on EVERY board before the capacity check, so a task is
+            # never left dispatchable merely because the fleet is at its cap
+            # (in which case dispatch_once — which also parks — never runs).
+            # Idempotent and fail-open per board.
+            if urgency_required:
+                for _b in boards:
+                    _slug = _b.get("slug") or _kb.DEFAULT_BOARD
+                    _uc = None
+                    try:
+                        _uc = _kb.connect(board=_slug)
+                        _kb._park_unclassified_ready(_uc, board=_slug)
+                    except Exception:
+                        continue
+                    finally:
+                        if _uc is not None:
+                            try:
+                                _uc.close()
+                            except Exception:
+                                pass
+            # Deadlock guard (operator 2026-09-11): reclaim stale `running`
+            # claims across ALL boards *before* the fleet-cap check. Normally
+            # reclaim runs inside `dispatch_once`, but the cap check below
+            # `break`s out before calling it whenever running >= target — so a
+            # backlog of stale claims (worker dead, claim expired) pins the
+            # count, the loop never reclaims them, and the fleet deadlocks at
+            # "0 workers spawned" with a full ready queue. Reclaim is cheap,
+            # token-free, and only invoked on the stuck path.
+            if _count_running_across_boards(boards) >= target:
+                for b in boards:
+                    _slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    _rc = None
+                    try:
+                        _rc = _kb.connect(board=_slug)
+                        _kb.release_stale_claims(_rc)
+                        # Also reclaim claims whose worker pid is already dead
+                        # but whose TTL hasn't expired yet (e.g. workers
+                        # orphaned by a gateway restart). Otherwise they pin
+                        # the fleet cap for a full TTL and stall dispatch.
+                        for _tid, _wp in _rc.execute(
+                            "SELECT id, worker_pid FROM tasks "
+                            "WHERE status='running'"
+                        ).fetchall():
+                            try:
+                                if _wp and not _kb._pid_alive(_wp):
+                                    _kb.reclaim_task(
+                                        _rc, _tid,
+                                        reason="dispatcher guard: dead worker pid",
+                                    )
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                    finally:
+                        if _rc is not None:
+                            try:
+                                _rc.close()
+                            except Exception:
+                                pass
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
+                # Re-count the fleet's in-flight workers from the DB before each
+                # board (authoritative, not the spawn-result bookkeeping which
+                # lags the claim write). Stops the tick once the target is
+                # reached so the per-board caps can't fan out across boards.
+                if _count_running_across_boards(boards) >= target:
+                    break
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                # Boards whose work is deterministic tooling (not LLM work) can
+                # opt out of LLM dispatch entirely via board.json
+                # "no_llm_dispatch": true (2026-09-17: the PCB autoroute loop).
+                if _board_no_llm_dispatch(slug):
+                    continue
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
@@ -1537,11 +1850,26 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
+            # Adaptive backoff: when headroom is tight (target 0) we sleep
+            # longer so we don't hot-poll a starved box; when ample we poll
+            # promptly so freed-up resources trigger dispatch quickly.
+            try:
+                _hr = _compute_dispatch_headroom(max_in_progress)
+                _target = _hr.get("target_workers", 0)
+            except Exception:
+                _target = 1
+            if _target <= 0:
+                sleep_interval = min(300.0, max(interval, 120.0))  # tight -> up to 5 min
+            elif _target <= 1:
+                sleep_interval = interval  # normal 60s
+            else:
+                sleep_interval = max(30.0, interval * 0.5)  # ample -> poll faster
+
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
             slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
+            while slept < sleep_interval and self._running:
+                await asyncio.sleep(min(1.0, sleep_interval - slept))
                 slept += 1.0
 
         self._release_kanban_dispatcher_lock()
