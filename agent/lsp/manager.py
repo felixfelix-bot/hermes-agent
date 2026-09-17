@@ -60,6 +60,13 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+# Hard ceiling on concurrently-running language servers per service. LSP
+# servers are memory/CPU heavy (pyright/tsserver hold hundreds of MB each);
+# without a bound a worker that resolves several workspace roots can spawn a
+# swarm of them (2026-09-17: a duplicate pyright burned ~45% CPU). When the
+# cap is exceeded the least-recently-used running client is shut down. Set
+# ``lsp.max_clients`` in config.yaml to tune; 0 disables the cap.
+DEFAULT_MAX_CLIENTS = 4
 
 
 class _BackgroundLoop:
@@ -156,6 +163,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -166,6 +174,7 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_clients = max(0, int(max_clients))
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -220,6 +229,10 @@ class LSPService:
             # mark the (server, workspace) pair broken for the process
             # lifetime.  Clamp to a safe floor (0 still disables).
             idle_timeout = MIN_IDLE_TIMEOUT
+        try:
+            max_clients = int(lsp_cfg.get("max_clients", DEFAULT_MAX_CLIENTS))
+        except (TypeError, ValueError):
+            max_clients = DEFAULT_MAX_CLIENTS
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -251,6 +264,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            max_clients=max_clients,
         )
 
     # ------------------------------------------------------------------
@@ -532,6 +546,30 @@ class LSPService:
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
+    def _evict_lru_if_over_cap(self) -> None:
+        """Shut down the least-recently-used running client when at the cap.
+
+        ``max_clients`` bounds how many language servers one service may keep
+        alive at once. Eviction is best-effort and must never raise into the
+        spawn path.
+        """
+        if self._max_clients <= 0:
+            return
+        with self._state_lock:
+            running = [(k, c) for k, c in self._clients.items() if c.is_running]
+            if len(running) < self._max_clients:
+                return
+            running.sort(key=lambda kc: self._last_used.get(kc[0], 0.0))
+            evict_key, evict_client = running[0]
+            self._clients.pop(evict_key, None)
+            self._last_used.pop(evict_key, None)
+        try:
+            self._loop.run(evict_client.shutdown(), timeout=5.0)
+            logger.info("lsp: evicted LRU client %s (max_clients=%d)",
+                        evict_key, self._max_clients)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lsp: LRU eviction failed for %s: %s", evict_key, e)
+
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
         if srv is None:
@@ -549,6 +587,13 @@ class LSPService:
                 srv.server_id, file_path, "exclude marker hit (server gated off)"
             )
             return None  # exclude marker hit, server gated off
+        # Canonicalize so symlink/relative-path variants of the SAME directory
+        # resolve to ONE client key (otherwise each variant spawns its own
+        # server process — the duplicate-LSP leak).
+        try:
+            per_server_root = os.path.realpath(per_server_root)
+        except Exception:  # noqa: BLE001
+            pass
 
         key = (srv.server_id, per_server_root)
         if key in self._broken:
@@ -565,6 +610,11 @@ class LSPService:
                 return await spawning
             except Exception:  # noqa: BLE001
                 return None
+
+        # Bound concurrent servers: if we're at the cap, shut down the
+        # least-recently-used running client before spawning another (heavy
+        # servers like pyright/tsserver must not accumulate).
+        self._evict_lru_if_over_cap()
 
         # Begin spawn
         loop = asyncio.get_running_loop()
