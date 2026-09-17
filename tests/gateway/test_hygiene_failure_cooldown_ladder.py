@@ -26,6 +26,7 @@ from gateway.run import (
     _record_hygiene_cooldown,
     _reset_hygiene_failure_streak,
     hygiene_compaction_recovered,
+    hygiene_noop_should_cool,
 )
 from gateway.run import GatewayRunner
 from gateway.session_state import PersistentState, SessionState
@@ -372,3 +373,37 @@ class TestRecordedCooldownEscalates:
         assert waits[0] < waits[1] < waits[2]
         for wait, mult in zip(waits, _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS):
             assert wait == pytest.approx(BASE * mult, abs=5.0)
+
+
+# ---------------------------------------------------------------------------
+# #21301: the degenerate no-op path must still cool down
+# ---------------------------------------------------------------------------
+
+class TestHygieneNoopShouldCool:
+    """A completed-but-unpersisted hygiene run must record a cooldown.
+
+    Otherwise the abort-only cooldown never fires and the gateway re-runs
+    hygiene every pass while the transcript never shrinks.
+    """
+
+    def test_noop_runs_should_cool(self):
+        # not aborted, not recovered => the #21301 degenerate path
+        assert hygiene_noop_should_cool(aborted=False, recovered=False) is True
+
+    def test_aborted_does_not_double_count(self):
+        # aborts already record their own cooldown in the abort branch
+        assert hygiene_noop_should_cool(aborted=True, recovered=False) is False
+
+    def test_recovered_runs_do_not_cool(self):
+        for aborted in (False, True):
+            assert hygiene_noop_should_cool(aborted=aborted, recovered=True) is False
+
+    def test_matches_the_recovered_predicate_on_the_degenerate_case(self):
+        # End-to-end: the exact inputs the #21301 path produces.
+        recovered = hygiene_compaction_recovered(
+            aborted=False, rotated=False, in_place=False,
+            msg_count=410, new_count=410,
+            approx_tokens=436681, new_tokens=436681,
+        )
+        assert recovered is False
+        assert hygiene_noop_should_cool(aborted=False, recovered=recovered) is True

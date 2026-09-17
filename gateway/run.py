@@ -248,6 +248,20 @@ def hygiene_compaction_recovered(
     )
 
 
+def hygiene_noop_should_cool(*, aborted: bool, recovered: bool) -> bool:
+    """True when a hygiene run neither aborted nor recovered (#21301).
+
+    The degenerate path: compression ran to completion but nothing was
+    persisted ("did not rotate or compact in place — no session_db on the
+    hygiene agent"), so the transcript is unchanged. Because the summary did
+    not abort, the abort-only cooldown below never fires and hygiene re-runs on
+    the next pass forever while the session never shrinks. This predicate marks
+    those runs as cooldown-worthy. Extracted so the decision is unit-testable
+    rather than pinned by a source-reading test (AGENTS.md bans those).
+    """
+    return (not aborted) and (not recovered)
+
+
 def _record_hygiene_cooldown(
     gateway,
     session_id: str,
@@ -18004,7 +18018,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # counts, so a numbers-only check would
                                         # read a no-op as success and clear the
                                         # streak on every wedged run (#79624).
-                                        if hygiene_compaction_recovered(
+                                        _hyg_recovered = hygiene_compaction_recovered(
                                             aborted=_hyg_aborted,
                                             rotated=_hyg_rotated,
                                             in_place=_hyg_in_place,
@@ -18012,9 +18026,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             new_count=_new_count,
                                             approx_tokens=_approx_tokens,
                                             new_tokens=_new_tokens,
-                                        ):
+                                        )
+                                        if _hyg_recovered:
                                             _reset_hygiene_failure_streak(
                                                 self, session_key
+                                            )
+                                        elif hygiene_noop_should_cool(
+                                            aborted=_hyg_aborted,
+                                            recovered=_hyg_recovered,
+                                        ) and _hyg_failure_cooldown_seconds >= 0:
+                                            # No-op (#21301): compression ran but
+                                            # could not persist, so nothing shrank.
+                                            # Record an escalating cooldown or the
+                                            # gateway re-runs hygiene every pass.
+                                            _record_hygiene_cooldown(
+                                                self, session_entry.session_id,
+                                                _hygiene_cooldown_for_failure(
+                                                    self, session_key,
+                                                    _hyg_failure_cooldown_seconds,
+                                                ),
+                                                "hygiene no-op: no session_db to "
+                                                "persist compaction (#21301)",
+                                            )
+                                            logger.warning(
+                                                "Session hygiene: no-op compaction "
+                                                "for %s; escalating cooldown (#21301)",
+                                                session_entry.session_id,
                                             )
                                     if _hyg_aborted:
                                         if _hyg_failure_cooldown_seconds >= 0:
