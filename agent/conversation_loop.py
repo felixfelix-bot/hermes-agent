@@ -4154,6 +4154,14 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                # Phase K4 (2026-09-17): a flat-router CAPACITY outage
+                # ("all providers exhausted") is NOT transient — every lane has
+                # no headroom, so retrying 3x just burns time and floods the
+                # operator channel. Fail once; the gate holds until capacity
+                # returns (zai-quota-gate / capacity sentinel).
+                if "all providers exhausted" in _err_lower:
+                    classified.retryable = False
+                    classified.should_fallback = False
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
