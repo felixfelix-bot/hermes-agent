@@ -740,14 +740,54 @@ class TestGovernanceAttestationLine:
 
     def test_credential_on_attestation_key_still_masked(self):
         """Fail-closed: a non-verdict value on an attestation key is redacted."""
+        HEX64 = "8f4a1c9d2b7e5031" * 4
         for text, secret in (
             ("secret-scan: hunter2pass", "hunter2pass"),
             ("secret-scan=Sup3rS3cret!", "Sup3rS3cret!"),
             ("secrets_clean: " + "9f2c" + "a" * 60, "9f2c" + "a" * 60),
+            # Glued (no-space) payloads: ``v.split("(")[0]`` used to accept these
+            # because the head was a verdict word, leaving the payload intact —
+            # a false negative the pre-fix code did not have (adversarial probe
+            # 2026-09-18, cases paren-nospace-*/env-nospace-*).
+            ("secret-scan: clean(" + HEX64 + ")", HEX64),
+            ("secret-scan=clean(" + HEX64 + ")", HEX64),
+            ("secret-scan: clean(Sup3rS3cret!passw0rd)", "Sup3rS3cret!passw0rd"),
+            ("secrets_clean: clean(xY3kLmN2pQr7sT1uV4wZ8aB1)", "xY3kLmN2pQr7sT1uV4wZ8aB1"),
+            # Scheme-less userinfo form. The ``://`` variant of this probe never
+            # reaches the colon pass at all (documented web-URL passthrough —
+            # see test_url_bearing_text_skips_the_colon_pass_by_design).
+            ("secret-scan: clean(hunter2:hunter2@h/x)", "hunter2"),
         ):
             result = redact_sensitive_text(text, force=True)
             assert secret not in result, text
             assert result != text, text
+
+    def test_glued_tool_annotation_still_accepted(self):
+        """A short tool annotation may be glued to the verdict, not just spaced.
+
+        ``clean(gitleaks 8.21.2)`` reaches the validator as ``clean(gitleaks``
+        because the value token stops at the first space; the line remainder is
+        rejoined, but only when it closes the paren and ends the line.
+        """
+        for text in ("secret-scan: clean(gitleaks 8.21.2)",
+                     "secret-scan=clean(gitleaks 8.21.2)",
+                     "secret-scan: clean(regex fallback)",
+                     "log\nsecret-scan: clean(gitleaks 8.21.2)\ntail"):
+            assert redact_sensitive_text(text, force=True) == text, text
+
+    def test_url_bearing_text_skips_the_colon_pass_by_design(self):
+        """Measured 2026-09-18 while triaging the adversarial probe of this fix.
+
+        A text containing ``://`` skips the YAML colon-config pass wholesale
+        (the long-standing web-URL passthrough; URL credentials are opt-in via
+        ``_redact_strict_url_credentials``). So an attestation-shaped line on
+        such a text is neither protected nor masked *by that pass* — that is
+        the URL carve-out, not a hole in the attestation exemption. Recorded
+        here so it is not re-reported as a regression of this change.
+        """
+        for text in ("url: http://u:hunter2@h/x",
+                     "secret-scan: clean(http://u:hunter2@h/x)"):
+            assert redact_sensitive_text(text, force=True) == text, text
 
     def test_ordinary_secret_lines_still_masked(self):
         """The exemption must not weaken the normal credential paths."""

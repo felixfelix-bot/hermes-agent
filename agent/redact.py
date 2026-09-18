@@ -335,9 +335,56 @@ _ATTESTATION_VERDICTS = frozenset({
     "clean", "cleaned", "pass", "passed", "ok", "green", "none",
     "no-hits", "nohits", "0",
 })
+# Optional tool annotation glued to the verdict (``clean(gitleaks 8.21.2)``,
+# the no-space ENV form). Deliberately narrow: at most three short lexemes made
+# of tool/version characters. Without this, ``v.split("(")[0]`` accepted
+# ``clean(<64-hex>)`` and ``clean(Sup3rS3cret!passw0rd)`` and left the payload
+# untouched — a false negative the pre-fix code did not have (adversarial probe
+# of this change, 2026-09-18; cases ``paren-nospace-*``/``env-nospace-hex``).
+_ATTESTATION_ANNOT_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9._-]{0,15}(?:\s+[A-Za-z0-9][A-Za-z0-9._-]{0,15}){0,2}")
+# Rejoin of an annotation split by the value token: the key=value rules stop
+# the value at the first whitespace, so ``clean(gitleaks 8.21.2)`` arrives as
+# ``clean(gitleaks`` plus a line remainder. Only a remainder that closes the
+# paren and then ends the line counts — a payload can never be accepted on a
+# prefix (``clean(<hex> <hex>)`` has no valid annotation inside).
+_ATTESTATION_TAIL_RE = re.compile(r"^([^()\n]*)\)[ \t]*$")
 
 
-def _is_attestation_line(key: str, value: str) -> bool:
+def _is_attestation_value(value: str, rest: str = "") -> bool:
+    """True only when ``value`` reads as a scan verdict, not as a credential.
+
+    Accepted: a verdict word (``clean``) with an optional whitespace-separated
+    annotation (``clean (gitleaks 8.21.2)``), a glued annotation whose content
+    passes :data:`_ATTESTATION_ANNOT_RE`, and the nested label form
+    (``secret-scan:`` as the value of ``secrets_clean:``). Everything else —
+    opaque tokens, hex keys, URLs, passwords, even when they follow ``clean(``
+    without a space — falls back to the normal redaction rules.
+
+    ``rest`` is the line remainder after the captured value, used only to
+    rejoin an annotation that the value token split at whitespace.
+    """
+    v = value.strip().rstrip(":")
+    lv = v.lower()
+    if lv in _ATTESTATION_KEYS:
+        return True  # nested label form: ``secrets_clean: secret-scan: …``
+    head, sep, tail = v.partition("(")
+    if not sep:
+        return lv in _ATTESTATION_VERDICTS
+    if head.strip().lower() not in _ATTESTATION_VERDICTS:
+        return False
+    if not tail.endswith(")"):
+        # Unterminated here: the annotation continued past whitespace (the
+        # value token stops at the first space). ``rest`` is the remainder of
+        # the whole *text*, so clip it to the current line before rejoining.
+        m = _ATTESTATION_TAIL_RE.match(tail + rest.split("\n", 1)[0])
+        if not m:
+            return False
+        tail = m.group(1) + ")"
+    return bool(_ATTESTATION_ANNOT_RE.fullmatch(tail[:-1].strip()))
+
+
+def _is_attestation_line(key: str, value: str, rest: str = "") -> bool:
     """True when ``key: value`` is a secrets_clean attestation, not a credential.
 
     Matches the governance grammar ``secret-scan: clean (gitleaks x.y.z)`` and
@@ -349,10 +396,7 @@ def _is_attestation_line(key: str, value: str) -> bool:
     k = key.strip().lower()
     if k not in _ATTESTATION_KEYS and k.rsplit(".", 1)[-1].strip() not in _ATTESTATION_KEYS:
         return False
-    v = value.strip().lower().rstrip(":")
-    if v in _ATTESTATION_KEYS:
-        return True  # nested label form: ``secrets_clean: secret-scan: …``
-    return v.split("(")[0].strip() in _ATTESTATION_VERDICTS
+    return _is_attestation_value(value, rest)
 
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
@@ -895,7 +939,7 @@ def redact_sensitive_text(
                 # Governance attestations are verdicts, not credentials: keep
                 # ``secret-scan=clean`` / ``secrets_clean=clean`` intact so the
                 # secrets_clean gate can read its own contract line (t_ce14a2c7).
-                if _is_attestation_line(name, value):
+                if _is_attestation_line(name, value, m.string[m.end():]):
                     return m.group(0)
                 # Keyword must sit at a word boundary within the key —
                 # ``author=Smith`` / ``press.secretary=…`` are prose, not
@@ -956,7 +1000,7 @@ def redact_sensitive_text(
                 # Governance attestation lines (D-128 §19.2) are verdicts, not
                 # credentials — the redactor must not eat the very line the
                 # secrets_clean gate greps for (admin t_ce14a2c7).
-                if _is_attestation_line(key, value):
+                if _is_attestation_line(key, value, m.string[m.end():]):
                     return m.group(0)
                 # Keyword must sit at a word boundary within the key —
                 # ``Secretary: J.Smith`` / ``tokenizer: cl100k_base`` are
