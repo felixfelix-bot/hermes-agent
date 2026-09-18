@@ -697,6 +697,65 @@ class TestConfigKeyRedosResistance:
         assert "password:" in result
 
 
+class TestGovernanceAttestationLine:
+    """The ``secrets_clean`` gate's canonical attestation line must survive.
+
+    D-128 §19.2: ``gate_engine.RE_SECRET_CLEAN`` greps the completion evidence
+    for ``secret-scan:\\s*clean``. The key contains the word ``secret``, so the
+    colon-config rule treated the line as a credential assignment and masked the
+    verdict word, storing ``secret-scan: ***`` — the gate then could never match
+    the attestation it exists to verify (verified 2026-09-18 on admin
+    t_ce14a2c7: gate_engine.evaluate → secrets_clean FAIL with 0 independent
+    scan hits; first seen plebeian/t_62c4783e run 3). The exemption is
+    fail-closed: the value must read as a scan verdict.
+    """
+
+    CANONICAL = "secret-scan: clean (gitleaks 8.21.2)"
+
+    def test_canonical_attestation_unchanged(self):
+        assert redact_sensitive_text(self.CANONICAL, force=True) == self.CANONICAL
+
+    def test_attestation_variants_unchanged(self):
+        for text in (
+            self.CANONICAL,
+            "secret-scan: clean (regex fallback)",
+            "secret_scan: clean (gitleaks 8.21.2)",
+            "  secret-scan: clean (gitleaks 8.21.2)",
+            "secrets_clean: secret-scan: clean (gitleaks 8.21.2)",
+            "- secrets_clean: secret-scan: clean (gitleaks 8.21.2)",
+            "secret-scan: passed (gitleaks 8.21.2)",
+            "gates.secret-scan: clean (gitleaks 8.21.2)",
+            "SECRET_SCAN=clean",
+        ):
+            assert redact_sensitive_text(text, force=True) == text, text
+
+    def test_attestation_survives_multiline_result(self):
+        """The shape a completion ``result`` actually has."""
+        text = (
+            "tests: 42 passed (exit_code 0)\n"
+            f"{self.CANONICAL}\n"
+            "reviewer_model: kimi-k3\nAPPROVED"
+        )
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_credential_on_attestation_key_still_masked(self):
+        """Fail-closed: a non-verdict value on an attestation key is redacted."""
+        for text, secret in (
+            ("secret-scan: hunter2pass", "hunter2pass"),
+            ("secret-scan=Sup3rS3cret!", "Sup3rS3cret!"),
+            ("secrets_clean: " + "9f2c" + "a" * 60, "9f2c" + "a" * 60),
+        ):
+            result = redact_sensitive_text(text, force=True)
+            assert secret not in result, text
+            assert result != text, text
+
+    def test_ordinary_secret_lines_still_masked(self):
+        """The exemption must not weaken the normal credential paths."""
+        assert "hunter2" not in redact_sensitive_text("password: hunter2", force=True)
+        assert ("Sup3rS3cret!" not in
+                redact_sensitive_text("SPRING_DATASOURCE_PASSWORD=Sup3rS3cret!", force=True))
+
+
 class TestXaiToken:
     KEY = "xai-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstu"
 

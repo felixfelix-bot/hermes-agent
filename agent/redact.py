@@ -313,6 +313,48 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
+
+# Governance attestation labels (D-128 §19.2). The ``secrets_clean`` gate greps
+# the completion evidence for ``secret-scan: clean (<tool> <ver>)``
+# (``gate_engine.RE_SECRET_CLEAN``). That *key* contains the word ``secret``, so
+# the colon-config rule below read the line as a credential assignment and
+# masked the verdict word — storing ``secret-scan: ***`` and making the gate
+# unpassable for an honestly-scanned card (admin t_ce14a2c7; first seen on
+# plebeian/t_62c4783e run 3, where the gate FAILed with zero independent scan
+# hits). These keys are verdict labels, never credential names, so they are
+# exempted from the YAML/ENV assignment rules — but ONLY when the value itself
+# reads as a scan verdict, so a real secret that happens to sit on such a line
+# is still masked (fail closed).
+_ATTESTATION_KEYS = frozenset({
+    "secret-scan", "secret_scan", "secrets-scan", "secrets_scan",
+    "secret-clean", "secret_clean", "secrets-clean", "secrets_clean",
+})
+# Verdict words accepted as an attestation value. ``clean (gitleaks 8.21.2)``
+# reaches the validator as ``clean`` — the YAML value group stops at whitespace.
+_ATTESTATION_VERDICTS = frozenset({
+    "clean", "cleaned", "pass", "passed", "ok", "green", "none",
+    "no-hits", "nohits", "0",
+})
+
+
+def _is_attestation_line(key: str, value: str) -> bool:
+    """True when ``key: value`` is a secrets_clean attestation, not a credential.
+
+    Matches the governance grammar ``secret-scan: clean (gitleaks x.y.z)`` and
+    its nested form ``secrets_clean: secret-scan: clean …``. Fail-closed: both
+    the key AND the value must look like that grammar, so an opaque token, a hex
+    key, or a URL placed on such a line is left to the normal redaction rules.
+    A namespaced key (``gates.secret-scan``) is accepted on its last segment.
+    """
+    k = key.strip().lower()
+    if k not in _ATTESTATION_KEYS and k.rsplit(".", 1)[-1].strip() not in _ATTESTATION_KEYS:
+        return False
+    v = value.strip().lower().rstrip(":")
+    if v in _ATTESTATION_KEYS:
+        return True  # nested label form: ``secrets_clean: secret-scan: …``
+    return v.split("(")[0].strip() in _ATTESTATION_VERDICTS
+
+
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
@@ -850,6 +892,11 @@ def redact_sensitive_text(
                 # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
+                # Governance attestations are verdicts, not credentials: keep
+                # ``secret-scan=clean`` / ``secrets_clean=clean`` intact so the
+                # secrets_clean gate can read its own contract line (t_ce14a2c7).
+                if _is_attestation_line(name, value):
+                    return m.group(0)
                 # Keyword must sit at a word boundary within the key —
                 # ``author=Smith`` / ``press.secretary=…`` are prose, not
                 # credentials (ported from nearai/ironclaw#6129). All-caps
@@ -905,6 +952,11 @@ def redact_sensitive_text(
                 # (issue #2852): api_key: os.getenv('X') is a code snippet,
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
+                    return m.group(0)
+                # Governance attestation lines (D-128 §19.2) are verdicts, not
+                # credentials — the redactor must not eat the very line the
+                # secrets_clean gate greps for (admin t_ce14a2c7).
+                if _is_attestation_line(key, value):
                     return m.group(0)
                 # Keyword must sit at a word boundary within the key —
                 # ``Secretary: J.Smith`` / ``tokenizer: cl100k_base`` are
