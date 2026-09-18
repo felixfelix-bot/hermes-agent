@@ -95,6 +95,27 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+def _cross_node_claim_allows(board: str, task_id: str) -> bool:
+    """Optional cross-node dispatch guard (ADR-013/9.2). Default: allow.
+
+    When ``KANBAN_SPAWN_CLAIM_CMD`` is set, run it (``{board}``/``{task_id}``
+    substituted) BEFORE spawning a worker. Exit 0 = this node won the claim
+    (proceed); non-zero = a peer holds it (skip). Unset -> always allow.
+    Fail-open on error: the guard must never wedge dispatch.
+    """
+    tmpl = os.environ.get("KANBAN_SPAWN_CLAIM_CMD", "").strip()
+    if not tmpl:
+        return True
+    cmd = tmpl.replace("{board}", board).replace("{task_id}", task_id)
+    try:
+        rc = subprocess.run(cmd, shell=True, timeout=15,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode
+        return rc == 0
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -6923,6 +6944,24 @@ def specify_triage_task(
     return True
 
 
+# Fields a decomposed child inherits from its root task. This is the single
+# source of truth for fan-out inheritance — extend this tuple when a new
+# scheduling/priority or worker-pinning column is added, instead of editing the
+# INSERT by hand (that omission is exactly how AV-FIX-1 lost priority=1).
+# Deliberately excluded:
+#   * workspace_kind / workspace_path — handled per-child below (worktree
+#     isolation requires each sibling to get its own checkout, not the root's).
+#   * branch_name — siblings must never share one branch.
+# `_decompose_...` reads only the columns that exist on the board, so a board
+# that predates a column (e.g. the urgency migration) still decomposes cleanly.
+_DECOMPOSE_INHERIT_FIELDS = (
+    "priority",
+    "urgency", "urgency_source", "urgency_deadline", "urgency_set_at",
+    "model_override", "provider_override", "reasoning_effort",
+    "max_runtime_seconds", "skills", "project_id",
+)
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7015,9 +7054,19 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        # Which inherit-able columns actually exist on THIS board. Boards that
+        # predate the urgency migration simply lack those columns; skip them
+        # rather than error. This is the single source of truth for what a
+        # child inherits — see _DECOMPOSE_INHERIT_FIELDS.
+        _cols_present = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        _inherit_fields = tuple(
+            f for f in _DECOMPOSE_INHERIT_FIELDS if f in _cols_present
+        )
+        _sel_extra = "".join(f", {f}" for f in _inherit_fields)
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
-            "FROM tasks WHERE id = ?",
+            "SELECT id, status, tenant, workspace_kind, workspace_path"
+            + _sel_extra
+            + " FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
@@ -7031,6 +7080,7 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        inherited = {f: root_row[f] for f in _inherit_fields}
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7062,22 +7112,32 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Inherit the root's scheduling/priority + worker-pinning fields,
+            # allowing an explicit per-child override for any inherited field.
+            child_fields = dict(inherited)
+            for f in _inherit_fields:
+                if f in child:
+                    child_fields[f] = child[f]
+            _cols = (
+                "id", "title", "body", "assignee", "status", "workspace_kind",
+                "workspace_path", "tenant", "created_at", "created_by",
+            ) + _inherit_fields
+            _vals = (
+                new_id,
+                title,
+                body if isinstance(body, str) else None,
+                assignee,
+                "todo",
+                child_ws_kind,
+                child_ws_path,
+                tenant,
+                now,
+                (author or "decomposer"),
+            ) + tuple(child_fields[f] for f in _inherit_fields)
             conn.execute(
-                "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
-                (
-                    new_id,
-                    title,
-                    body if isinstance(body, str) else None,
-                    assignee,
-                    child_ws_kind,
-                    child_ws_path,
-                    tenant,
-                    now,
-                    (author or "decomposer"),
-                ),
+                "INSERT INTO tasks (" + ", ".join(_cols) + ") VALUES ("
+                + ", ".join("?" for _ in _vals) + ")",
+                _vals,
             )
             _append_event(
                 conn, new_id, "created",
@@ -7712,6 +7772,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    urgency_parked: list[str] = field(default_factory=list)
+    """Ready task ids parked in ``scheduled`` this tick because their
+    ``urgency`` column was NULL while ``kanban.urgency_required`` is on.
+    Making ``now|soon|defer|batch`` mandatory means unclassified work never
+    spawns; the ``urgency-triage`` classifier stamps a level and releases it.
+    Empty when the board has no urgency column (pre-migration) or the gate
+    is disabled."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8101,9 +8168,11 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
+        # Soft kill: SIGTERM first with a generous grace window so the worker
+        # can commit in-progress work / clean up (hold-first philosophy — the
+        # Kalman headroom governor prevents most starvation, so a timeout here
+        # is a genuinely long-running task, not a resource-starved one). Only
+        # SIGKILL if it is still alive after the grace.
         killed = False
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
@@ -8113,8 +8182,8 @@ def enforce_max_runtime(
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
                 pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
+            # Polling wait — no time.sleep on the write txn. 60s grace.
+            for _ in range(120):
                 if not _pid_alive(pid):
                     break
                 time.sleep(0.5)
@@ -8841,6 +8910,17 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
+        # Budget policy (operator 2026-09-11, L.3): an iteration-budget
+        # exhaustion is not a crash — it means the task needed more turns, not
+        # that it is broken. Give it ONE extra escalating attempt (the D.2 logic
+        # raises goal_max_turns 120 -> 160) before tripping the breaker, so a
+        # genuinely larger task can finish without waiting for the hourly
+        # governor revive. Explicit per-task max_retries overrides this.
+        if task_override is None and "iteration budget exhausted" in (error or "").lower():
+            effective_limit = max(effective_limit,
+                                  int(failure_limit or DEFAULT_FAILURE_LIMIT) + 1)
+            limit_source = "dispatcher+iteration"
+
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
@@ -8893,6 +8973,22 @@ def _record_task_failure(
             blocked = True
         else:
             # Below threshold.
+            # Budget escalation (operator 2026-09-11): if a run died from
+            # exhausting its iteration budget, raise the per-task budget on
+            # the NEXT attempt instead of re-running the identical config.
+            # This avoids the wasteful "60-turn fail -> block -> wait for
+            # hourly governor revive -> 160 turns" detour. Genuine crashes
+            # (pid-not-alive / signals) keep their existing budget.
+            if "iteration budget exhausted" in (error or "").lower():
+                _bump_turns = 160 if failures >= 2 else 120
+                conn.execute(
+                    "UPDATE tasks SET goal_max_turns = "
+                    "MAX(COALESCE(goal_max_turns, 0), ?), "
+                    "max_runtime_seconds = "
+                    "MAX(COALESCE(max_runtime_seconds, 0), 5400) "
+                    "WHERE id = ?",
+                    (_bump_turns, task_id),
+                )
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -9218,6 +9314,123 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def _tasks_have_urgency_column(conn: sqlite3.Connection) -> bool:
+    """True when the external urgency migration has added ``tasks.urgency``."""
+    try:
+        return "urgency" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+    except Exception:
+        return False
+
+
+def _ensure_urgency_columns(conn: sqlite3.Connection) -> bool:
+    """Lazily add the urgency columns/index if the board is not yet migrated.
+
+    Mirrors the external ``urgency_gate.migrate`` so a newly created board is
+    gated the first time the dispatcher touches it. Returns True when the
+    columns are present (already or just added), False when the board has no
+    ``tasks`` table or the migration failed (fail-open per board).
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        if not cols:
+            return False
+        if "urgency" in cols:
+            return True
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN urgency TEXT "
+            "CHECK (urgency IN ('now','soon','defer','batch'))")
+        conn.execute("ALTER TABLE tasks ADD COLUMN urgency_deadline INTEGER")
+        conn.execute("ALTER TABLE tasks ADD COLUMN urgency_set_at INTEGER")
+        conn.execute("ALTER TABLE tasks ADD COLUMN urgency_source TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_urgency ON tasks(status, urgency)")
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def _park_unclassified_ready(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> list:
+    """Park ``ready`` tasks with a NULL urgency so they can never spawn.
+
+    Enforces ``kanban.urgency_required`` at the dispatcher — the one choke
+    point every spawn path funnels through. Parked cards land in ``scheduled``
+    with a reason pointing at ``hermes-urgency set``; the ``urgency-triage``
+    classifier stamps a level and releases them.
+
+    Fail polarity: per-task fail-closed (an unclassified card never spawns),
+    per-system fail-open (our bugs here never stop the tick). Boards that have
+    not had the external urgency migration applied are left untouched.
+    """
+    try:
+        if not _ensure_urgency_columns(conn):
+            return []
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status='ready' AND urgency IS NULL"
+        ).fetchall()
+        if not rows:
+            return []
+        reason = (
+            "urgency-unclassified: classify with "
+            f"hermes-urgency set {board or '<board>'} <id> <now|soon|defer|batch>"
+        )
+        parked = []
+        for (tid,) in rows:
+            try:
+                conn.execute(
+                    "UPDATE tasks SET urgency_source='urgency-unclassified' "
+                    "WHERE id=? AND urgency IS NULL",
+                    (tid,),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                if schedule_task(conn, tid, reason=reason):
+                    parked.append(tid)
+            except Exception:
+                continue
+        if parked:
+            _touch_urgency_triage()
+        return parked
+    except Exception:
+        return []
+
+
+def _touch_urgency_triage() -> None:
+    """Nudge the urgency-triage drain service (systemd path unit watches this).
+
+    Failure is irrelevant to dispatch — best-effort only.
+    """
+    try:
+        base = os.path.join(os.path.expanduser("~"), ".hermes", "state")
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "urgency-triage.touch"), "w") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+
+def _urgency_required_default() -> bool:
+    """Config fallback for callers that do not pass ``urgency_required``.
+
+    Defaults to ``False`` when the key is absent so library/test callers that
+    never opted in keep their historical behavior; operators enable the gate
+    explicitly with ``kanban.urgency_required: true`` in ``config.yaml`` (this
+    box sets it on both the root and manager profiles).
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        return bool(
+            (load_config() or {}).get("kanban", {}).get("urgency_required", False)
+        )
+    except Exception:
+        return False
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9229,6 +9442,7 @@ def dispatch_once(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
+    urgency_required: Optional[bool] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
@@ -9267,6 +9481,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            urgency_required=urgency_required,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -9284,6 +9499,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            urgency_required=urgency_required,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -9305,6 +9521,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    urgency_required: Optional[bool] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9367,6 +9584,15 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Mandatory-urgency gate (kanban.urgency_required): an unclassified ready
+    # card is parked in `scheduled` before the spawn loop ever sees it, so no
+    # entry point can dispatch work without a now|soon|defer|batch level. Runs
+    # after recompute_ready so newly-promoted cards are caught this tick.
+    if urgency_required is None:
+        urgency_required = _urgency_required_default()
+    if urgency_required and not dry_run:
+        result.urgency_parked = _park_unclassified_ready(conn, board=board)
 
     # Both knobs are total in-flight caps. Collapse them before either lane
     # dispatches so ready and review workers consume the same budget without
@@ -9571,6 +9797,16 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if not _cross_node_claim_allows(board, claimed.id):
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                    (claimed.id,),
+                )
+            _log.info("kanban dispatch: %s/%s held by a peer; deferring",
+                      board, claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -9699,6 +9935,16 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        if not _cross_node_claim_allows(board, claimed.id):
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                    (claimed.id,),
+                )
+            _log.info("kanban dispatch: %s/%s held by a peer; deferring",
+                      board, claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -10242,6 +10488,7 @@ def run_daemon(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
+    urgency_required: Optional[bool] = None,
 ) -> None:
     """Run the dispatcher in a loop until interrupted.
 
@@ -10277,6 +10524,7 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    urgency_required=urgency_required,
                 )
             if on_tick is not None:
                 try:
