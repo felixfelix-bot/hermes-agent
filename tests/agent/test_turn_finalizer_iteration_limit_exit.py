@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.turn_finalizer import finalize_turn
+from hermes_cli import kanban_db as kb
 
 
 class _LimitAgent:
@@ -168,10 +169,16 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    # The finalizer classifies its budget-exhausted log line from the code the
+    # kernel returns (it no longer samples run ownership itself — see
+    # t_092cbd1b), so the stub must speak that API too.
+    record = MagicMock(
+        name="record_task_failure_result",
+        return_value=kb._FailureRecordResult.RECORDED,
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure_result", record)
     agent = _LimitAgent()
 
     result = _finalize(

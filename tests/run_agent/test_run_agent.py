@@ -4190,7 +4190,11 @@ class TestRunConversation:
         ``consecutive_failures`` counter increments and the dispatcher's
         ``failure_limit`` breaker eventually trips. The legacy
         ``kanban_block`` call was replaced because blocked-outcome runs
-        bypass the failure counter.
+        bypass the failure counter. Since t_092cbd1b the finalizer calls the
+        kernel's result-reporting entry point
+        ``kanban_db._record_task_failure_result`` (the bool
+        ``_record_task_failure`` is its wrapper) so it can tell a refused
+        write from a recorded one.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
@@ -4215,7 +4219,7 @@ class TestRunConversation:
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
+            patch("hermes_cli.kanban_db._record_task_failure_result",
                   mock_record_failure),
             patch("hermes_cli.kanban_db.connect", mock_connect),
             patch.object(agent, "_persist_session"),
@@ -4265,7 +4269,7 @@ class TestRunConversation:
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
+            patch("hermes_cli.kanban_db._record_task_failure_result",
                   mock_record_failure),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

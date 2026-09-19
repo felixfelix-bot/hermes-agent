@@ -30,6 +30,12 @@ caller inherits it, and ``*_own_run_id_*`` proves the legitimate path is
 unchanged.
 ``*_logs_*`` pins the finalizer's log classification: a write the
 kernel refused must never be reported as recorded (round-1 review finding).
+``test_supersede_*`` extends that to a supersede landing between the
+caller's decision and the kernel's write, and
+``test_record_task_failure_result_*`` pins the reporting API the
+classification is taken from (round-2 residual, t_092cbd1b);
+``test_missing_task_*`` keeps the non-refusal no-write code out of the
+supersede wording.
 """
 
 from __future__ import annotations
@@ -277,9 +283,12 @@ def test_record_task_failure_accepts_own_run_id(conn):
 # a refusal leaves the successor's id in place (≠ our run id) — so every
 # refusal printed "recorded budget-exhausted failure …" one line under the
 # kernel's own "refusing …" warning, and the ``refused`` branch was unreachable
-# dead code. The classification is now taken from run ownership sampled BEFORE
-# the write, which is the predicate the kernel's guard evaluates, so a refused
-# write can never be labelled recorded.
+# dead code. Round 1 moved the classification to run ownership sampled BEFORE
+# the write; round 2 (t_092cbd1b, section below) removed even that sample,
+# because a predicate evaluated outside the kernel's guarding transaction is
+# not the predicate the guard applies — see that section for the window.
+# Either way the invariant pinned below holds: a write the kernel refused is
+# never labelled "recorded".
 
 _LOGGER = "agent.conversation_loop"
 
@@ -341,3 +350,174 @@ def test_run_id_absent_logs_recorded(conn, monkeypatch, caplog):
     assert not [
         m for m in messages if "refused budget-exhausted failure" in m
     ], messages
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round-2 residual (t_092cbd1b): the ownership sample and the kernel's write
+# are not one transaction — the refusal must be REPORTED, not inferred
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Sampling ``current_run_id`` before the call is not the predicate the guard
+# evaluates inside its own ``BEGIN IMMEDIATE``: a concurrent reaper /
+# stale-claim reclaim that supersedes the run inside that window makes the
+# kernel refuse the write while the caller still believes it owns the run, so
+# the previous classification printed ``recorded budget-exhausted failure …``
+# one line under the kernel's own ``refusing …`` warning. The finalizer now
+# takes the log-line decision from ``_record_task_failure_result``, whose code
+# is produced INSIDE the guarding transaction.
+# ``test_supersede_*`` is the defect-level RED for the window;
+# ``test_record_task_failure_result_*`` pins the reporting API itself.
+
+
+def _supersede_inside_the_write_window(
+    monkeypatch, writer_conn, task_id: str, superseder_run_id: int
+) -> list:
+    """Supersede ``task_id``'s run between the caller's decision and the write.
+
+    ``writer_conn`` is a SECOND connection (the fixture's): it repoints
+    ``tasks.current_run_id`` the moment the kernel opens its write
+    transaction — exactly the window that separates "I own this run" from the
+    guarded write, in which a dispatcher reaper / stale-claim reclaim
+    legitimately takes the card over.
+    """
+    real_write_txn = kb.write_txn
+    fired: list = []
+
+    def racing_write_txn(connection):
+        if not fired:
+            fired.append(True)
+            writer_conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (superseder_run_id, task_id),
+            )
+            writer_conn.commit()
+        return real_write_txn(connection)
+
+    monkeypatch.setattr("hermes_cli.kanban_db.write_txn", racing_write_txn)
+    return fired
+
+
+def test_supersede_inside_write_window_logs_refused_and_never_recorded(conn, monkeypatch, caplog):
+    task_id = kb.create_task(conn, title="Implement the export", assignee="builder")
+    claimed = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert claimed is not None
+    run_id = int(claimed.current_run_id)
+    run_before = _run_row(conn, run_id)
+    events_before = _event_count(conn)
+    superseder_run_id = run_id + 100
+
+    fired = _supersede_inside_the_write_window(
+        monkeypatch, conn, task_id, superseder_run_id
+    )
+
+    caplog.set_level("INFO")
+    _finished(monkeypatch, conn, task_id, run_id)
+
+    assert fired == [True], "the race window was never entered"
+    messages = _log_messages(caplog)
+    assert not [
+        m for m in messages if "recorded budget-exhausted failure" in m
+    ], messages
+    refused = [m for m in messages if "refused budget-exhausted failure" in m]
+    assert len(refused) == 1, messages
+    # The kernel really did refuse, so the assertion above is not passing
+    # because the write never ran at all / blew up.
+    assert [m for m in messages if "refusing timed_out" in m], messages
+    assert not [
+        m for m in messages if "Failed to record budget-exhausted failure" in m
+    ], messages
+
+    # Board untouched by our write: our own run is still open, no event, no
+    # failure counted — and the superseder is still the current run.
+    assert _run_row(conn, run_id) == run_before
+    assert _event_count(conn) == events_before
+    task = kb.get_task(conn, task_id)
+    assert task.current_run_id == superseder_run_id
+    assert task.status == "running"
+    assert int(task.consecutive_failures) == 0
+    assert task.last_failure_error in (None, "")
+
+
+def test_record_task_failure_result_reports_refusal_and_recorded_write(conn):
+    task_id, stale_run_id, successor_run_id = _start_review_run(conn)
+
+    refused = kb._record_task_failure_result(
+        conn, task_id, _BUDGET_ERROR,
+        outcome="timed_out", release_claim=True, end_run=True,
+        expected_run_id=stale_run_id,
+    )
+    assert refused is kb._FailureRecordResult.REFUSED
+    assert refused not in kb._RECORDED_FAILURE_RESULTS
+    # The bool wrapper keeps the pre-existing contract for the same call: a
+    # refusal is False, indistinguishable from "landed below the breaker".
+    assert kb._record_task_failure(
+        conn, task_id, _BUDGET_ERROR,
+        outcome="timed_out", release_claim=True, end_run=True,
+        expected_run_id=stale_run_id,
+    ) is False
+
+    recorded = kb._record_task_failure_result(
+        conn, task_id, _BUDGET_ERROR,
+        outcome="timed_out", release_claim=True, end_run=True,
+        expected_run_id=successor_run_id,
+    )
+    assert recorded is kb._FailureRecordResult.RECORDED
+    assert recorded in kb._RECORDED_FAILURE_RESULTS
+
+
+def test_record_task_failure_result_reports_tripped_and_missing_task(conn):
+    task_id = kb.create_task(conn, title="Implement the export", assignee="builder")
+    claimed = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert claimed is not None
+    run_id = int(claimed.current_run_id)
+
+    tripped = kb._record_task_failure_result(
+        conn, task_id, _BUDGET_ERROR,
+        outcome="timed_out", release_claim=True, end_run=True,
+        force_trip=True, expected_run_id=run_id,
+    )
+    assert tripped is kb._FailureRecordResult.TRIPPED
+    assert tripped in kb._RECORDED_FAILURE_RESULTS
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+    # The bool wrapper still reports the breaker trip, exactly as before.
+    second = kb.create_task(conn, title="Second", assignee="builder")
+    claimed_second = kb.claim_task(conn, second, claimer="builder:1")
+    assert claimed_second is not None
+    assert kb._record_task_failure(
+        conn, second, _BUDGET_ERROR,
+        outcome="timed_out", release_claim=True, end_run=True,
+        force_trip=True, expected_run_id=int(claimed_second.current_run_id),
+    ) is True
+
+    missing = kb._record_task_failure_result(
+        conn, "t_no_such_task", _BUDGET_ERROR, outcome="timed_out",
+    )
+    assert missing is kb._FailureRecordResult.TASK_MISSING
+    assert missing not in kb._RECORDED_FAILURE_RESULTS
+    assert kb._record_task_failure(
+        conn, "t_no_such_task", _BUDGET_ERROR, outcome="timed_out",
+    ) is False
+
+
+def test_missing_task_logs_neither_recorded_nor_a_supersede(conn, monkeypatch, caplog):
+    """A card row that is gone is not a supersede: report it as such.
+
+    Both no-write codes must stay out of the ``recorded`` line, but only a
+    refusal is a stale-worker supersede — claiming "run X is current" for a
+    deleted/archived card would be a second, quieter lie in the same log.
+    """
+    caplog.set_level("INFO", logger=_LOGGER)
+    _finished(monkeypatch, conn, "t_no_such_task", 7)
+
+    messages = _log_messages(caplog)
+    assert not [
+        m for m in messages if "recorded budget-exhausted failure" in m
+    ], messages
+    assert not [
+        m for m in messages if "refused budget-exhausted failure" in m
+    ], messages
+    assert len([
+        m for m in messages
+        if "cannot record budget-exhausted failure for task t_no_such_task" in m
+    ]) == 1, messages

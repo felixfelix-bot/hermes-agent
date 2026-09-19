@@ -182,24 +182,24 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    # Classify the write from run ownership sampled
-                    # BEFORE the call: it is the same predicate the
-                    # kernel's guard evaluates (``expected_run_id`` vs
-                    # ``tasks.current_run_id``). Sampling afterwards is
-                    # useless -- a recorded write closes the run
-                    # (``end_run=True``) so ``_current_run_id()`` is
-                    # ``None``, while a refusal leaves the successor's id
-                    # in place; both differ from our run id, so a
-                    # post-call sample labels refusals "recorded" and
-                    # makes the ``refused`` branch below unreachable dead
-                    # code (round-1 review finding on t_ddcaad8b). See the
-                    # run-ownership invariant on ``_record_task_failure``.
-                    _owns_run = (
-                        _kanban_run_id is not None
-                        and _kb._current_run_id(_conn, _kanban_task)
-                        == _kanban_run_id
-                    )
-                    _kb._record_task_failure(
+                    # The kernel tells us whether the write landed
+                    # (``_record_task_failure_result``), and it decides that
+                    # INSIDE the same BEGIN IMMEDIATE transaction as the
+                    # run-ownership guard, so this log line cannot disagree
+                    # with the board. Neither cheaper signal works:
+                    # ``_record_task_failure``'s bool returns False both for
+                    # a refused write and for a recorded one below the
+                    # breaker threshold, and re-deriving ownership here is
+                    # racy by construction -- a sample taken BEFORE the call
+                    # is not the predicate the guard evaluates, so a
+                    # concurrent reaper / stale-claim reclaim that supersedes
+                    # this run inside that window still printed "recorded ..."
+                    # while the kernel refused (round-2 residual on
+                    # t_ddcaad8b, filed as t_092cbd1b; round 1 was a
+                    # post-call sample, which cannot tell the two outcomes
+                    # apart either). See the run-ownership invariant on
+                    # ``_record_task_failure_result``.
+                    _record_result = _kb._record_task_failure_result(
                         _conn,
                         _kanban_task,
                         error=(
@@ -217,17 +217,21 @@ def finalize_turn(
                             "budget_max": agent.max_iterations,
                         },
                     )
-                    # A refused write must never be reported as recorded:
-                    # the kernel logs its own "refusing ..." warning for
-                    # that case.
-                    if _kanban_run_id is None or _owns_run:
+                    # A write that did not land must never be reported as
+                    # recorded: the kernel logs its own "refusing ..."
+                    # warning for the refusal case. The two no-write codes are
+                    # reported separately because only REFUSED is a supersede —
+                    # TASK_MISSING means the card row itself is gone
+                    # (archived/deleted concurrently) and there is no
+                    # successor run to warn about.
+                    if _record_result in _kb._RECORDED_FAILURE_RESULTS:
                         logger.info(
                             "recorded budget-exhausted failure for task %s "
                             "(run %s, %d/%d)",
                             _kanban_task, _kanban_run_id,
                             api_call_count, agent.max_iterations,
                         )
-                    else:
+                    elif _record_result is _kb._FailureRecordResult.REFUSED:
                         logger.warning(
                             "refused budget-exhausted failure for task %s: "
                             "this process owns run %s but run %s is current "
@@ -235,6 +239,12 @@ def finalize_turn(
                             "run)",
                             _kanban_task, _kanban_run_id,
                             _kb._current_run_id(_conn, _kanban_task),
+                        )
+                    else:
+                        logger.warning(
+                            "cannot record budget-exhausted failure for task "
+                            "%s (run %s): no such task row",
+                            _kanban_task, _kanban_run_id,
                         )
                 finally:
                     try:

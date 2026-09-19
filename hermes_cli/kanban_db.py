@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -8757,7 +8758,42 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
-def _record_task_failure(
+class _FailureRecordResult(str, Enum):
+    """The kernel's verdict on a :func:`_record_task_failure_result` call.
+
+    ``_record_task_failure`` deliberately keeps its historical ``bool``
+    return (``True`` only when the breaker tripped), which conflates "the
+    run-ownership guard refused this write" with "the write landed below the
+    threshold" -- both are ``False``. A caller that has to know whether its
+    write actually landed (the budget-exhausted log line in
+    ``agent/turn_finalizer.py``) cannot recover that from the boolean, and
+    cannot recover it from a post-call board read either: a recorded write
+    clears ``tasks.current_run_id`` (``end_run=True``) while a refusal leaves
+    the superseder's id in place, so BOTH differ from the caller's own id.
+
+    These codes are produced inside the same ``BEGIN IMMEDIATE`` transaction
+    as the write itself, so they are the guard's own verdict rather than a
+    re-derived guess that can race it.
+    """
+
+    # Guard refused before any write: counter, claim, runs and events untouched.
+    REFUSED = "refused"
+    # No such task row (card archived/deleted): nothing to write.
+    TASK_MISSING = "task_missing"
+    # The write landed; the failure counter is still below its effective limit.
+    RECORDED = "recorded"
+    # The write landed and the failure circuit breaker tripped (auto-blocked).
+    TRIPPED = "tripped"
+
+
+#: Result codes that mean "the write landed". Anything outside this set means
+#: the board was left exactly as it was and must never be logged as recorded.
+_RECORDED_FAILURE_RESULTS = frozenset(
+    {_FailureRecordResult.RECORDED, _FailureRecordResult.TRIPPED}
+)
+
+
+def _record_task_failure_result(
     conn: sqlite3.Connection,
     task_id: str,
     error: str,
@@ -8769,7 +8805,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+) -> _FailureRecordResult:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
 
@@ -8778,9 +8814,11 @@ def _record_task_failure(
     through here so the ``consecutive_failures`` counter and the
     auto-block threshold stay consistent.
 
-    Returns True when the task was auto-blocked (counter reached
-    ``failure_limit``), False when it was just updated in place (or when
-    the run-ownership guard below refused the write).
+    Returns a :class:`_FailureRecordResult` code: ``RECORDED`` / ``TRIPPED``
+    when the write landed, ``REFUSED`` when the run-ownership guard below
+    turned it into a deliberate no-op, ``TASK_MISSING`` when there is no task
+    row. Callers that only need the breaker keep using the ``bool`` wrapper
+    ``_record_task_failure``.
 
     Run-ownership invariant (never re-derive it from the task id alone)
     ------------------------------------------------------------------
@@ -8799,6 +8837,14 @@ def _record_task_failure(
     that know their run id MUST pass it; ``None`` preserves the legacy
     unpinned behaviour for dispatcher-internal callers (spawn/reap paths)
     that are authoritative by construction.
+
+    The refusal is REPORTED, never inferred. Because this function's return
+    code is produced inside the guarding transaction, a caller (the
+    finalizer's budget-exhausted log line) learns "the write did not land"
+    without sampling ownership itself -- a sample taken before the call is
+    not the predicate the guard evaluates inside its own ``BEGIN IMMEDIATE``,
+    so a concurrent reaper / stale-claim reclaim that supersedes the run in
+    that window would leave the caller believing it had recorded (t_092cbd1b).
 
     Modes:
 
@@ -8841,7 +8887,7 @@ def _record_task_failure(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
-            return False
+            return _FailureRecordResult.TASK_MISSING
         # Run-ownership guard — see the "Run-ownership invariant" section of
         # this function's docstring. A caller whose run is no longer the
         # task's ``current_run_id`` has been superseded (handed off, reclaimed
@@ -8862,7 +8908,7 @@ def _record_task_failure(
                 expected_run_id,
                 row["current_run_id"],
             )
-            return False
+            return _FailureRecordResult.REFUSED
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -8971,7 +9017,51 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
-    return blocked
+    return (
+        _FailureRecordResult.TRIPPED if blocked else _FailureRecordResult.RECORDED
+    )
+
+
+def _record_task_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    force_trip: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Boolean-contract wrapper over :func:`_record_task_failure_result`.
+
+    Keeps every pre-existing caller working byte-for-byte: ``True`` when the
+    task was auto-blocked (the counter reached its effective limit), ``False``
+    otherwise -- including the two paths where NOTHING was written, a
+    run-ownership refusal and a missing task row, just as before.
+
+    Callers that must distinguish "the write landed" from "the board was left
+    untouched" call ``_record_task_failure_result`` and branch on its code.
+    That distinction cannot be re-derived by the caller: a post-call board
+    read is racy and ambiguous (see :class:`_FailureRecordResult`).
+    """
+    return (
+        _record_task_failure_result(
+            conn,
+            task_id,
+            error,
+            outcome=outcome,
+            failure_limit=failure_limit,
+            force_trip=force_trip,
+            release_claim=release_claim,
+            end_run=end_run,
+            event_payload_extra=event_payload_extra,
+            expected_run_id=expected_run_id,
+        )
+        is _FailureRecordResult.TRIPPED
+    )
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly
