@@ -3364,6 +3364,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ) from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                # SQLITE_IOERR ("disk I/O error") is the transient contended-
+                # append failure on this fleet (vulnerable SQLite 3.50.4 +
+                # many short-lived CLI openers on a DELETE-journal state.db).
+                # The journal-mode probe already retries this exact class as
+                # transient (see the WAL journal-mode probe); ride it out
+                # within the patience budget here too, so one I/O blip does
+                # not abort the operator's turn as session_persistence_failed.
+                if "disk i/o error" in err_msg and self._sleep_before_write_retry(deadline, patience_s):
+                    continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
