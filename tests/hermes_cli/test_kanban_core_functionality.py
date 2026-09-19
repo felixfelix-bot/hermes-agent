@@ -1061,7 +1061,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    calls = {"connect": 0, "to_thread": 0, "per_call": []}
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
@@ -1074,15 +1074,18 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
+        # PR salvage (#32857 commit 7): the dispatcher reaps zombies at the top
+        # of each tick via ``asyncio.to_thread`` (reaper + auto-decompose +
+        # ``_tick_once`` + ``_ready_nonempty``), so the stop threshold is 6.
+        # The per-to_thread connect delta is what the assertions below read:
+        # it survives the read-only probes the tick loop grows over time
+        # (urgency ordering, global fleet-cap counts, ready/review probe).
         calls["to_thread"] += 1
+        _before = calls["connect"]
         result = fn(*args, **kwargs)
+        calls["per_call"].append(
+            (getattr(fn, "__name__", "?"), calls["connect"] - _before)
+        )
         if calls["to_thread"] >= 6:
             runner._running = False
         return result
@@ -1106,13 +1109,24 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+
+    # The corrupt board is attempted once and then skipped: the second tick
+    # must not issue the dispatch connect again because the board's DB
+    # fingerprint is unchanged and still quarantined. Asserting the tick-1 vs
+    # tick-2 delta pins that behaviour without freezing the absolute connect
+    # count, which moves whenever the tick loop grows a read-only probe
+    # (per-tick probes today: auto-decompose's triage scan, urgency-ordering
+    # count, two global fleet-cap counts, the ready/review probe).
+    tick_once_connects = [
+        delta for name, delta in calls["per_call"] if name == "_tick_once"
+    ]
+    assert len(tick_once_connects) == 2, calls["per_call"]
+    assert tick_once_connects[0] == tick_once_connects[1] + 1, (
+        f"expected the second tick to skip exactly one dispatch connect, "
+        f"got per-tick connects {tick_once_connects} (all calls: "
+        f"{calls['per_call']})"
+    )
+    assert calls["connect"] >= 5
 
 
 # ---------------------------------------------------------------------------

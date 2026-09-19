@@ -678,6 +678,50 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
+# ── hermes_* module purges must be restored ─────────────────────────────────
+# A few fixtures need a freshly imported ``hermes_cli`` / ``hermes_state``
+# module tree (to observe a new ``HERMES_HOME``). They used to get one by
+# deleting those entries from ``sys.modules`` and never putting them back,
+# which leaks for the rest of the session: every module imported *before* the
+# purge (production modules and other test modules) keeps the OLD module
+# object while fresh imports hand callers a NEW one. Monkeypatches then land
+# on one object while the code under test calls the other, so the patches
+# silently no-op. Running the whole kanban file set in one process lost its
+# kanban write guard, yanked the decomposer roster back to real profiles, and
+# broke the lifecycle-hook, swarm-rollback and rate-limit-requeue tests that
+# way. Purge through this fixture instead — it restores the pre-purge module
+# objects at teardown, so the leak is confined to the test that asked for it.
+_HERMES_PURGE_PREFIXES = ("hermes_cli", "hermes_state")
+_HERMES_PURGE_EXACT = ("hermes_constants",)
+
+
+def _purgeable_hermes_modules() -> list[str]:
+    return [
+        name
+        for name in list(sys.modules)
+        if name.startswith(_HERMES_PURGE_PREFIXES) or name in _HERMES_PURGE_EXACT
+    ]
+
+
+@pytest.fixture
+def purge_hermes_modules():
+    """Purge ``hermes_*`` modules from ``sys.modules``, restoring them after.
+
+    Request this *before* the first import of ``hermes_cli`` /
+    ``hermes_state`` inside a test (or inside the fixtures that test uses)
+    whenever the test needs that tree imported fresh.
+    """
+    saved = {name: sys.modules[name] for name in _purgeable_hermes_modules()}
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield saved
+    finally:
+        for name in _purgeable_hermes_modules():
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
 # ── Live state.db write guard ───────────────────────────────────────────────
 # Companion to the kanban guard above, for the MAIN state database.
 # ``hermes_state._ensure_test_isolation`` (the single choke point every

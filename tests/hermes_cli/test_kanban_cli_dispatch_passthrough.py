@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,14 +17,16 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+def isolated_kanban_home(monkeypatch, purge_hermes_modules):
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    ``purge_hermes_modules`` swaps in a freshly imported ``hermes_cli`` tree so
+    the new HERMES_HOME is picked up; it restores the previous module objects
+    at teardown so the purge can't leak into other test files.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     yield test_home
 
 
