@@ -1,5 +1,6 @@
 """Tests for agent/system_prompt.py — context-file cwd wiring."""
 
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -339,3 +340,147 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+# ── T4 (cost-reduction-sprint): longest-prefix stability ────────────────────
+#
+# A provider prompt cache only reuses a prefix that is BYTE-IDENTICAL across
+# turns: DeepSeek prices cached input at $0.03/M against $0.14/M uncached
+# (~4.7x) and NeuralWatt charges real prefill compute, so one volatile byte
+# rendered ABOVE the stable scaffold costs the whole prefix on every rebuild.
+# The assembly order (stable -> context -> volatile) is the invariant that
+# keeps the prefix reusable; these tests guard the ORDER, not the content.
+
+_MEMORY = "MEMORY_SNAPSHOT_SENTINEL"
+_USER = "USER_PROFILE_SENTINEL"
+_EXTERNAL_MEMORY = "EXTERNAL_MEMORY_SENTINEL"
+_CHANGED_SKILLS = "SKILLS_INDEX_AFTER_A_PATCH"
+_DAY_ONE_EARLY = datetime(2026, 9, 19, 0, 5)        # Saturday 00:05
+_DAY_ONE_LATE = datetime(2026, 9, 19, 23, 55)       # Saturday 23:55
+_DAY_TWO = datetime(2026, 9, 20, 0, 5)              # Sunday
+
+
+class _FakeMemoryStore:
+    """Only the two blocks ``build_system_prompt_parts`` reads."""
+
+    def __init__(self, memory="", user=""):
+        self._blocks = {"memory": memory, "user": user}
+
+    def format_for_system_prompt(self, kind):
+        return self._blocks.get(kind, "")
+
+
+class _FakeMemoryManager:
+    def build_system_prompt(self):
+        return _EXTERNAL_MEMORY
+
+
+def _build_variant(builder, *, skills=_SKILLS, when=None, **overrides):
+    """Rebuild the prompt with a controllable VOLATILE tail.
+
+    ``skills`` and ``when`` are exactly the inputs that move between rebuilds
+    in production (the agent patches its own skills mid-session; the day rolls
+    over), so varying them is what makes the stability assertions non-vacuous.
+    """
+    agent = _make_agent(
+        valid_tool_names=["skills_list"],
+        _memory_store=_FakeMemoryStore(_MEMORY, _USER),
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _memory_manager=_FakeMemoryManager(),
+        **overrides,
+    )
+    patches = [
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
+        patch("run_agent.get_toolset_for_tool", return_value=None),
+        patch("run_agent.build_skills_system_prompt", return_value=skills),
+    ]
+    if when is not None:
+        patches.append(patch("hermes_time.now", return_value=when))
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        return builder(agent)
+
+
+class TestLongestPrefixStability:
+    """T4: the stable tier is the prefix the upstream prompt cache reuses."""
+
+    def test_stable_prefix_byte_identical_when_volatile_tail_moves(self):
+        first = _build_variant(build_system_prompt_parts, skills=_SKILLS,
+                               when=_DAY_ONE_EARLY)
+        second = _build_variant(build_system_prompt_parts,
+                                skills=_CHANGED_SKILLS, when=_DAY_TWO)
+        # The tail genuinely moved (skills patched, day rolled) ...
+        assert first["volatile"] != second["volatile"]
+        # ... and the prefix the provider caches did not, byte for byte.
+        assert first["stable"] == second["stable"]
+        assert first["stable"].encode("utf-8") == second["stable"].encode("utf-8")
+
+    def test_full_prompt_keeps_the_identical_leading_prefix(self):
+        parts_a = _build_variant(build_system_prompt_parts, when=_DAY_ONE_EARLY)
+        parts_b = _build_variant(build_system_prompt_parts,
+                                 skills=_CHANGED_SKILLS, when=_DAY_TWO)
+        full_a = _build_variant(build_system_prompt, when=_DAY_ONE_EARLY)
+        full_b = _build_variant(build_system_prompt,
+                                skills=_CHANGED_SKILLS, when=_DAY_TWO)
+        n = len(parts_a["stable"])
+        assert n > 0
+        assert full_a.startswith(parts_a["stable"])
+        assert full_b.startswith(parts_b["stable"])
+        assert full_a[:n] == full_b[:n]
+
+    def test_band_order_is_stable_then_context_then_volatile(self):
+        parts = _build_variant(build_system_prompt_parts)
+        full = _build_variant(build_system_prompt)
+        assert parts["stable"] and parts["context"] and parts["volatile"]
+        # Exactly the documented assembly: the three bands, in order, joined
+        # with a blank line — stable FIRST, volatile LAST.
+        assert full == "\n\n".join(
+            p for p in (parts["stable"], parts["context"], parts["volatile"]) if p
+        )
+        assert full.startswith(parts["stable"])
+        assert full.index(parts["context"]) >= len(parts["stable"])
+        assert full.index(parts["volatile"]) > full.index(parts["context"])
+
+    def test_stable_band_carries_no_volatile_state(self):
+        parts = _build_variant(
+            build_system_prompt_parts,
+            model="deepseek/deepseek-flash",
+            provider="deepseek",
+            platform="cli",
+            pass_session_id=True,
+            session_id="sess-t4-sentinel",
+        )
+        stable = parts["stable"]
+        for volatile_marker in (
+            _SKILLS,
+            _MEMORY,
+            _USER,
+            _EXTERNAL_MEMORY,
+            "Conversation started:",
+            "Model: deepseek/deepseek-flash",
+            "Provider: deepseek",
+            "Platform: cli",
+            "Session ID: sess-t4-sentinel",
+        ):
+            assert volatile_marker not in stable, volatile_marker
+            assert volatile_marker in parts["volatile"], volatile_marker
+
+    def test_timestamp_is_date_only_so_one_day_is_byte_stable(self):
+        early = _build_variant(build_system_prompt_parts, when=_DAY_ONE_EARLY)
+        late = _build_variant(build_system_prompt_parts, when=_DAY_ONE_LATE)
+        assert "Conversation started: Saturday, September 19, 2026" in early["volatile"]
+        # 23h50 apart on the same day -> identical bytes, so a rebuild during
+        # the day (compaction, gateway turn, session resume) still hits.
+        assert early["volatile"] == late["volatile"]
+        assert early["stable"] == late["stable"]
+
+    def test_volatile_tail_moves_only_at_the_date_boundary(self):
+        one = _build_variant(build_system_prompt_parts, when=_DAY_ONE_LATE)
+        two = _build_variant(build_system_prompt_parts, when=_DAY_TWO)
+        assert one["volatile"] != two["volatile"]   # keeps the test above honest
+        assert one["stable"] == two["stable"]
