@@ -1685,6 +1685,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Diagnostics (rendered further down, in the text branch) need the
+        # direct parent/child state. Resolve it here, while the connection is
+        # still open: evaluating it after this ``with`` block exited raised
+        # ``sqlite3.ProgrammingError: Cannot operate on a closed database`` and
+        # killed ``kanban show`` for every task on every board.
+        graph = kb.task_graph_context(conn, args.task_id)
 
     if getattr(args, "json", False):
         payload = {
@@ -1762,9 +1768,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(
-        task, events, runs, graph=kb.task_graph_context(conn, task.id)
-    )
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
