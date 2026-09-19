@@ -28,6 +28,8 @@ the pre-fix code end-to-end, through the real finalizer path);
 ``test_record_task_failure_*`` pins the shared guard itself so every future
 caller inherits it, and ``*_own_run_id_*`` proves the legitimate path is
 unchanged.
+``*_logs_*`` pins the finalizer's log classification: a write the
+kernel refused must never be reported as recorded (round-1 review finding).
 """
 
 from __future__ import annotations
@@ -262,3 +264,80 @@ def test_record_task_failure_accepts_own_run_id(conn):
 
     run = _run_row(conn, successor_run_id)
     assert run["outcome"] == "timed_out" and run["ended_at"] is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Finalizer log classification: a REFUSED write must never be reported as
+# "recorded" (review finding, round 1 on t_ddcaad8b)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The first version of this fix classified the outcome from the board AFTER the
+# call (``_current_run_id(conn, task) != run_id``). BOTH outcomes satisfy that
+# predicate — a recorded write closes the run, so the id becomes ``None``, and
+# a refusal leaves the successor's id in place (≠ our run id) — so every
+# refusal printed "recorded budget-exhausted failure …" one line under the
+# kernel's own "refusing …" warning, and the ``refused`` branch was unreachable
+# dead code. The classification is now taken from run ownership sampled BEFORE
+# the write, which is the predicate the kernel's guard evaluates, so a refused
+# write can never be labelled recorded.
+
+_LOGGER = "agent.conversation_loop"
+
+
+def _log_messages(caplog) -> list:
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_stale_run_id_logs_refused_and_never_recorded(conn, monkeypatch, caplog):
+    task_id, stale_run_id, successor_run_id = _start_review_run(conn)
+
+    caplog.set_level("INFO", logger=_LOGGER)
+    _finished(monkeypatch, conn, task_id, stale_run_id)
+
+    messages = _log_messages(caplog)
+    assert not [
+        m for m in messages if "recorded budget-exhausted failure" in m
+    ], messages
+    refused = [m for m in messages if "refused budget-exhausted failure" in m]
+    assert len(refused) == 1, messages
+    assert f"for task {task_id}: this process owns run {stale_run_id}" in refused[0]
+    assert f"but run {successor_run_id} is current" in refused[0]
+
+    # The log matches the board: the successor is still the current run.
+    assert kb.get_task(conn, task_id).current_run_id == successor_run_id
+
+
+def test_own_run_id_logs_recorded_and_never_refused(conn, monkeypatch, caplog):
+    task_id = kb.create_task(conn, title="Implement the export", assignee="builder")
+    claimed = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert claimed is not None
+    run_id = int(claimed.current_run_id)
+
+    caplog.set_level("INFO", logger=_LOGGER)
+    _finished(monkeypatch, conn, task_id, run_id)
+
+    messages = _log_messages(caplog)
+    recorded = [m for m in messages if "recorded budget-exhausted failure" in m]
+    assert len(recorded) == 1, messages
+    assert f"for task {task_id} (run {run_id}, 90/90)" in recorded[0]
+    assert not [
+        m for m in messages if "refused budget-exhausted failure" in m
+    ], messages
+
+
+def test_run_id_absent_logs_recorded(conn, monkeypatch, caplog):
+    """No ``HERMES_KANBAN_RUN_ID`` ⇒ unpinned legacy path, still recorded."""
+    task_id = kb.create_task(conn, title="Implement the export", assignee="builder")
+    claimed = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert claimed is not None
+
+    caplog.set_level("INFO", logger=_LOGGER)
+    _finished(monkeypatch, conn, task_id, None)
+
+    messages = _log_messages(caplog)
+    assert len([
+        m for m in messages if "recorded budget-exhausted failure" in m
+    ]) == 1, messages
+    assert not [
+        m for m in messages if "refused budget-exhausted failure" in m
+    ], messages

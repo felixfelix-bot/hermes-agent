@@ -182,6 +182,23 @@ def finalize_turn(
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
+                    # Classify the write from run ownership sampled
+                    # BEFORE the call: it is the same predicate the
+                    # kernel's guard evaluates (``expected_run_id`` vs
+                    # ``tasks.current_run_id``). Sampling afterwards is
+                    # useless -- a recorded write closes the run
+                    # (``end_run=True``) so ``_current_run_id()`` is
+                    # ``None``, while a refusal leaves the successor's id
+                    # in place; both differ from our run id, so a
+                    # post-call sample labels refusals "recorded" and
+                    # makes the ``refused`` branch below unreachable dead
+                    # code (round-1 review finding on t_ddcaad8b). See the
+                    # run-ownership invariant on ``_record_task_failure``.
+                    _owns_run = (
+                        _kanban_run_id is not None
+                        and _kb._current_run_id(_conn, _kanban_task)
+                        == _kanban_run_id
+                    )
                     _kb._record_task_failure(
                         _conn,
                         _kanban_task,
@@ -200,15 +217,10 @@ def finalize_turn(
                             "budget_max": agent.max_iterations,
                         },
                     )
-                    # The ownership guard inside ``_record_task_failure`` is
-                    # authoritative and may have refused this write (stale
-                    # run). Report what the board actually shows rather than
-                    # claiming a write that may not have happened.
-                    if (
-                        _kanban_run_id is None
-                        or _kb._current_run_id(_conn, _kanban_task)
-                        != _kanban_run_id
-                    ):
+                    # A refused write must never be reported as recorded:
+                    # the kernel logs its own "refusing ..." warning for
+                    # that case.
+                    if _kanban_run_id is None or _owns_run:
                         logger.info(
                             "recorded budget-exhausted failure for task %s "
                             "(run %s, %d/%d)",
