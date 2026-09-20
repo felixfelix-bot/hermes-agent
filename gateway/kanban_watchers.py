@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,52 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+# --- Reclaim-loop circuit breaker (2026-09-20) ------------------------------
+# A worker that dies immediately is reclaimed by the dispatcher guard below and
+# then re-spawned on the very next tick, forever: `reclaim_task` deliberately
+# clears `consecutive_failures` ("fresh budget"), so `kanban.failure_limit`
+# never trips. The out-of-band `fleet_loop_guard.py` timer also catches this,
+# but only on its own cadence. This breaker bounds the loop *inline*: each
+# dead-pid reclaim blocks the task for an exponentially growing backoff
+# (5m, 10m, 20m, ...) and hard-blocks it after `RECLAIM_BLOCK_AFTER` strikes.
+# Once a worker runs and the task leaves `blocked` the strike count is dropped,
+# so a legitimately-recovered task starts clean.
+RECLAIM_BACKOFF_BASE_S = 300          # 5 minutes
+RECLAIM_BACKOFF_MAX_S = 3600          # 1 hour ceiling
+RECLAIM_BLOCK_AFTER = 3               # dead-pid reclaims before a hard block
+
+
+def _reclaim_backoff_path() -> Path:
+    """Profile-safe path for the strike/backoff ledger (resolved per call)."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "bot" / "reclaim_backoff.json"
+
+
+def _load_reclaim_backoff() -> dict:
+    try:
+        data = json.loads(_reclaim_backoff_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_reclaim_backoff(data: dict) -> None:
+    try:
+        path = _reclaim_backoff_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _reclaim_backoff_seconds(strikes: int) -> int:
+    """Exponential backoff for the Nth dead-pid reclaim (5m, 10m, 20m, ...)."""
+    return min(RECLAIM_BACKOFF_BASE_S * (2 ** max(strikes - 1, 0)),
+               RECLAIM_BACKOFF_MAX_S)
+
 
 
 def _resolve_auto_decompose_settings(
@@ -1602,18 +1649,45 @@ class GatewayKanbanWatchersMixin:
                         # but whose TTL hasn't expired yet (e.g. workers
                         # orphaned by a gateway restart). Otherwise they pin
                         # the fleet cap for a full TTL and stall dispatch.
+                        _bf = _load_reclaim_backoff()
                         for _tid, _wp in _rc.execute(
                             "SELECT id, worker_pid FROM tasks "
                             "WHERE status='running'"
                         ).fetchall():
                             try:
-                                if _wp and not _kb._pid_alive(_wp):
-                                    _kb.reclaim_task(
+                                if not _wp or _kb._pid_alive(_wp):
+                                    continue
+                                _entry = _bf.get(_tid) or {}
+                                _strikes = int(_entry.get("count", 0)) + 1
+                                if _strikes >= RECLAIM_BLOCK_AFTER:
+                                    _kb.block_task(
                                         _rc, _tid,
-                                        reason="dispatcher guard: dead worker pid",
+                                        reason=(f"reclaim loop: worker died "
+                                                f"{_strikes}x (dispatcher "
+                                                f"guard) — auto-blocked; "
+                                                f"needs human"),
                                     )
+                                    _bf.pop(_tid, None)
+                                    logger.warning(
+                                        "kanban reclaim-loop breaker: "
+                                        "hard-blocked %s (worker died %dx)",
+                                        _tid, _strikes)
+                                else:
+                                    _bk_until = time.time() + \
+                                        _reclaim_backoff_seconds(_strikes)
+                                    _kb.block_task(
+                                        _rc, _tid,
+                                        reason=(f"reclaim backoff until "
+                                                f"{int(_bk_until)} (dead "
+                                                f"worker pid, strike "
+                                                f"{_strikes})"),
+                                    )
+                                    _bf[_tid] = {"count": _strikes,
+                                                 "until": _bk_until,
+                                                 "board": _slug}
                             except Exception:
                                 continue
+                        _save_reclaim_backoff(_bf)
                     except Exception:
                         continue
                     finally:
@@ -1622,6 +1696,42 @@ class GatewayKanbanWatchersMixin:
                                 _rc.close()
                             except Exception:
                                 pass
+            # Release cards whose reclaim backoff has elapsed; forget strike
+            # counts for cards that recovered (left `blocked` some other way).
+            _bf = _load_reclaim_backoff()
+            if _bf:
+                _now = time.time()
+                for _tid, _entry in list(_bf.items()):
+                    if not isinstance(_entry, dict):
+                        _bf.pop(_tid, None)
+                        continue
+                    _board = _entry.get("board")
+                    _conn = None
+                    try:
+                        _conn = _kb.connect(board=_board) if _board else None
+                        if _conn is None:
+                            _bf.pop(_tid, None)
+                            continue
+                        _row = _conn.execute(
+                            "SELECT status FROM tasks WHERE id = ?", (_tid,)
+                        ).fetchone()
+                        _st = str(_row[0]) if _row else None
+                        if _st is None:
+                            _bf.pop(_tid, None)
+                        elif float(_entry.get("until", 0)) <= _now:
+                            _kb.unblock_task(_conn, _tid)
+                            _bf.pop(_tid, None)
+                        elif _st != "blocked":
+                            _bf.pop(_tid, None)
+                    except Exception:
+                        continue
+                    finally:
+                        if _conn is not None:
+                            try:
+                                _conn.close()
+                            except Exception:
+                                pass
+                _save_reclaim_backoff(_bf)
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 # Re-count the fleet's in-flight workers from the DB before each
