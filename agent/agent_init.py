@@ -2043,6 +2043,15 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Anti-thrash strike ceiling before automatic compaction is blocked on a
+    # looping session. 1 = block after a single unproductive compaction; the
+    # default 2 matches the historical hard-coded behaviour.
+    try:
+        compression_ineffective_strike_limit = max(
+            1, int(_compression_cfg.get("ineffective_strike_limit", 2) or 2)
+        )
+    except (TypeError, ValueError):
+        compression_ineffective_strike_limit = 2
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2547,7 +2556,35 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            ineffective_strike_limit=compression_ineffective_strike_limit,
         )
+        # Hard assertion (operator 2026-09-20): an explicit model.context_length
+        # MUST be what the built-in compressor enforces. A silent fallback (e.g.
+        # get_model_context_length()'s 128K default when the override is not
+        # plumbed) makes sessions compact far earlier than configured, and the
+        # incompressible prompt can then meet the threshold and block compaction
+        # forever. Fail loud instead of degrading silently. Skipped only when an
+        # LM Studio runtime length was verified (legitimately different) or the
+        # operator opts out via compression.allow_context_length_mismatch.
+        if (
+            _config_context_length is not None
+            and _lmstudio_runtime_context_length is None
+            and not is_truthy_value(
+                _compression_cfg.get("allow_context_length_mismatch"),
+                default=False,
+            )
+        ):
+            _resolved_ctx = int(agent.context_compressor.context_length or 0)
+            if _resolved_ctx != int(_config_context_length):
+                raise RuntimeError(
+                    "model.context_length is set to "
+                    f"{int(_config_context_length):,} but the context compressor "
+                    f"resolved {_resolved_ctx:,}. An explicit context window must "
+                    "be honored; a silent fallback (typically the 128K default for "
+                    "models the resolver does not know) compresses far too early. "
+                    "Fix model.context_length, or set "
+                    "compression.allow_context_length_mismatch: true to override."
+                )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:

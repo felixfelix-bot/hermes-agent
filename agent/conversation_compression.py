@@ -3624,6 +3624,19 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+        # Record the incompressible floor (system prompt tiers + tool schemas +
+        # rules/skills/memory) so the anti-thrash verdict can distinguish
+        # "messages are still too big" (real thrash) from "the fixed prefix
+        # alone exceeds the threshold" (compaction cannot help; do not strike).
+        try:
+            from agent.context_breakdown import (
+                estimate_incompressible_floor_tokens,
+            )
+            agent.context_compressor.incompressible_floor_tokens = (
+                estimate_incompressible_floor_tokens(agent, compressed)
+            )
+        except Exception:
+            agent.context_compressor.incompressible_floor_tokens = 0
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
         # leave this false, so unrelated later usage cannot be charged to an

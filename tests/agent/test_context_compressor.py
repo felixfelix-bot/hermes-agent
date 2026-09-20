@@ -3352,3 +3352,72 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestIncompressibleFloorAntiThrash:
+    """A compaction that cannot clear the threshold only because the FIXED
+    prefix (system prompt + tool schemas) already meets it must not count as an
+    ineffective strike — otherwise compression blocks forever and the overflow
+    warning fires every turn (the 2026-09-20 incident)."""
+
+    def _mk(self, *, threshold_tokens=100_000, floor=0, limit=2):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=200_000,
+        ):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.5,
+                quiet_mode=True,
+                ineffective_strike_limit=limit,
+            )
+            _ = c.context_length
+        c.threshold_tokens = threshold_tokens
+        c.incompressible_floor_tokens = floor
+        return c
+
+    def test_floor_explains_overage_does_not_strike(self):
+        c = self._mk(threshold_tokens=100_000, floor=140_000)
+        c._verify_compaction_cleared_threshold = True
+        c.update_from_response({"prompt_tokens": 150_000, "completion_tokens": 5})
+        assert c._ineffective_compression_count == 0
+        assert c._compression_block_reason() is None  # not blocked
+
+    def test_genuine_message_thrash_still_strikes(self):
+        c = self._mk(threshold_tokens=100_000, floor=1_000)
+        c._verify_compaction_cleared_threshold = True
+        c.update_from_response({"prompt_tokens": 150_000, "completion_tokens": 5})
+        assert c._ineffective_compression_count == 1
+
+    def test_strike_limit_is_configurable(self):
+        c = self._mk(limit=1)
+        c._ineffective_compression_count = 1
+        assert c._compression_block_reason() == "ineffective"
+        c2 = self._mk(limit=3)
+        c2._ineffective_compression_count = 2
+        assert c2._compression_block_reason() is None
+
+
+def test_summary_call_is_tagged_compression(compressor):
+    """The summary request must carry task_type=compression so the proxy records
+    api_calls.task_type and the compression-cost Kalman governor can measure."""
+    from types import SimpleNamespace
+
+    turns = [
+        {"role": "user", "content": "please fix the thing"},
+        {"role": "assistant", "content": "working on it " + ("x" * 2000)},
+    ]
+    captured = {}
+
+    def _fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="## Goal\nok"))]
+        )
+
+    with patch("agent.context_compressor.call_llm", _fake_call_llm):
+        out = compressor._generate_summary(turns)
+
+    assert out  # a summary came back
+    assert captured.get("extra_body", {}).get("task_type") == "compression"
+

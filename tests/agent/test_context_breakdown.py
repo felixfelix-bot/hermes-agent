@@ -126,3 +126,34 @@ def test_details_lines_caps_listing():
     assert any("… and 5 more" in line for line in lines)
 
 
+# ── incompressible floor (anti-thrash input) ────────────────────────────────
+
+from agent.context_breakdown import estimate_incompressible_floor_tokens  # noqa: E402
+
+
+def test_incompressible_floor_excludes_conversation():
+    stable = (
+        "base guidance\n"
+        "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>"
+    )
+    history = [{"role": "user", "content": "x" * 4000}]
+    agent, parts = _make_agent(stable=stable, context="# Proj", volatile="now")
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, history)
+        floor = estimate_incompressible_floor_tokens(agent, history)
+
+    cats = {c["id"]: c["tokens"] for c in data["categories"]}
+    expected = sum(v for k, v in cats.items() if k != "conversation")
+    assert floor == expected
+    assert floor > 0
+    assert cats.get("conversation", 0) > 0      # compressible content exists
+    assert floor < data["estimated_total"]      # and is excluded from the floor
+
+
+def test_incompressible_floor_zero_without_prefix():
+    agent, parts = _make_agent(stable="", context="", volatile="")
+    agent.tools = []  # override the helper's non-empty default
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        assert estimate_incompressible_floor_tokens(agent, []) == 0
+
+

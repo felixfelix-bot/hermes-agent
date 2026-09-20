@@ -641,6 +641,14 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
+        "ineffective_strike_limit": 2,  # anti-thrash ceiling: block automatic
+                                      # compaction after this many compactions that
+                                      # left the *compressible* context over threshold.
+                                      # 1 = block after a single unproductive pass; 2
+                                      # (default) matches the historical behaviour. An
+                                      # over-threshold reading explained entirely by the
+                                      # incompressible floor (system prompt + tool
+                                      # schemas) never counts as a strike.
         "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
                                       # no-LLM tool-result prune, run independently of
                                       # `threshold` above. On large-window models

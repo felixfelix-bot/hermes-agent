@@ -156,6 +156,30 @@ def compute_session_context_breakdown(
     }
 
 
+def estimate_incompressible_floor_tokens(
+    agent: Any,
+    messages: Optional[List[dict]] = None,
+) -> int:
+    """Tokens a compaction cannot reclaim: the fixed request prefix.
+
+    Compaction rewrites conversation history, but the system-prompt tiers,
+    tool schemas, rules, skills index, MCP/subagent definitions and memory are
+    re-sent verbatim on every request. When *this* floor alone meets the
+    compression threshold, no amount of message-shrinking can clear it, so the
+    anti-thrash breaker must not count those compactions as ineffective
+    (see ``context_compressor._verify_compaction_cleared_threshold``).
+
+    Reuses :func:`compute_session_context_breakdown` so the figure matches the
+    ``/context`` display exactly. Returns 0 when the breakdown is empty.
+    """
+    breakdown = compute_session_context_breakdown(agent, messages)
+    return sum(
+        int(cat.get("tokens") or 0)
+        for cat in breakdown.get("categories", [])
+        if cat.get("id") != "conversation"
+    )
+
+
 # ── /context rendering (CLI + gateway) ──────────────────────────────────────
 #
 # Pure text renderers over the payload above. The CLI shows a glyph block-grid

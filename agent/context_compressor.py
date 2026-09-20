@@ -2532,6 +2532,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        ineffective_strike_limit: int = 2,
     ):
         self.model = model
         self.base_url = base_url
@@ -2592,6 +2593,21 @@ class ContextCompressor(ContextEngine):
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+        # Anti-thrash strike ceiling before automatic compaction is blocked.
+        # Config: ``compression.ineffective_strike_limit`` (single source at
+        # agent_init); 1 permits one strike, default 2 matches the historical
+        # hard-coded behaviour.
+        try:
+            self.ineffective_strike_limit = max(1, int(ineffective_strike_limit))
+        except (TypeError, ValueError):
+            self.ineffective_strike_limit = 2
+        # Tokens the fixed request prefix (system prompt tiers + tool schemas +
+        # rules/skills/memory) occupies; compaction cannot shrink them. Set by
+        # the agent each compaction via
+        # ``estimate_incompressible_floor_tokens``. When the over-threshold
+        # reading is fully explained by this floor, the compaction is NOT
+        # counted as ineffective (see ``update_from_response``).
+        self.incompressible_floor_tokens = 0
         # Output-token reservation: the provider carves max_tokens out of the
         # context window, so the usable input budget is context_length -
         # max_tokens. None = provider default => assume no reservation. (#43547)
@@ -2786,19 +2802,45 @@ class ContextCompressor(ContextEngine):
             # Keying on real usage compares like with like and fires exactly once
             # per compaction.
             if self._verify_compaction_cleared_threshold:
-                if self.last_prompt_tokens >= self.threshold_tokens:
+                _floor = max(
+                    0, int(getattr(self, "incompressible_floor_tokens", 0) or 0)
+                )
+                _compressible = self.last_prompt_tokens - _floor
+                if (
+                    self.last_prompt_tokens >= self.threshold_tokens
+                    and _compressible >= self.threshold_tokens
+                ):
+                    # Genuine thrash: even without the fixed prefix the messages
+                    # still exceed the trigger, so the next turn compacts again.
                     self._record_ineffective_compression_verdict(
                         self._ineffective_compression_count + 1,
                     )
                     if not self.quiet_mode:
                         logger.warning(
                             "Compaction did not clear the threshold: %d real "
-                            "tokens still >= %d. The incompressible prompt "
-                            "(system prompt + tool schemas) may already exceed "
-                            "it, in which case shrinking messages cannot help. "
+                            "tokens still >= %d (incompressible floor %d). "
                             "ineffective_compression_count=%d",
                             self.last_prompt_tokens, self.threshold_tokens,
-                            self._ineffective_compression_count,
+                            _floor, self._ineffective_compression_count,
+                        )
+                elif (
+                    self.last_prompt_tokens >= self.threshold_tokens
+                    and _floor >= self.threshold_tokens
+                ):
+                    # The fixed prefix ALONE meets the threshold: no amount of
+                    # message-shrinking can clear it. Do NOT strike — striking
+                    # would block compression forever and re-emit the overflow
+                    # warning every turn. Reset and log the real cause once.
+                    self._record_ineffective_compression_verdict(0)
+                    if not self.quiet_mode:
+                        logger.warning(
+                            "Context over threshold (%d >= %d), but the "
+                            "incompressible floor (system prompt + tool "
+                            "schemas + rules/skills/memory = %d tokens) already "
+                            "meets it — message compaction cannot help. Raise "
+                            "model.context_length or shrink the fixed prefix.",
+                            self.last_prompt_tokens, self.threshold_tokens,
+                            _floor,
                         )
                 else:
                     self._record_ineffective_compression_verdict(0)
@@ -2966,8 +3008,9 @@ class ContextCompressor(ContextEngine):
         _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
         if _cooldown_remaining > 0:
             return f"cooldown:{_cooldown_remaining:.0f}"
+        _limit = getattr(self, "ineffective_strike_limit", 2) or 2
         if (
-            self._ineffective_compression_count >= 2
+            self._ineffective_compression_count >= _limit
             or self._fallback_compression_streak >= 2
         ):
             return "ineffective"
@@ -4190,6 +4233,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
+                # Tag the summary request so the flat-router proxy records
+                # ``api_calls.task_type='compression'`` (zai_proxy
+                # ``_extract_task_type``). Without it the compression-cost
+                # Kalman governor's ratio is always 0 and its filter degenerates
+                # (see hermes-orchestration scripts/engine/compression_cost_governor.py).
+                # ``extra_body`` is the documented pass-through for provider
+                # request fields; the proxy is the aux compression endpoint.
+                "extra_body": {"task_type": "compression"},
                 # NO max_tokens: the output cap must never truncate a summary.
                 # ``summary_budget`` is prompt-level guidance only ("Target ~N
                 # tokens" above). Most OpenAI-compatible wires already omit the
