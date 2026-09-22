@@ -23,6 +23,9 @@ from hermes_state import (
     SessionDB,
     is_malformed_db_error,
     repair_state_db_schema,
+    _backup_db_file,
+    _malformed_backup_paths,
+    _prune_malformed_backups,
 )
 
 
@@ -393,5 +396,65 @@ def test_repair_stale_btree_index_preserves_rows(tmp_path):
         assert msgs[0]["content"] == "hello world 0"
     finally:
         db.close()
+
+
+# ── Backup-loop bound (root-disk incident 2026-09-22) ────────────────────
+# A malformed state.db that is re-opened copies the whole file each time. On
+# 2026-09-22 a manager loop left 24 ~1 GB copies (17.6 GB) on a filesystem that
+# had already hit 0 free, starving every SQLite write. The backup path must cap
+# its retention and refuse to copy when the disk can't hold another copy.
+
+import time as _time  # noqa: E402
+
+
+def _seed_backups(db_path: Path, n: int) -> list:
+    out = []
+    for i in range(n):
+        b = db_path.with_name(f"{db_path.name}.malformed-backup-2026010{i}_000000")
+        b.write_bytes(b"x" * 64)
+        out.append(b)
+        _time.sleep(0.02)  # distinct mtimes so "newest" is well-defined
+    return out
+
+
+def test_prune_keeps_only_newest_n(tmp_path):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"db")
+    _seed_backups(db_path, 5)
+
+    removed = _prune_malformed_backups(db_path, keep=2)
+
+    remaining = _malformed_backup_paths(db_path)
+    assert len(remaining) == 2
+    assert len(removed) == 3
+    # The survivors are the newest two, not an arbitrary pair.
+    assert remaining[0].stat().st_mtime >= remaining[1].stat().st_mtime
+
+
+def test_backup_db_file_enforces_retention(tmp_path):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"db-bytes")
+    _seed_backups(db_path, 5)
+
+    out = _backup_db_file(db_path)
+
+    assert out is not None
+    assert Path(out).exists()
+    assert len(_malformed_backup_paths(db_path)) <= hermes_state._MALFORMED_BACKUP_RETENTION
+
+
+def test_backup_db_file_skips_when_no_free_space(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"x" * (8 * 1024 * 1024))
+    # Report a filesystem with 1 byte free.
+    monkeypatch.setattr(
+        hermes_state.os, "statvfs",
+        lambda _p: type("VFS", (), {"f_bavail": 1, "f_frsize": 1})(),
+    )
+
+    assert _backup_db_file(db_path) is None
+    # No copy was taken, so nothing new to prune.
+    assert _malformed_backup_paths(db_path) == []
+
 
 

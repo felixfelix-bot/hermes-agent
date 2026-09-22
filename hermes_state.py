@@ -1459,6 +1459,60 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
+_MALFORMED_BACKUP_RETENTION = 2
+
+# Refuse a raw backup when free space can't hold the copy plus a safety margin.
+# Without this a repeatedly-opened malformed DB multiplies ~GB copies across a
+# full disk: on 2026-09-22 a manager state.db loop wrote 24 copies / 17.6 GB in
+# ~3 h while the root filesystem was already at 100%, starving SQLite writes.
+_MALFORMED_BACKUP_MIN_FREE_BYTES = 256 * 1024 * 1024
+
+
+def _malformed_backup_paths(db_path: Path) -> List[Path]:
+    """Timestamped raw backups of *db_path*, newest first (no WAL/SHM sidecars)."""
+    paths = [
+        p for p in db_path.parent.glob(f"{db_path.name}.malformed-backup-*")
+        if not p.name.endswith(("-wal", "-shm"))
+    ]
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return paths
+
+
+def _prune_malformed_backups(db_path: Path,
+                             keep: int = _MALFORMED_BACKUP_RETENTION) -> List[str]:
+    """Delete old ``.malformed-backup-*`` copies beyond *keep* (newest kept).
+
+    Bounds the population so a repeated malformed-open loop can never
+    accumulate unbounded ~GB copies. Each kept copy's ``-wal`` / ``-shm``
+    sidecars go with it. Returns the removed file names.
+    """
+    removed: List[str] = []
+    for old in _malformed_backup_paths(db_path)[max(0, keep):]:
+        for suffix in ("", "-wal", "-shm"):
+            sidecar = old.with_name(old.name + suffix)
+            try:
+                if sidecar.exists():
+                    sidecar.unlink()
+                    removed.append(sidecar.name)
+            except OSError:
+                pass
+    return removed
+
+
+def _backup_has_room(db_path: Path) -> bool:
+    """True when the filesystem can hold another copy of *db_path* safely."""
+    try:
+        st = os.statvfs(str(db_path.parent))
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        return True  # can't tell; don't block a forensic backup
+    try:
+        size = db_path.stat().st_size
+    except OSError:
+        size = 0
+    return free >= size + _MALFORMED_BACKUP_MIN_FREE_BYTES
+
+
 def _backup_db_file(db_path: Path) -> Optional[Path]:
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
 
@@ -1471,6 +1525,11 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     connection's POSIX advisory locks (see ``hermes_cli.sqlite_safe_read``).
     The repair path can be entered by one SessionDB while the gateway holds
     others, so this is a real possibility rather than a theoretical one.
+
+    Retention is capped at ``_MALFORMED_BACKUP_RETENTION`` and the copy is
+    skipped when the disk lacks room for it, so a repeated-open loop cannot
+    fill the filesystem (see the module comment on
+    ``_MALFORMED_BACKUP_MIN_FREE_BYTES``).
     """
     import datetime
     import shutil
@@ -1489,6 +1548,17 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         )
         return None
 
+    # Make room for the copy we're about to take (keep-1), then refuse if the
+    # disk still can't hold it.
+    _prune_malformed_backups(db_path, keep=max(0, _MALFORMED_BACKUP_RETENTION - 1))
+    if not _backup_has_room(db_path):
+        logger.error(
+            "Refusing to back up malformed DB %s: not enough free space for "
+            "another copy (retention=%d). Free space before retrying.",
+            db_path, _MALFORMED_BACKUP_RETENTION,
+        )
+        return None
+
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     try:
@@ -1497,6 +1567,8 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
                 shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+        # Enforce the cap after the copy too, in case it created an extra.
+        _prune_malformed_backups(db_path)
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
