@@ -319,8 +319,13 @@ class TestDefaultContextLengths:
         expected_keys = {
             "deepseek-v4-pro": 1_000_000,
             "deepseek-v4-flash": 1_000_000,
+            "deepseek-v4.1-flash": 1_000_000,
+            "deepseek-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
+            # Catch-all: any unknown/legacy ``deepseek`` alias must also be
+            # 1M so a provider-prefixed id cannot silently reset to 128K.
+            "deepseek": 1_000_000,
         }
         for key, value in expected_keys.items():
             assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
@@ -338,16 +343,31 @@ class TestDefaultContextLengths:
             cases = [
                 ("deepseek-v4-pro", 1_000_000),
                 ("deepseek-v4-flash", 1_000_000),
+                ("deepseek-v4.1-flash", 1_000_000),
+                ("deepseek-flash", 1_000_000),
                 ("deepseek/deepseek-v4-pro", 1_000_000),
                 ("deepseek/deepseek-v4-flash", 1_000_000),
+                ("deepseek/deepseek-v4.1-flash", 1_000_000),
+                ("deepseek/deepseek-flash", 1_000_000),
                 ("deepseek-chat", 1_000_000),
                 ("deepseek-reasoner", 1_000_000),
+                # Unknown deepseek ids hit the (now 1M) family catch-all.
+                ("deepseek/legacy-unknown", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
                 actual = get_model_context_length(model_id)
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
+
+    def test_deepseek_flash_alias_respects_explicit_config_override(self):
+        """The 1M config override (model.context_length) must still win over
+        the static table for the fleet's ``deepseek-flash`` alias."""
+        from agent.model_metadata import get_model_context_length
+
+        assert get_model_context_length(
+            "deepseek/deepseek-flash", config_context_length=1_048_576,
+        ) == 1_048_576
 
 
 

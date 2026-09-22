@@ -454,15 +454,20 @@ DEFAULT_CONTEXT_LENGTHS = {
     # DeepSeek — V4 family ships with a 1M context window. The legacy
     # aliases ``deepseek-chat`` / ``deepseek-reasoner`` are server-side
     # mapped to the non-thinking / thinking modes of ``deepseek-v4-flash``
-    # and inherit the same 1M window. The ``deepseek`` substring entry
-    # below remains as a 128K fallback for older / unknown DeepSeek model
-    # ids (e.g. via custom endpoints).
+    # and inherit the same 1M window. The bare ``deepseek-flash`` /
+    # ``deepseek-v4.1-flash`` fleet aliases and the generic ``deepseek``
+    # substring entry are 1M too, so no alias path (custom endpoint, usage-DB
+    # detection, provider-prefixed id) can resolve down to the legacy 128K
+    # window and silently reset compression (the 1M ``model.context_length``
+    # is only honored when a caller passes it as the explicit override).
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+    "deepseek-v4.1-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
+    "deepseek-flash": 1_000_000,
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,
-    "deepseek": 128000,
+    "deepseek": 1_000_000,
     # Meta
     "llama": 131072,
     # Qwen — specific model families before the catch-all.
