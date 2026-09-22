@@ -71,6 +71,120 @@ def _reclaim_backoff_seconds(strikes: int) -> int:
                RECLAIM_BACKOFF_MAX_S)
 
 
+def _strike_dead_pid_workers(kb, boards, *, pid_alive=None, now_fn=None,
+                             grace_seconds=None) -> list[str]:
+    """Strike dead-pid workers: backoff-block them, hard-block after N strikes.
+
+    Runs on **every** dispatcher tick, deliberately *outside* the
+    ``running >= target`` deadlock guard. The pass originally lived inside that
+    guard (commit ``10bbb0a8d8``), which left the breaker inert exactly when it
+    was needed: with the fleet below its capacity target the guard never opened,
+    so dead workers fell through to the per-board ``dispatch_once`` ->
+    ``detect_crashed_workers`` path, which re-readies the card as ``crashed``
+    and (by design) clears ``consecutive_failures``. A card whose worker dies
+    immediately was therefore re-spawned every tick forever and never accrued a
+    single strike — and because the failure counter stayed clean, no other
+    breaker saw it either (``fleet_loop_guard`` reported "no looping cards"
+    while the digest showed the card burning worker slots).
+
+    Two guards, both mirroring ``kanban_db.detect_crashed_workers``, keep the
+    now-per-tick pass from striking *healthy* workers:
+
+    * **host-local claims only** — ``worker_pid`` from another host's claim is
+      meaningless here, because ``_pid_alive`` is a local probe;
+    * **launch-window grace** — ``/proc`` visibility can transiently report a
+      freshly forked worker as dead. Measured from ``tasks.started_at`` (the
+      first time the task ever started), exactly as
+      ``detect_crashed_workers`` does; measuring from the *current run* would
+      reset the grace on every re-spawn and neuter the breaker for the
+      fast-crash loop it exists to stop.
+
+    Returns the ids it acted on (struck or hard-blocked). Fail-open per board:
+    a board that raises is skipped, never fatal to the tick.
+    """
+    acted: list[str] = []
+    if not boards:
+        return acted
+    alive_fn = pid_alive or getattr(kb, "_pid_alive", None)
+    if alive_fn is None:
+        return acted
+    if now_fn is None:
+        now_fn = time.time
+    if grace_seconds is None:
+        resolve_grace = getattr(kb, "_resolve_crash_grace_seconds", None)
+        try:
+            grace_seconds = (
+                int(resolve_grace()) if resolve_grace is not None
+                else int(getattr(kb, "DEFAULT_CRASH_GRACE_SECONDS", 30))
+            )
+        except Exception:
+            grace_seconds = 30
+    try:
+        host_prefix = f"{kb._claimer_id().split(':', 1)[0]}:"
+    except Exception:
+        host_prefix = ""
+    now = now_fn()
+    ledger = _load_reclaim_backoff()
+    dirty = False
+    for board in boards:
+        slug = (board or {}).get("slug") or kb.DEFAULT_BOARD
+        conn = None
+        try:
+            conn = kb.connect(board=slug)
+            rows = conn.execute(
+                "SELECT id, worker_pid, claim_lock, started_at "
+                "FROM tasks WHERE status='running'"
+            ).fetchall()
+            for row in rows:
+                tid, wpid = row[0], row[1]
+                lock = row[2] or ""
+                started = row[3]
+                if not wpid:
+                    continue
+                if host_prefix and not lock.startswith(host_prefix):
+                    continue
+                if (started is not None and grace_seconds > 0
+                        and now - int(started) < grace_seconds):
+                    continue
+                if alive_fn(wpid):
+                    continue
+                entry = ledger.get(tid) or {}
+                strikes = int(entry.get("count", 0)) + 1
+                if strikes >= RECLAIM_BLOCK_AFTER:
+                    kb.block_task(
+                        conn, tid,
+                        reason=(f"reclaim loop: worker died {strikes}x "
+                                f"(dispatcher guard) — auto-blocked; "
+                                f"needs human"),
+                    )
+                    ledger.pop(tid, None)
+                    logger.warning(
+                        "kanban reclaim-loop breaker: hard-blocked %s "
+                        "(worker died %dx)", tid, strikes)
+                else:
+                    until = now + _reclaim_backoff_seconds(strikes)
+                    kb.block_task(
+                        conn, tid,
+                        reason=(f"reclaim backoff until {int(until)} "
+                                f"(dead worker pid, strike {strikes})"),
+                    )
+                    ledger[tid] = {"count": strikes, "until": until,
+                                   "board": slug}
+                acted.append(tid)
+                dirty = True
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    if dirty:
+        _save_reclaim_backoff(ledger)
+    return acted
+
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -1630,6 +1744,15 @@ class GatewayKanbanWatchersMixin:
                                 _uc.close()
                             except Exception:
                                 pass
+            # Dead-pid reclaim-loop breaker: strike/backoff/hard-block every
+            # `running` task whose worker pid is dead. Runs on EVERY tick,
+            # deliberately OUTSIDE the fleet-cap guard below. Inside it the
+            # breaker was inert whenever the fleet sat below `target`: the
+            # guard never opened, the reclaim went through `dispatch_once` ->
+            # `detect_crashed_workers` instead, which re-readies the card as
+            # `crashed` while clearing `consecutive_failures` — an unbounded
+            # spawn/die loop in which this counter never incremented once.
+            _strike_dead_pid_workers(_kb, boards)
             # Deadlock guard (operator 2026-09-11): reclaim stale `running`
             # claims across ALL boards *before* the fleet-cap check. Normally
             # reclaim runs inside `dispatch_once`, but the cap check below
@@ -1645,49 +1768,6 @@ class GatewayKanbanWatchersMixin:
                     try:
                         _rc = _kb.connect(board=_slug)
                         _kb.release_stale_claims(_rc)
-                        # Also reclaim claims whose worker pid is already dead
-                        # but whose TTL hasn't expired yet (e.g. workers
-                        # orphaned by a gateway restart). Otherwise they pin
-                        # the fleet cap for a full TTL and stall dispatch.
-                        _bf = _load_reclaim_backoff()
-                        for _tid, _wp in _rc.execute(
-                            "SELECT id, worker_pid FROM tasks "
-                            "WHERE status='running'"
-                        ).fetchall():
-                            try:
-                                if not _wp or _kb._pid_alive(_wp):
-                                    continue
-                                _entry = _bf.get(_tid) or {}
-                                _strikes = int(_entry.get("count", 0)) + 1
-                                if _strikes >= RECLAIM_BLOCK_AFTER:
-                                    _kb.block_task(
-                                        _rc, _tid,
-                                        reason=(f"reclaim loop: worker died "
-                                                f"{_strikes}x (dispatcher "
-                                                f"guard) — auto-blocked; "
-                                                f"needs human"),
-                                    )
-                                    _bf.pop(_tid, None)
-                                    logger.warning(
-                                        "kanban reclaim-loop breaker: "
-                                        "hard-blocked %s (worker died %dx)",
-                                        _tid, _strikes)
-                                else:
-                                    _bk_until = time.time() + \
-                                        _reclaim_backoff_seconds(_strikes)
-                                    _kb.block_task(
-                                        _rc, _tid,
-                                        reason=(f"reclaim backoff until "
-                                                f"{int(_bk_until)} (dead "
-                                                f"worker pid, strike "
-                                                f"{_strikes})"),
-                                    )
-                                    _bf[_tid] = {"count": _strikes,
-                                                 "until": _bk_until,
-                                                 "board": _slug}
-                            except Exception:
-                                continue
-                        _save_reclaim_backoff(_bf)
                     except Exception:
                         continue
                     finally:
