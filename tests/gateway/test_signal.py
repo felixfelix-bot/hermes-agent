@@ -779,7 +779,9 @@ class TestSignalSendResultValidation:
         result = await adapter.send(chat_id="group:abc123", content="brief")
 
         assert result.success is False
-        assert result.error == "IDENTITY_FAILURE"
+        # Order-independent on purpose: which failure is reported first follows
+        # signal-cli's member ordering, not any contract we own.
+        assert result.error in {"IDENTITY_FAILURE", "NETWORK_FAILURE"}
 
     @pytest.mark.asyncio
     async def test_dm_send_single_recipient_failure_still_fails(self, monkeypatch):
@@ -802,6 +804,30 @@ class TestSignalSendResultValidation:
 
         assert result.success is False
         assert result.error == "IDENTITY_FAILURE"
+
+    @pytest.mark.asyncio
+    async def test_response_without_results_is_delivered_and_logged(
+        self, monkeypatch, caplog
+    ):
+        """A response with no ``results`` list is the plain accepted-send shape:
+        there is no per-recipient evidence, so it stays DELIVERED.
+
+        This is a deliberate, load-bearing bias, not an oversight: calling it a
+        failure would make the cron scheduler resend a message that went out
+        (the duplicate this fix removes), and the RPC already returned without a
+        JSON-RPC error.  The DEBUG log keeps the unconfirmable shape visible
+        when someone diagnoses a delivery question.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({"timestamp": 1712345678000})
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("DEBUG"):
+            result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is True
+        assert "no per-recipient results" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -1046,11 +1046,34 @@ class SignalAdapter(BasePlatformAdapter):
         So: at least one SUCCESS ⇒ delivered (unreachable recipients are logged
         for the operator, not turned into a delivery failure); zero SUCCESS ⇒
         real failure, which callers may still retry or report.
+
+        This is the ONE place signal-cli's per-recipient verdicts are turned
+        into a delivery decision: every ``send``-family call site routes through
+        it — ``send()`` (text), ``send_multiple_images()`` (attachment batches),
+        ``send_image()`` / ``send_document()`` and ``send_voice()`` /
+        ``send_video()``.  Fixing the verdict here fixes all of them at once;
+        the other ``results`` readers in this package
+        (``signal_rate_limit.py``, ``_rpc(raise_on_rate_limit=True)``) only look
+        for ``RATE_LIMIT_FAILURE`` and never decide delivered-vs-failed.
+
+        A response WITHOUT a ``results`` list (the shape signal-cli returns for
+        a plain accepted send) carries no per-recipient evidence at all.  It is
+        treated as delivered, deliberately: a non-None result means the RPC
+        returned without a JSON-RPC error, and "no evidence of failure" must not
+        become "failed" here — the caller's fallback would resend a message that
+        went out, which is the very duplicate this function was fixed for.
+        Logged at DEBUG so the unconfirmable shape stays diagnosable.
         """
         if not result or not isinstance(result, dict):
             return True, None
 
         results = result.get("results")
+        if not isinstance(results, list):
+            logger.debug(
+                "Signal: send response carries no per-recipient results (%s) — "
+                "no failure evidence, treating as delivered",
+                sorted(result.keys()),
+            )
         if isinstance(results, list):
             failures: list[str] = []
             successes = 0
