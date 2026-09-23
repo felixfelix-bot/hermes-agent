@@ -1027,23 +1027,58 @@ class SignalAdapter(BasePlatformAdapter):
         """Validate signal-cli send response results.
 
         Returns (success, error_message).
+
+        signal-cli reports ONE entry per recipient, so a group send yields one
+        entry per member.  A failure for a single member — typically
+        ``IDENTITY_FAILURE``, an untrusted/stale safety number that only the
+        operator can clear — does NOT mean the send failed: every other member
+        already received the message.
+
+        Classifying such a partial send as a total failure is what produced the
+        cron duplicate-delivery bug: the scheduler saw "failed" for a delivery
+        that HAD happened, fell through to its standalone fallback
+        (``live adapter delivery to signal:group:… failed: IDENTITY_FAILURE,
+        falling back to standalone``), and the operator received two copies of
+        every brief.  The fallback could never have helped anyway — a resend
+        through the same account hits the same per-recipient verdict, while
+        duplicating the members that already got it.
+
+        So: at least one SUCCESS ⇒ delivered (unreachable recipients are logged
+        for the operator, not turned into a delivery failure); zero SUCCESS ⇒
+        real failure, which callers may still retry or report.
         """
         if not result or not isinstance(result, dict):
             return True, None
 
         results = result.get("results")
         if isinstance(results, list):
+            failures: list[str] = []
+            successes = 0
             for r in results:
                 if not isinstance(r, dict):
                     continue
                 rtype = r.get("type")
                 if rtype and rtype != "SUCCESS":
-                    return False, str(rtype)
+                    failures.append(str(rtype))
+                    continue
                 if "success" in r and not r.get("success"):
                     fail = r.get("failure")
-                    if fail:
-                        return False, str(fail)
-                    return False, "Recipient delivery failed"
+                    failures.append(str(fail) if fail else "Recipient delivery failed")
+                    continue
+                successes += 1
+            if failures and not successes:
+                # Nothing reached anyone — a genuine failure.
+                return False, failures[0]
+            if failures:
+                logger.warning(
+                    "Signal: partial send — %d of %d recipient(s) did not "
+                    "receive the message (%s); treating the send as delivered "
+                    "because a resend would duplicate it for the recipients "
+                    "that did",
+                    len(failures),
+                    len(failures) + successes,
+                    ", ".join(sorted(set(failures))),
+                )
         return True, None
 
     # ------------------------------------------------------------------

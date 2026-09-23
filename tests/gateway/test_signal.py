@@ -709,6 +709,100 @@ class TestSignalSendResultValidation:
         assert result.success is False
         assert result.error == "Some connection error"
 
+    @pytest.mark.asyncio
+    async def test_group_send_partial_recipient_failure_is_delivered(
+        self, monkeypatch, caplog
+    ):
+        """A group send that reached SOME members is a DELIVERY, not a failure.
+
+        signal-cli returns one result entry per group member.  The group here
+        has two members: one SUCCESS, one IDENTITY_FAILURE (an untrusted /
+        re-registered safety number for that member only).
+
+        Regression for the cron double-delivery bug: classifying this as a
+        failed send made the cron scheduler believe nothing had been delivered,
+        so it re-sent the same brief through the standalone path and the
+        operator received TWO copies — even though the live send had in fact
+        reached the group.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "SUCCESS",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is True, (
+            "a group send that reached at least one member must not be reported "
+            "as a total failure — that is what triggered the duplicate resend"
+        )
+        assert result.error is None
+        # The member that could not be reached must still be visible to the
+        # operator: the fix hides the failure from the delivery decision, not
+        # from the logs.
+        assert "IDENTITY_FAILURE" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_group_send_all_recipients_failed_still_fails(self, monkeypatch):
+        """Nothing reached anyone → still a real failure, so the caller keeps
+        its retry/deliver-or-error behaviour (never silently drop a brief)."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "NETWORK_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is False
+        assert result.error == "IDENTITY_FAILURE"
+
+    @pytest.mark.asyncio
+    async def test_dm_send_single_recipient_failure_still_fails(self, monkeypatch):
+        """One recipient, one failure → total failure (no partial success to
+        report, no duplicate risk either way)."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is False
+        assert result.error == "IDENTITY_FAILURE"
+
 
 # ---------------------------------------------------------------------------
 # stop_typing() delegates to _stop_typing_indicator (#4647)
