@@ -129,6 +129,21 @@ class CronScheduler(ABC):
         return None
 
 
+def active_provider_name() -> str:
+    """Best-effort name of the resolved cron provider ('builtin', 'chronos', …).
+
+    Mirrors the CLI's ``_active_cron_provider_name`` semantics: any failure
+    returns 'builtin' so callers fall back to ticker-based heuristics.
+    Offline by contract (``is_available()`` forbids network). Lets tool-side
+    consumers skip ticker-heartbeat checks for external providers, which fire
+    via webhook and intentionally never write a heartbeat.
+    """
+    try:
+        return resolve_cron_scheduler().name or "builtin"
+    except Exception:
+        return "builtin"
+
+
 def resolve_cron_scheduler() -> "CronScheduler":
     """Return the active cron scheduler provider.
 

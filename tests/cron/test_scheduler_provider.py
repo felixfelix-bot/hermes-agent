@@ -414,3 +414,26 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+
+
+def test_active_provider_name_defaults_to_builtin_on_failure(monkeypatch):
+    """`active_provider_name` is a best-effort probe used by tool-side
+    consumers to decide whether ticker-heartbeat heuristics apply; any
+    resolution failure must answer 'builtin' (fall back to the ticker
+    contract), never raise into the caller."""
+    import cron.scheduler_provider as sp
+
+    def _boom():
+        raise RuntimeError("provider resolution exploded")
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", _boom)
+    assert sp.active_provider_name() == "builtin"
+
+
+def test_active_provider_name_resolves_real_default(monkeypatch):
+    """Sanity: with the default (empty) provider config the resolved name is
+    the built-in's, and the helper reports it unchanged."""
+    import cron.scheduler_provider as sp
+
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: sp.InProcessCronScheduler())
+    assert sp.active_provider_name() == "builtin"
