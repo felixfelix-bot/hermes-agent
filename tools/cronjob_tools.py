@@ -376,6 +376,74 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     )
 
 
+def _ticker_liveness_fields() -> Optional[Dict[str, Any]]:
+    """Ticker-liveness fields for a create result; ``warning`` only when dead.
+
+    Cron is per-profile by design (#4707): the ticker runs inside a gateway
+    scoped to one home. When this agent's HERMES_HOME is a profile no gateway
+    services — a dispatched worker on a single-gateway host is the filed case
+    — ``create`` still persists the job, but nothing will ever fire it:
+    ``next_run_at`` freezes at creation and ``last_run_at`` stays null while
+    the tool answers a plain "Cron job 'x' created." (11-day-old dead letter
+    found in the field with nobody noticing).
+
+    Detection is the STORE-SCOPED ticker heartbeat (``get_ticker_liveness``),
+    never gateway pids: a gateway running for a DIFFERENT home is exactly the
+    false-negative this catches. External providers (chronos &c.) fire via
+    webhook with no in-process ticker and intentionally never write a
+    heartbeat, so they are exempt — as is an indeterminate provider probe
+    (``None``): no proof of the builtin means no basis for a heartbeat
+    verdict, and a false DEAD LETTER is worse than silence.
+
+    Returns ``None`` when an external provider owns firing, the provider probe
+    is indeterminate, or the probe itself fails (advisory only — never breaks
+    create). Otherwise ``{"ticker_liveness": "live", "heartbeat_age_seconds":
+    …}`` for a live store, a QUIET ``{"ticker_liveness": "unknown",
+    "heartbeat_age_seconds": None}`` when the heartbeat exists but can't be
+    read (torn write — cannot determine is not dead), and a loud ``warning``
+    when the store is ``never``/``stale``.
+    """
+    try:
+        from cron.scheduler_provider import active_provider_name
+
+        provider = active_provider_name()
+        if provider != "builtin":
+            return None  # webhook-fired or indeterminate: no heartbeat verdict
+
+        from cron.jobs import get_ticker_liveness
+
+        liveness = get_ticker_liveness()
+    except Exception:
+        return None
+
+    status = liveness.get("status")
+    age = liveness.get("heartbeat_age")
+    if status in ("live", "unknown"):
+        # unknown = heartbeat present but unreadable (torn write): the store
+        # may well be ticked — report the status, stay quiet.
+        return {"ticker_liveness": status, "heartbeat_age_seconds": age}
+
+    if status == "never":
+        detail = "no ticker has ever touched this store"
+    else:
+        detail = (
+            f"no ticker heartbeat for {int(age or 0)}s "
+            f"(staleness threshold: {int(liveness.get('stale_after') or 0)}s)"
+        )
+    return {
+        "ticker_liveness": status,
+        "heartbeat_age_seconds": age,
+        "warning": (
+            f"DEAD LETTER — this cron store is not being ticked: {detail}. "
+            "The job was saved, but it will not fire until a gateway cron "
+            "ticker services this home. Fix: run a gateway scoped to this "
+            "HERMES_HOME (or enable gateway.multiplex_profiles for it), or "
+            "register the job in the ticked store instead. Verify with: "
+            "hermes cron status."
+        ),
+    }
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -1148,22 +1216,30 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
-            return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
-                indent=2,
-            )
+            _result_payload = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "message": _create_message,
+            }
+            # Dead-letter guard: if nothing ticks this store, say so NOW —
+            # a "created ✓" answer for a job that can never fire is the
+            # silent-failure trap (see _ticker_liveness_fields).
+            _liveness = _ticker_liveness_fields()
+            if _liveness:
+                _result_payload.update(_liveness)
+                if _liveness.get("warning"):
+                    _result_payload["message"] = (
+                        f"{_create_message}\n⚠ {_liveness['warning']}"
+                    )
+            return json.dumps(_result_payload, indent=2)
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
