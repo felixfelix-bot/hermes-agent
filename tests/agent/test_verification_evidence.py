@@ -210,3 +210,39 @@ def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):
     assert result is not None, (
         "Windows backslash path should be matched via posix=False fallback"
     )
+
+
+def test_verification_event_records_active_model(tmp_path, monkeypatch):
+    """T2: each verification event carries the active model (per-model rates)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "kimi-k2.7-code")
+    _node_project(tmp_path)
+    record_terminal_result(
+        command="pnpm test", cwd=tmp_path, session_id="s1",
+        exit_code=0, output="ok",
+    )
+    with sqlite3.connect(tmp_path / ".hermes" / "verification_evidence.db") as conn:
+        rows = conn.execute("SELECT model FROM verification_events").fetchall()
+    assert rows and rows[0][0] == "kimi-k2.7-code"
+
+
+def test_schema_migration_adds_model_column(tmp_path, monkeypatch):
+    """T2: an existing (pre-model) DB gains the column on connect."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    db = home / "verification_evidence.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE verification_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " created_at TEXT NOT NULL, session_id TEXT NOT NULL, cwd TEXT NOT NULL,"
+            " root TEXT NOT NULL, command TEXT NOT NULL, canonical_command TEXT NOT NULL,"
+            " kind TEXT NOT NULL, scope TEXT NOT NULL, status TEXT NOT NULL,"
+            " exit_code INTEGER NOT NULL, output_summary TEXT NOT NULL)")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from agent.verification_evidence import _connect
+    conn = _connect()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(verification_events)")}
+    finally:
+        conn.close()
+    assert "model" in cols
