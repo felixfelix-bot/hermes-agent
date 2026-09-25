@@ -100,6 +100,40 @@ def test_external_provider_never_warns(monkeypatch):
     assert "ticker_liveness" not in created
 
 
+def test_torn_heartbeat_is_quiet_unknown(tmp_path):
+    """A present-but-unreadable heartbeat (torn write) is `unknown`, and
+    unknown is QUIET: the store may well be ticked, so no DEAD LETTER
+    warning — only the structured status field, and create still succeeds."""
+    hb = tmp_path / "cron" / "ticker_heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("garbage-torn-write", encoding="utf-8")
+    created = json.loads(
+        cronjob(action="create", prompt="Check", schedule="every 1h")
+    )
+    assert created["success"] is True
+    assert created["ticker_liveness"] == "unknown"
+    assert not created.get("warning")
+    assert "⚠" not in created["message"]
+
+
+def test_indeterminate_provider_is_quiet(monkeypatch):
+    """If the provider probe is indeterminate (active_provider_name → None),
+    the firing mechanism is unknown — heartbeat heuristics don't apply and
+    the create result carries no liveness fields at all (advisory probe,
+    never a false alarm and never a create failure). The probe is patched
+    directly: a resolve_cron_scheduler that RAISES also fails create's
+    provider registration, which is separate, pre-existing behavior."""
+    import cron.scheduler_provider as sp
+
+    monkeypatch.setattr(sp, "active_provider_name", lambda: None)
+    created = json.loads(
+        cronjob(action="create", prompt="Check", schedule="every 1h")
+    )
+    assert created["success"] is True
+    assert not created.get("warning")
+    assert "ticker_liveness" not in created
+
+
 def test_liveness_probe_failure_still_creates(monkeypatch):
     """The probe is advisory: a broken heartbeat read must never break create."""
     import cron.jobs as jobs_mod

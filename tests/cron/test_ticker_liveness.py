@@ -83,3 +83,61 @@ def test_scoped_to_active_profile_store(hermes_env, tmp_path):
     with use_cron_store(other):
         assert get_ticker_liveness()["status"] == "live"
     assert get_ticker_liveness()["status"] == "never"
+
+
+# ── unknown: present-but-unreadable heartbeat is NOT "never" ──────────────────
+# The reader's contract (get_ticker_heartbeat_age) says None = "cannot
+# determine" (missing, torn read, I/O error) — callers must not read it as
+# "dead". Liveness keeps that distinction: only a PROVABLY ABSENT file is
+# `never`; a file we failed to read is `unknown` and must stay quiet.
+
+
+def test_torn_heartbeat_is_unknown_not_never(hermes_env):
+    """A heartbeat file whose content can't be parsed (torn/partial write)
+    reports `unknown`, never a loud `never` — a store that IS being ticked
+    must not be told its jobs are dead letters."""
+    from cron.jobs import get_ticker_liveness
+
+    (hermes_env / "cron" / "ticker_heartbeat").write_text(
+        "not-an-epoch-at-all", encoding="utf-8"
+    )
+    v = get_ticker_liveness()
+    assert v["status"] == "unknown"
+    assert v["heartbeat_age"] is None
+
+
+def test_empty_heartbeat_is_unknown(hermes_env):
+    from cron.jobs import get_ticker_liveness
+
+    (hermes_env / "cron" / "ticker_heartbeat").write_text("", encoding="utf-8")
+    assert get_ticker_liveness()["status"] == "unknown"
+
+
+def test_unknown_is_distinct_from_missing(hermes_env):
+    """Same probe, two stores: absent file → `never`; present-but-torn →
+    `unknown`. The distinction is the whole point of the status."""
+    from cron.jobs import get_ticker_liveness, use_cron_store
+
+    torn = hermes_env / "torn-home"
+    (torn / "cron").mkdir(parents=True)
+    (torn / "cron" / "ticker_heartbeat").write_text("garbage", encoding="utf-8")
+
+    assert get_ticker_liveness()["status"] == "never"
+    with use_cron_store(torn):
+        assert get_ticker_liveness()["status"] == "unknown"
+
+
+def test_default_threshold_is_the_shared_constant(hermes_env):
+    """The staleness threshold is ONE constant shared with `hermes cron
+    status` — the tool and the CLI must never disagree about the same
+    store (a duplicated literal could drift)."""
+    import cron.jobs as jobs_mod
+
+    assert jobs_mod.TICKER_STALE_AFTER_SECONDS == 60 * 3 + 20
+    from cron.jobs import get_ticker_liveness
+
+    assert get_ticker_liveness()["stale_after"] == jobs_mod.TICKER_STALE_AFTER_SECONDS
+
+    import hermes_cli.cron as cli_cron
+
+    assert cli_cron.TICKER_STALE_AFTER_SECONDS == jobs_mod.TICKER_STALE_AFTER_SECONDS

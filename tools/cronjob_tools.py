@@ -391,18 +391,24 @@ def _ticker_liveness_fields() -> Optional[Dict[str, Any]]:
     never gateway pids: a gateway running for a DIFFERENT home is exactly the
     false-negative this catches. External providers (chronos &c.) fire via
     webhook with no in-process ticker and intentionally never write a
-    heartbeat, so they are exempt.
+    heartbeat, so they are exempt — as is an indeterminate provider probe
+    (``None``): no proof of the builtin means no basis for a heartbeat
+    verdict, and a false DEAD LETTER is worse than silence.
 
-    Returns ``None`` when an external provider owns firing or the probe itself
-    fails (advisory only — never breaks create). Otherwise
-    ``{"ticker_liveness": "live", "heartbeat_age_seconds": …}`` for a live
-    store, plus a loud ``warning`` when the store is ``never``/``stale``.
+    Returns ``None`` when an external provider owns firing, the provider probe
+    is indeterminate, or the probe itself fails (advisory only — never breaks
+    create). Otherwise ``{"ticker_liveness": "live", "heartbeat_age_seconds":
+    …}`` for a live store, a QUIET ``{"ticker_liveness": "unknown",
+    "heartbeat_age_seconds": None}`` when the heartbeat exists but can't be
+    read (torn write — cannot determine is not dead), and a loud ``warning``
+    when the store is ``never``/``stale``.
     """
     try:
         from cron.scheduler_provider import active_provider_name
 
-        if active_provider_name() != "builtin":
-            return None  # webhook-fired provider; no heartbeat is expected
+        provider = active_provider_name()
+        if provider != "builtin":
+            return None  # webhook-fired or indeterminate: no heartbeat verdict
 
         from cron.jobs import get_ticker_liveness
 
@@ -412,15 +418,17 @@ def _ticker_liveness_fields() -> Optional[Dict[str, Any]]:
 
     status = liveness.get("status")
     age = liveness.get("heartbeat_age")
-    if status == "live":
-        return {"ticker_liveness": "live", "heartbeat_age_seconds": age}
+    if status in ("live", "unknown"):
+        # unknown = heartbeat present but unreadable (torn write): the store
+        # may well be ticked — report the status, stay quiet.
+        return {"ticker_liveness": status, "heartbeat_age_seconds": age}
 
     if status == "never":
         detail = "no ticker has ever touched this store"
     else:
         detail = (
             f"no ticker heartbeat for {int(age or 0)}s "
-            f"(staleness threshold: {int(liveness['stale_after'])}s)"
+            f"(staleness threshold: {int(liveness.get('stale_after') or 0)}s)"
         )
     return {
         "ticker_liveness": status,

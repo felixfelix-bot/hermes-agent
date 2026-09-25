@@ -4,15 +4,24 @@ Filed incident (t_7419f6af sibling hazard): comp-gov-1787437592 vanished from
 the default store ~2026-09-05; a role-46 comment claims "the gateway owns the
 in-memory job list and clobbers CLI-added crons". These tests pin the contract
 that a store mutation performed by the ticker path (advance_next_runs /
-mark_job_run inside tick(), or a direct mark_job_run call) must preserve a job
+mark_job_run inside tick(), or a direct stale-payload save) must preserve a job
 that a SEPARATE process (``hermes cron add`` / ensure_cron.py / hand edit)
 wrote into jobs.json between this process's load and save — the shrink-merge
 guard (#80624) extended to the tick path.
+
+NON-VACUITY: the external write must land AFTER the operation's own
+load_jobs() and BEFORE its save_jobs(). Writing it before the call would make
+survival trivial (the fresh load already sees it) — that shape passes even
+with the guard deleted. Each test below injects the sibling write mid-flight
+(inside the load→save window of the code under test) via a hook the real code
+calls between the two: mark_job_run touches ``_hermes_now`` after its load;
+advance_next_runs calls ``compute_next_run`` between its load and its save;
+the direct test performs the load→write→stale-save sequence explicitly.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
@@ -65,38 +74,90 @@ def _external_add(home, job_id, **fields):
     return job
 
 
-def test_mark_job_run_preserves_externally_added_job(hermes_env):
-    from cron.jobs import create_job, load_jobs, mark_job_run
+def _backdate(home, job_id):
+    """Make a job due NOW with a raw disk edit (same shape a CLI sibling
+    would use), so tick() dispatches it this pass."""
+    path = _jobs_file(home)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for job in data["jobs"]:
+        if job["id"] == job_id:
+            job["next_run_at"] = (hermes_now() - timedelta(minutes=1)).isoformat()
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def test_stale_payload_save_preserves_external_job(hermes_env):
+    """THE guard pin, stated directly: save_jobs() called with a list loaded
+    BEFORE a sibling's out-of-band write must not shrink the store. This is
+    exactly the degraded-writer shape #80624 guards (loaded older snapshot,
+    then saves and would otherwise clobber the concurrent create)."""
+    from cron.jobs import _jobs_lock, create_job, load_jobs, save_jobs
 
     agent = create_job(prompt="hello", schedule="every 5m", name="agent", deliver="local")
-    external = _external_add(hermes_env, "ext-11111")
 
-    mark_job_run(agent["id"], success=True)
+    with _jobs_lock():
+        stale = load_jobs()  # payload WITHOUT the sibling's job
+        assert all(j["id"] != "ext-direct" for j in stale)
+        _external_add(hermes_env, "ext-direct")  # sibling lands mid-section
+        save_jobs(stale)  # stale-payload write: the clobber attempt
+
+    stored = {j["id"] for j in load_jobs()}
+    assert "ext-direct" in stored, "stale-payload save clobbered the sibling's job"
+    assert agent["id"] in stored
+
+
+def test_mark_job_run_preserves_external_job_landed_mid_section(hermes_env, monkeypatch):
+    """mark_job_run() does load → mutate → save under one lock section. A
+    sibling write that lands between its load and its save must survive —
+    injected via ``_hermes_now``, which mark_job_run calls right after the
+    load, before the save."""
+    import cron.jobs as jobs_mod
+    from cron.jobs import create_job, load_jobs
+
+    agent = create_job(prompt="hello", schedule="every 5m", name="agent", deliver="local")
+
+    real_now = jobs_mod._hermes_now
+    fired: list[bool] = []
+
+    def now_with_sibling():
+        if not fired:
+            fired.append(True)
+            _external_add(hermes_env, "ext-midflight")
+        return real_now()
+
+    # Armed AFTER create_job so the hook's single shot fires inside
+    # mark_job_run's critical section, not during create.
+    monkeypatch.setattr(jobs_mod, "_hermes_now", now_with_sibling)
+    jobs_mod.mark_job_run(agent["id"], success=True)
+    assert fired, "hook never fired — test is vacuous"
 
     stored = {j["id"]: j for j in load_jobs()}
-    assert "ext-11111" in stored
-    assert stored["ext-11111"]["prompt"] == "external"
+    assert "ext-midflight" in stored, "mark_job_run clobbered the sibling's job"
     assert stored[agent["id"]]["last_status"] == "ok"
     assert stored[agent["id"]]["next_run_at"] != agent["next_run_at"]
 
 
-def test_tick_preserves_externally_added_job(hermes_env, monkeypatch):
+def test_tick_preserves_external_job_landed_during_advance(hermes_env, monkeypatch):
+    """tick()'s at-most-once advance (advance_next_runs) is a load → compute →
+    save batch. A sibling write landing inside that window (injected via
+    ``compute_next_run``, called between the load and the save) must survive
+    the tick's rewrite of jobs.json."""
+    import cron.jobs as jobs_mod
     from cron.jobs import create_job, load_jobs
     from cron.scheduler import tick
 
     agent = create_job(prompt="hello", schedule="every 5m", name="agent", deliver="local")
+    _backdate(hermes_env, agent["id"])
 
-    # Make the agent job due NOW and add the external job in the same
-    # out-of-band disk edit (a CLI sibling acting between our load and tick).
-    backdated = (hermes_now() - timedelta(minutes=1)).isoformat()
-    path = _jobs_file(hermes_env)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    for job in data["jobs"]:
-        if job["id"] == agent["id"]:
-            job["next_run_at"] = backdated
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    external = _external_add(hermes_env, "ext-22222")
+    real_cnr = jobs_mod.compute_next_run
+    fired: list[bool] = []
 
+    def cnr_with_sibling(schedule, now):
+        if not fired:
+            fired.append(True)
+            _external_add(hermes_env, "ext-tick")
+        return real_cnr(schedule, now)
+
+    monkeypatch.setattr(jobs_mod, "compute_next_run", cnr_with_sibling)
     # Execute nothing for real: the delivery/agent path is irrelevant to the
     # preservation contract under test.
     monkeypatch.setattr(
@@ -106,9 +167,12 @@ def test_tick_preserves_externally_added_job(hermes_env, monkeypatch):
     executed = tick(verbose=False, can_dispatch=lambda: True)
 
     assert executed >= 1
+    assert fired, "hook never fired — test is vacuous"
     stored = {j["id"]: j for j in load_jobs()}
-    assert "ext-22222" in stored
-    assert stored["ext-22222"]["prompt"] == "external"
+    assert "ext-tick" in stored, "tick clobbered the sibling's job"
+    assert stored["ext-tick"]["prompt"] == "external"
     # The due job was advanced past its backdated slot (at-most-once semantics).
+    from datetime import datetime
+
     advanced_to = datetime.fromisoformat(stored[agent["id"]]["next_run_at"])
     assert advanced_to > hermes_now() - timedelta(seconds=1)
