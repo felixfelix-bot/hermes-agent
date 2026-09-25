@@ -974,6 +974,39 @@ def get_ticker_success_age() -> Optional[float]:
     return _epoch_file_age(store.cron_dir / "ticker_last_success")
 
 
+def get_ticker_liveness(stale_after: Optional[float] = None) -> Dict[str, Any]:
+    """Assess whether the ACTIVE cron store is being ticked.
+
+    Returns ``{"status": "never"|"stale"|"live", "heartbeat_age": float|None,
+    "stale_after": float}``:
+
+    - ``never``  — no heartbeat file: nothing has EVER ticked this store
+      (a profile home no gateway services — the dead-letter shape).
+    - ``stale``  — heartbeat older than ``stale_after``: the ticker that once
+      served this store is gone or wedged.
+    - ``live``   — fresh heartbeat: a ticker owns this store.
+
+    ``stale_after`` defaults to the shared ``TICKER_INTERVAL_SECONDS * 3 + 20``
+    threshold used by ``hermes cron status`` so consumers of this helper and
+    the CLI status heuristic can never disagree about the same store.
+
+    Store-scoped by construction (``_current_cron_store``): a gateway running
+    for a DIFFERENT home leaves this store's verdict untouched — which is the
+    whole point, since "is any gateway process alive?" is exactly the check
+    that false-negatives on single-gateway hosts with profile-scoped agents.
+    """
+    if stale_after is None:
+        stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+    age = get_ticker_heartbeat_age()
+    if age is None:
+        status = "never"
+    elif age > stale_after:
+        status = "stale"
+    else:
+        status = "live"
+    return {"status": status, "heartbeat_age": age, "stale_after": stale_after}
+
+
 def record_catch_up_occurrence() -> None:
     """Increment the profile-local stale-schedule catch-up counter, best effort."""
     path = _current_cron_store().cron_dir / "catch_up_occurrences"
