@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 
 class CronScheduler(ABC):
@@ -129,11 +129,14 @@ class CronScheduler(ABC):
         return None
 
 
-def active_provider_name() -> str:
+def active_provider_name() -> Optional[str]:
     """Best-effort name of the resolved cron provider ('builtin', 'chronos', …).
 
-    Mirrors the CLI's ``_active_cron_provider_name`` semantics: any failure
-    returns 'builtin' so callers fall back to ticker-based heuristics.
+    Mirrors the CLI's ``_active_cron_provider_name`` semantics for the happy
+    path. A resolution FAILURE returns ``None`` — indeterminate, NOT
+    ``'builtin'``: claiming the built-in ticker would make tool-side
+    heartbeat heuristics apply to a store that may be webhook-fired (a false
+    DEAD-LETTER alarm). ``None`` means "cannot determine — stay quiet".
     Offline by contract (``is_available()`` forbids network). Lets tool-side
     consumers skip ticker-heartbeat checks for external providers, which fire
     via webhook and intentionally never write a heartbeat.
@@ -141,7 +144,7 @@ def active_provider_name() -> str:
     try:
         return resolve_cron_scheduler().name or "builtin"
     except Exception:
-        return "builtin"
+        return None
 
 
 def resolve_cron_scheduler() -> "CronScheduler":

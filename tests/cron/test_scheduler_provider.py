@@ -416,18 +416,20 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
 
 
 
-def test_active_provider_name_defaults_to_builtin_on_failure(monkeypatch):
+def test_active_provider_name_returns_none_on_failure(monkeypatch):
     """`active_provider_name` is a best-effort probe used by tool-side
-    consumers to decide whether ticker-heartbeat heuristics apply; any
-    resolution failure must answer 'builtin' (fall back to the ticker
-    contract), never raise into the caller."""
+    consumers to decide whether ticker-heartbeat heuristics apply. A
+    resolution FAILURE is indeterminate, not builtin: claiming the built-in
+    ticker would run heartbeat heuristics against a store that may be
+    webhook-fired and false-nag a DEAD LETTER. None = "cannot determine,
+    stay quiet"; it must never raise into the caller."""
     import cron.scheduler_provider as sp
 
     def _boom():
         raise RuntimeError("provider resolution exploded")
 
     monkeypatch.setattr(sp, "resolve_cron_scheduler", _boom)
-    assert sp.active_provider_name() == "builtin"
+    assert sp.active_provider_name() is None
 
 
 def test_active_provider_name_resolves_real_default(monkeypatch):

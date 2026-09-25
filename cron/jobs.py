@@ -97,6 +97,11 @@ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
 # drift apart.
 TICKER_INTERVAL_SECONDS = 60
+# Staleness threshold for the ticker heartbeat shared by `get_ticker_liveness`
+# (cronjob tool warning) and `hermes cron status` — ONE constant so the tool
+# and the CLI can never disagree about the same store. 3 missed iterations
+# plus slack, = 200s at the 60s default interval.
+TICKER_STALE_AFTER_SECONDS = TICKER_INTERVAL_SECONDS * 3 + 20
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -977,17 +982,24 @@ def get_ticker_success_age() -> Optional[float]:
 def get_ticker_liveness(stale_after: Optional[float] = None) -> Dict[str, Any]:
     """Assess whether the ACTIVE cron store is being ticked.
 
-    Returns ``{"status": "never"|"stale"|"live", "heartbeat_age": float|None,
-    "stale_after": float}``:
+    Returns ``{"status": "never"|"unknown"|"stale"|"live",
+    "heartbeat_age": float|None, "stale_after": float}``:
 
     - ``never``  — no heartbeat file: nothing has EVER ticked this store
       (a profile home no gateway services — the dead-letter shape).
+    - ``unknown`` — heartbeat file present but unreadable (torn/partial
+      write, I/O error): preserves ``get_ticker_heartbeat_age``'s contract
+      that an indeterminate read is NOT evidence of death. Callers must
+      stay quiet on unknown.
     - ``stale``  — heartbeat older than ``stale_after``: the ticker that once
       served this store is gone or wedged.
     - ``live``   — fresh heartbeat: a ticker owns this store.
 
-    ``stale_after`` defaults to the shared ``TICKER_INTERVAL_SECONDS * 3 + 20``
-    threshold used by ``hermes cron status`` so consumers of this helper and
+    Caveat: a heartbeat proves the ticker LOOP iterated, not that jobs
+    dispatched — a wedged-but-looping ticker still reports ``live``.
+
+    ``stale_after`` defaults to ``TICKER_STALE_AFTER_SECONDS`` — the same
+    constant ``hermes cron status`` uses, so consumers of this helper and
     the CLI status heuristic can never disagree about the same store.
 
     Store-scoped by construction (``_current_cron_store``): a gateway running
@@ -996,10 +1008,19 @@ def get_ticker_liveness(stale_after: Optional[float] = None) -> Dict[str, Any]:
     that false-negatives on single-gateway hosts with profile-scoped agents.
     """
     if stale_after is None:
-        stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+        stale_after = TICKER_STALE_AFTER_SECONDS
     age = get_ticker_heartbeat_age()
     if age is None:
-        status = "never"
+        # None conflates "missing" with "unreadable" (torn read); split them
+        # via stat so an existing-but-unparseable heartbeat is unknown, never
+        # a loud "never" (cannot-determine ≠ dead).
+        try:
+            heartbeat_exists = (
+                _current_cron_store().cron_dir / "ticker_heartbeat"
+            ).exists()
+        except Exception:
+            heartbeat_exists = False
+        status = "unknown" if heartbeat_exists else "never"
     elif age > stale_after:
         status = "stale"
     else:
