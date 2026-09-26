@@ -926,7 +926,12 @@ def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) 
 # profiles). New providers should set default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3.6-flash",
-    "zai": "glm-4.5-flash",
+    # zai: kept in lockstep with ZaiProfile.default_aux_model
+    # (plugins/model-providers/zai). The resolver above reads z.ai's live
+    # catalogue; this entry is what a caller falls back to when that lookup
+    # has no answer, so it must be a served id — the retired glm-4.5-flash
+    # that used to live here made every fall-through aux call a 404/503.
+    "zai": "glm-5.3-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",

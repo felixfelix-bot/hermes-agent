@@ -28,17 +28,30 @@ the effective endpoint is the loopback zai-proxy, the request gets an
 ``X-Hermes-Session: <session id>`` header so the proxy can stamp
 ``api_calls.session_id`` and token burn becomes attributable to a task/profile.
 Loopback-only — real Z.AI endpoints never receive the header.
+
+:meth:`ZaiProfile.resolve_aux_model` keeps the auxiliary ("cheap") tier on an
+id z.ai actually serves, by reading its live ``/models`` catalogue instead of
+trusting the hardcoded ``default_aux_model``, which rots (``glm-4.5-flash``
+was still pinned here long after z.ai retired it, so every aux task on this
+provider spent a round-trip on a 404/429 before the retry net caught it).
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
+import threading
+import time
+import urllib.request
 from typing import Any
 from urllib.parse import urlparse
 
 from providers import register_provider
-from providers.base import ProviderProfile
+from providers.base import ProviderProfile, _profile_user_agent
+
+logger = logging.getLogger(__name__)
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
 
@@ -81,6 +94,125 @@ def _endpoint_is_loopback(base_url: str | None) -> bool:
     except ValueError:
         return False
     return host in _LOOPBACK_HOSTS
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary ("cheap") model resolution.
+#
+# ``ProviderProfile.default_aux_model`` is a hardcoded id in source, so it rots:
+# z.ai retired ``glm-4.5-flash`` and this profile kept advertising it, so every
+# auxiliary task on this provider burned a round-trip on a model the catalogue
+# no longer lists (and, behind this fleet's relay, a request that carried zero
+# routable candidates). ``resolve_aux_model`` exists precisely so the cheap tier
+# tracks the provider's machine-readable recommendation instead of a constant a
+# human has to remember to bump — see ``providers/base.py`` for the contract.
+#
+# Cost model: the resolution runs on client-resolution paths, so the answer is
+# memoized per process (6h for an id, 5min for "no answer") and a failure is
+# never cached as an answer. The only network work is one authenticated
+# ``/models`` GET plus, per candidate, at most one 1-token probe.
+# ---------------------------------------------------------------------------
+_AUX_MODEL_CACHE_TTL_SECONDS = 6 * 3600.0   # catalogue drift is a release-timescale event
+_AUX_MODEL_MISS_TTL_SECONDS = 5 * 60.0      # no answer → retry soon, but don't hammer
+_AUX_MODEL_FETCH_TIMEOUT_SECONDS = 4.0
+_AUX_MODEL_PROBE_TIMEOUT_SECONDS = 6.0
+# How many candidates the 1-token probe may walk past. Bounded so a host whose
+# whole cheap tier is withdrawn pays two requests, not the catalogue's length.
+_AUX_MODEL_PROBE_LIMIT = 2
+
+# Non-chat siblings of a chat model satisfy a naive "flash" match the same way
+# they satisfy OpenRouter's family rungs: a provider names its speech, image,
+# embedding and rerank endpoints after the chat model they are paired with.
+_AUX_MODEL_EXCLUDE = (
+    "embed", "-tts", "transcribe", "-image", "audio", "-vl", "vision", "rerank",
+)
+
+# z.ai's DEFINITIVE "this id is not served" markers, live-verified 2026-09-23:
+# an unserved id answers HTTP 400 ``{"code":"1211","message":"Unknown Model,
+# please check the model code."}``, while a LISTED model whose account has no
+# package answers HTTP 429 ``{"code":"1113","message":"Insufficient balance or
+# no resource package..."}``. The second is a billing state, not a retirement —
+# see :func:`_is_missing_model_response`.
+_MISSING_MODEL_MARKERS = (
+    "unknown model", "model not found", "model does not exist",
+    "invalid model", "no such model",
+)
+
+_aux_model_cache: dict[str, tuple[float, str]] = {}
+_aux_model_cache_lock = threading.Lock()
+
+
+def _aux_model_cache_get(key: str) -> str | None:
+    """The memoized answer for *key*, or None when there is none to serve."""
+    entry = _aux_model_cache.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if time.monotonic() >= expires_at:
+        return None
+    return value
+
+
+def _aux_model_cache_put(key: str, value: str) -> None:
+    """Memoize *value*, giving a negative answer a much shorter life."""
+    ttl = _AUX_MODEL_CACHE_TTL_SECONDS if value else _AUX_MODEL_MISS_TTL_SECONDS
+    with _aux_model_cache_lock:
+        _aux_model_cache[key] = (time.monotonic() + ttl, value)
+
+
+def _glm_version_key(model: str) -> tuple[int, int]:
+    """Sort key for a GLM id: ``glm-5.3`` → ``(5, 3)``, unknown → ``(0, 0)``.
+
+    Numeric, so the 9-vs-10 cliff a string comparison walks off does not
+    decide which generation the cheap tier lands on.
+    """
+    match = _GLM_VERSION_RE.match((model or "").strip().lower())
+    if not match:
+        return (0, 0)
+    return (int(match.group(1)), int(match.group(2) or 0))
+
+
+def _aux_flash_candidates(model_ids: Any) -> list[str]:
+    """Flash-family chat ids from *model_ids*, newest first.
+
+    Ties on generation go to the plain ``-flash`` id over a variant such as
+    ``-flashx``: the bare suffix is the tier z.ai documents as its cheap one.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in model_ids or ():
+        model_id = str(raw or "").strip()
+        lowered = model_id.lower()
+        if not model_id or lowered in seen:
+            continue
+        seen.add(lowered)
+        if not lowered.startswith("glm-") or "flash" not in lowered:
+            continue
+        if any(bad in lowered for bad in _AUX_MODEL_EXCLUDE):
+            continue
+        candidates.append(model_id)
+    candidates.sort(
+        key=lambda m: (_glm_version_key(m), m.lower().endswith("-flash")),
+        reverse=True,
+    )
+    return candidates
+
+
+def _is_missing_model_response(status: int, body: str) -> bool:
+    """True only for z.ai's DEFINITIVE "this id is gone" answer.
+
+    404/410, or a 400 that carries z.ai's unknown-model code/message. Every
+    other failure — 429 overload (code 1305), 429 no-package (code 1113),
+    401/403 auth, 5xx, a timeout — is a *state of the moment*, not evidence
+    about the catalogue, so the caller must keep the catalogue's pick rather
+    than let a probe subtract a model the catalogue says is served.
+    """
+    if status in (404, 410):
+        return True
+    if status != 400:
+        return False
+    lowered = (body or "").lower()
+    return '"1211"' in lowered or any(marker in lowered for marker in _MISSING_MODEL_MARKERS)
 
 
 def _model_supports_thinking(model: str | None) -> bool:
@@ -134,8 +266,178 @@ class ZaiProfile(ProviderProfile):
     """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort.
 
     Also carries the productivity-gate §1.4 session-attribution header when —
-    and only when — the effective endpoint is the loopback proxy.
+    and only when — the effective endpoint is the loopback proxy, and resolves
+    the auxiliary tier from z.ai's live catalogue.
     """
+
+    # ── Auxiliary (cheap) model ──────────────────────────────────────────
+
+    def resolve_aux_model(self, *, vision: bool = False) -> str:
+        """Return the newest flash-family id z.ai's live catalogue serves.
+
+        Reads the provider's own ``/models`` (the authority on what z.ai
+        serves — see :meth:`_aux_catalog_endpoint`) and returns the newest
+        ``-flash`` chat id in it, so the aux tier follows the catalogue
+        instead of the ``default_aux_model`` constant. A candidate that z.ai
+        itself calls unknown is skipped in favour of the next one.
+
+        Contract (``providers/base.py``): memoized per process, never raises,
+        and ``""`` when there is no answer so the caller falls through to
+        ``default_aux_model`` / the legacy fallback dict.
+
+        ``vision`` stays unserved: the flash tier has no multimodal member, so
+        vision keeps its own resolution path (``default_vision_model`` and
+        ``_PROVIDER_VISION_MODELS``) rather than being handed a text-only id.
+        """
+        if vision:
+            return ""
+        cached = _aux_model_cache_get("flash")
+        if cached is not None:
+            return cached
+        value = ""
+        try:
+            value = self._resolve_aux_model_live()
+        except Exception:
+            logger.debug("zai resolve_aux_model failed", exc_info=True)
+            value = ""
+        _aux_model_cache_put("flash", value)
+        return value
+
+    def _resolve_aux_model_live(self) -> str:
+        """One catalogue fetch + bounded probing; ``""`` when nothing answers."""
+        endpoint = self._aux_catalog_endpoint()
+        if not endpoint:
+            return ""
+        for api_key in self._aux_api_keys():
+            model_ids = self._fetch_catalog(api_key, endpoint)
+            if not model_ids:
+                continue
+            candidates = _aux_flash_candidates(model_ids)
+            if not candidates:
+                return ""
+            return self._first_candidate_served(candidates, api_key, endpoint)
+        return ""
+
+    def _aux_catalog_endpoint(self) -> str:
+        """Endpoint whose model list is authoritative for this provider.
+
+        A configured ``base_url`` wins when it is a real endpoint, but a
+        LOOPBACK one is skipped in favour of the provider's own: a local relay
+        publishes its own static subset of the catalogue (this fleet's proxy
+        still advertises the retired ``glm-4.5-flash``, and omits the current
+        ``glm-5.3-flash`` entirely), and trusting that list is how the aux tier
+        rotted in the first place.
+        """
+        configured = ""
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials(self.name) or {}
+            configured = str(creds.get("base_url") or "").strip()
+        except Exception:
+            logger.debug("zai credential lookup failed", exc_info=True)
+        if configured and not _endpoint_is_loopback(configured):
+            return configured.rstrip("/")
+        return (self.models_url or self.base_url or "").rstrip("/")
+
+    def _aux_api_keys(self) -> list[str]:
+        """Candidate credentials for the catalogue, best first, deduped.
+
+        The profile's own credential resolution comes first, then the env vars
+        this profile declares. An empty entry (anonymous fetch) is the last
+        resort, so a catalogue that needs no key still resolves when nothing is
+        configured yet — and on a host whose only key is a relay token, the 401
+        from each candidate simply leaves the aux tier on its curated default.
+        """
+        keys: list[str] = []
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials(self.name) or {}
+            resolved = str(creds.get("api_key") or "").strip()
+            if resolved:
+                keys.append(resolved)
+        except Exception:
+            logger.debug("zai credential lookup failed", exc_info=True)
+        for var in self.env_vars:
+            value = (os.environ.get(var) or "").strip()
+            if value:
+                keys.append(value)
+        deduped = list(dict.fromkeys(keys))
+        deduped.append("")
+        return deduped
+
+    def _fetch_catalog(self, api_key: str, endpoint: str) -> list[str]:
+        """Live model ids from *endpoint*, or ``[]`` — never raises."""
+        try:
+            return list(
+                self.fetch_models(
+                    api_key=api_key or None,
+                    base_url=endpoint or None,
+                    timeout=_AUX_MODEL_FETCH_TIMEOUT_SECONDS,
+                )
+                or ()
+            )
+        except Exception:
+            logger.debug("zai aux catalogue fetch failed", exc_info=True)
+            return []
+
+    def _first_candidate_served(
+        self, candidates: list[str], api_key: str, endpoint: str
+    ) -> str:
+        """First candidate the 1-token probe does not call definitively gone.
+
+        Probing is advisory by design: z.ai advertises ids it then refuses, but
+        it also refuses ids it still serves (a 429 no-package answer on a listed
+        model), so only a definitive "unknown model" reply subtracts a
+        candidate. When every probed candidate is gone we return ``""`` and let
+        the caller fall through to the curated default instead of pinning the
+        aux tier to an id the provider has withdrawn.
+        """
+        for candidate in candidates[:_AUX_MODEL_PROBE_LIMIT]:
+            if self._probe_serves(candidate, api_key, endpoint) is not False:
+                return candidate
+        return ""
+
+    def _probe_serves(self, model: str, api_key: str, endpoint: str) -> bool | None:
+        """One-token liveness probe: True served, False definitively gone, None unknown."""
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            }
+        ).encode()
+        request = urllib.request.Request(
+            endpoint.rstrip("/") + "/chat/completions", data=payload, method="POST"
+        )
+        request.add_header("Content-Type", "application/json")
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", _profile_user_agent())
+        if api_key:
+            request.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            from hermes_cli.urllib_security import open_credentialed_url
+
+            with open_credentialed_url(
+                request, timeout=_AUX_MODEL_PROBE_TIMEOUT_SECONDS
+            ) as resp:
+                resp.read()
+            return True
+        except Exception as exc:
+            status = getattr(exc, "code", None)
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:400]
+            except Exception:
+                body = ""
+            if isinstance(status, int) and _is_missing_model_response(status, body):
+                logger.debug("zai aux probe: %s is not served", model)
+                return False
+            logger.debug("zai aux probe for %s inconclusive: %r", model, exc)
+            return None
+
+    # ── Request shaping ──────────────────────────────────────────────────
 
     def build_api_kwargs_extras(
         self,
@@ -192,7 +494,14 @@ zai = ZaiProfile(
         "glm-4-9b",
     ),
     base_url="https://api.z.ai/api/paas/v4",
-    default_aux_model="glm-4.5-flash",
+    # Belt to :meth:`ZaiProfile.resolve_aux_model`'s braces: the resolver reads
+    # z.ai's live catalogue, and this constant is only what a caller falls back
+    # to when that lookup has no answer (offline, relay token, no key). It is
+    # therefore pinned to a served id — the previous value, ``glm-4.5-flash``,
+    # was retired upstream and made every fall-through aux call a guaranteed
+    # 404/503. Keep it in step with ``_API_KEY_PROVIDER_AUX_MODELS_FALLBACK``
+    # in ``agent/auxiliary_client.py``.
+    default_aux_model="glm-5.3-flash",
 )
 
 register_provider(zai)
