@@ -8,6 +8,7 @@ blocks completion, and never upgrades targeted checks into "repo green".
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -58,6 +59,20 @@ def _retention_cutoff() -> str:
 
 def _db_path() -> Path:
     return get_hermes_home() / "verification_evidence.db"
+
+
+def _active_model() -> str:
+    """Best-effort active model for the current turn (T2, 2026-09-24).
+
+    Records which model produced the work a verification event relates to, so
+    per-model gate-pass-rate becomes measurable. Reads the inference-model env
+    the agent/gateway bridges into tool subprocesses; empty when unknown.
+    """
+    for key in ("HERMES_INFERENCE_MODEL", "HERMES_MODEL"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    return ""
 
 
 def _connect() -> sqlite3.Connection:
@@ -121,10 +136,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             scope TEXT NOT NULL,
             status TEXT NOT NULL,
             exit_code INTEGER NOT NULL,
-            output_summary TEXT NOT NULL
+            output_summary TEXT NOT NULL,
+            model TEXT
         )
         """
     )
+    # T2 (2026-09-24): additive per-model attribution. Existing DBs migrate in
+    # place with a nullable column; pre-existing rows read as NULL.
+    _cols = {row[1] for row in conn.execute("PRAGMA table_info(verification_events)")}
+    if "model" not in _cols:
+        conn.execute("ALTER TABLE verification_events ADD COLUMN model TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS verification_state (
@@ -534,8 +555,8 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                 """
                 INSERT INTO verification_events(
                     created_at, session_id, cwd, root, command, canonical_command,
-                    kind, scope, status, exit_code, output_summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    kind, scope, status, exit_code, output_summary, model
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -549,6 +570,7 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                     evidence.status,
                     evidence.exit_code,
                     evidence.output_summary,
+                    _active_model(),
                 ),
             )
             if cur.lastrowid is None:
