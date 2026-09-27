@@ -1043,9 +1043,22 @@ class SignalAdapter(BasePlatformAdapter):
         through the same account hits the same per-recipient verdict, while
         duplicating the members that already got it.
 
-        So: at least one SUCCESS ⇒ delivered (unreachable recipients are logged
-        for the operator, not turned into a delivery failure); zero SUCCESS ⇒
-        real failure, which callers may still retry or report.
+        So: at least one *explicit* success ⇒ delivered (unreachable recipients
+        are logged for the operator, not turned into a delivery failure); a
+        non-empty failure list with no explicit success ⇒ real failure, which
+        callers may still retry or report.
+
+        Only an explicit success counts as a success: ``type == "SUCCESS"``, or
+        a truthy ``success`` field (the legacy shape).  An entry carrying
+        neither signal — including a ``results`` item that is not an object at
+        all — is counted as *neither* a success nor a failure and logged at
+        WARNING.  It must never stand in for a delivery: reading an unparseable
+        entry as a success is what let ``[<unparseable>, IDENTITY_FAILURE]``
+        become ``failures=[IDENTITY_FAILURE], successes=1``, i.e. a partial send
+        reported as delivered, where the pre-rewrite code returned a hard
+        failure.  A ``results`` list whose every entry is unclassifiable is
+        still delivered, on the same deliberate no-failure-evidence bias as the
+        shape documented below; the WARNING is its record.
 
         This is the ONE place signal-cli's per-recipient verdicts are turned
         into a delivery decision: every ``send``-family call site routes through
@@ -1077,8 +1090,12 @@ class SignalAdapter(BasePlatformAdapter):
         if isinstance(results, list):
             failures: list[str] = []
             successes = 0
+            unparseable: list[str] = []
             for r in results:
                 if not isinstance(r, dict):
+                    # Not a per-recipient object at all: unclassifiable, and it
+                    # cannot be evidence of a delivery.
+                    unparseable.append(type(r).__name__)
                     continue
                 rtype = r.get("type")
                 if rtype and rtype != "SUCCESS":
@@ -1088,7 +1105,22 @@ class SignalAdapter(BasePlatformAdapter):
                     fail = r.get("failure")
                     failures.append(str(fail) if fail else "Recipient delivery failed")
                     continue
-                successes += 1
+                if rtype == "SUCCESS" or r.get("success"):
+                    successes += 1
+                    continue
+                # Neither signal: counted as neither a success nor a failure, so
+                # it can never rescue an all-failure list into a delivery.
+                unparseable.append(",".join(sorted(r.keys())) or "no fields")
+            if unparseable:
+                logger.warning(
+                    "Signal: %d of %d send result entries carried neither a "
+                    "'type' nor a 'success' signal (%s) — neither a delivery "
+                    "nor a failure; an unparseable entry is not evidence that "
+                    "the message reached anyone",
+                    len(unparseable),
+                    len(results),
+                    ", ".join(sorted(set(unparseable))),
+                )
             if failures and not successes:
                 # Nothing reached anyone — a genuine failure.
                 return False, failures[0]

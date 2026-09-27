@@ -829,6 +829,118 @@ class TestSignalSendResultValidation:
         assert result.success is True
         assert "no per-recipient results" in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_legacy_failure_shape_beside_a_success_entry_is_a_partial_send(
+        self, monkeypatch, caplog
+    ):
+        """The legacy ``{"success": false, ...}`` shape still registers as a
+        per-recipient failure when it sits next to a ``SUCCESS`` entry.
+
+        This is the mixed case the recipient-level rewrite touches most, and it
+        had no test: the old shape must neither be dropped (which would hide the
+        member that never got the message) nor be read as a success (which would
+        make a partial send look like a clean one).  It stays a *partial* send —
+        delivered, with the unreachable member named in the log.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "success": False,
+                    "failure": "Some connection error",
+                },
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "SUCCESS",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is True
+        assert result.error is None
+        assert "Some connection error" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unparseable_entry_cannot_rescue_an_all_failure_send(
+        self, monkeypatch, caplog
+    ):
+        """An entry with neither ``type`` nor ``success`` is not a success.
+
+        Regression for the recipient-level rewrite in
+        ``SignalAdapter._validate_send_result``.  Such an entry used to fall
+        through both guards and increment the success counter, so a list of
+        ``[<unparseable>, IDENTITY_FAILURE]`` read as
+        ``failures=[IDENTITY_FAILURE], successes=1`` — i.e. a partial send, i.e.
+        delivered.  The pre-rewrite code returned a hard failure on the first
+        non-``SUCCESS`` entry, and that is the behaviour to keep: nothing in
+        this list is evidence that the message reached anybody, so an
+        unparseable entry must not flip a total failure into a delivery.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"number": "+155****0000"}},
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is False, (
+            "an unparseable result entry is not a delivery and must not turn an "
+            "all-failure recipient list into a delivered send"
+        )
+        assert result.error == "IDENTITY_FAILURE"
+        # The unparseable entry is surfaced to the operator rather than skipped.
+        assert "1 of 2" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_results_with_only_unparseable_entries_stay_delivered(
+        self, monkeypatch, caplog
+    ):
+        """A ``results`` list whose every entry is unclassifiable carries no
+        failure evidence, so it keeps the same deliberate bias as an absent
+        ``results`` list: DELIVERED, at WARNING instead of DEBUG.
+
+        Pinned so the bias is a decision rather than an accident — pairing an
+        unparseable entry with an explicit failure is what must fail (see the
+        test above), and this list must not start reporting a delivery failure
+        either, because that would send a resend for a message signal-cli
+        accepted.  Non-dict entries count as unclassifiable too: they cannot be
+        evidence of success, and silently ignoring them hid the shape.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"number": "+155****4567"}},
+                "not-a-result-object",
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is True
+        assert result.error is None
+        assert "2 of 2" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # stop_typing() delegates to _stop_typing_indicator (#4647)
