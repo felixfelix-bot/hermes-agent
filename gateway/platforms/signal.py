@@ -1131,7 +1131,7 @@ class SignalAdapter(BasePlatformAdapter):
                     "because a resend would duplicate it for the recipients "
                     "that did",
                     len(failures),
-                    len(failures) + successes,
+                    len(results),
                     ", ".join(sorted(set(failures))),
                 )
         return True, None
