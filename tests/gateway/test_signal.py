@@ -709,6 +709,238 @@ class TestSignalSendResultValidation:
         assert result.success is False
         assert result.error == "Some connection error"
 
+    @pytest.mark.asyncio
+    async def test_group_send_partial_recipient_failure_is_delivered(
+        self, monkeypatch, caplog
+    ):
+        """A group send that reached SOME members is a DELIVERY, not a failure.
+
+        signal-cli returns one result entry per group member.  The group here
+        has two members: one SUCCESS, one IDENTITY_FAILURE (an untrusted /
+        re-registered safety number for that member only).
+
+        Regression for the cron double-delivery bug: classifying this as a
+        failed send made the cron scheduler believe nothing had been delivered,
+        so it re-sent the same brief through the standalone path and the
+        operator received TWO copies — even though the live send had in fact
+        reached the group.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "SUCCESS",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is True, (
+            "a group send that reached at least one member must not be reported "
+            "as a total failure — that is what triggered the duplicate resend"
+        )
+        assert result.error is None
+        # The member that could not be reached must still be visible to the
+        # operator: the fix hides the failure from the delivery decision, not
+        # from the logs.
+        assert "IDENTITY_FAILURE" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_group_send_all_recipients_failed_still_fails(self, monkeypatch):
+        """Nothing reached anyone → still a real failure, so the caller keeps
+        its retry/deliver-or-error behaviour (never silently drop a brief)."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "NETWORK_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is False
+        # Order-independent on purpose: which failure is reported first follows
+        # signal-cli's member ordering, not any contract we own.
+        assert result.error in {"IDENTITY_FAILURE", "NETWORK_FAILURE"}
+
+    @pytest.mark.asyncio
+    async def test_dm_send_single_recipient_failure_still_fails(self, monkeypatch):
+        """One recipient, one failure → total failure (no partial success to
+        report, no duplicate risk either way)."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is False
+        assert result.error == "IDENTITY_FAILURE"
+
+    @pytest.mark.asyncio
+    async def test_response_without_results_is_delivered_and_logged(
+        self, monkeypatch, caplog
+    ):
+        """A response with no ``results`` list is the plain accepted-send shape:
+        there is no per-recipient evidence, so it stays DELIVERED.
+
+        This is a deliberate, load-bearing bias, not an oversight: calling it a
+        failure would make the cron scheduler resend a message that went out
+        (the duplicate this fix removes), and the RPC already returned without a
+        JSON-RPC error.  The DEBUG log keeps the unconfirmable shape visible
+        when someone diagnoses a delivery question.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({"timestamp": 1712345678000})
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("DEBUG"):
+            result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is True
+        assert "no per-recipient results" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_legacy_failure_shape_beside_a_success_entry_is_a_partial_send(
+        self, monkeypatch, caplog
+    ):
+        """The legacy ``{"success": false, ...}`` shape still registers as a
+        per-recipient failure when it sits next to a ``SUCCESS`` entry.
+
+        This is the mixed case the recipient-level rewrite touches most, and it
+        had no test: the old shape must neither be dropped (which would hide the
+        member that never got the message) nor be read as a success (which would
+        make a partial send look like a clean one).  It stays a *partial* send —
+        delivered, with the unreachable member named in the log.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "success": False,
+                    "failure": "Some connection error",
+                },
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "SUCCESS",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is True
+        assert result.error is None
+        assert "Some connection error" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unparseable_entry_cannot_rescue_an_all_failure_send(
+        self, monkeypatch, caplog
+    ):
+        """An entry with neither ``type`` nor ``success`` is not a success.
+
+        Regression for the recipient-level rewrite in
+        ``SignalAdapter._validate_send_result``.  Such an entry used to fall
+        through both guards and increment the success counter, so a list of
+        ``[<unparseable>, IDENTITY_FAILURE]`` read as
+        ``failures=[IDENTITY_FAILURE], successes=1`` — i.e. a partial send, i.e.
+        delivered.  The pre-rewrite code returned a hard failure on the first
+        non-``SUCCESS`` entry, and that is the behaviour to keep: nothing in
+        this list is evidence that the message reached anybody, so an
+        unparseable entry must not flip a total failure into a delivery.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"number": "+155****0000"}},
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:abc123", content="brief")
+
+        assert result.success is False, (
+            "an unparseable result entry is not a delivery and must not turn an "
+            "all-failure recipient list into a delivered send"
+        )
+        assert result.error == "IDENTITY_FAILURE"
+        # The unparseable entry is surfaced to the operator rather than skipped.
+        assert "1 of 2" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_results_with_only_unparseable_entries_stay_delivered(
+        self, monkeypatch, caplog
+    ):
+        """A ``results`` list whose every entry is unclassifiable carries no
+        failure evidence, so it keeps the same deliberate bias as an absent
+        ``results`` list: DELIVERED, at WARNING instead of DEBUG.
+
+        Pinned so the bias is a decision rather than an accident — pairing an
+        unparseable entry with an explicit failure is what must fail (see the
+        test above), and this list must not start reporting a delivery failure
+        either, because that would send a resend for a message signal-cli
+        accepted.  Non-dict entries count as unclassifiable too: they cannot be
+        evidence of success, and silently ignoring them hid the shape.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"number": "+155****4567"}},
+                "not-a-result-object",
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is True
+        assert result.error is None
+        assert "2 of 2" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # stop_typing() delegates to _stop_typing_indicator (#4647)

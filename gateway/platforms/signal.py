@@ -1027,23 +1027,113 @@ class SignalAdapter(BasePlatformAdapter):
         """Validate signal-cli send response results.
 
         Returns (success, error_message).
+
+        signal-cli reports ONE entry per recipient, so a group send yields one
+        entry per member.  A failure for a single member — typically
+        ``IDENTITY_FAILURE``, an untrusted/stale safety number that only the
+        operator can clear — does NOT mean the send failed: every other member
+        already received the message.
+
+        Classifying such a partial send as a total failure is what produced the
+        cron duplicate-delivery bug: the scheduler saw "failed" for a delivery
+        that HAD happened, fell through to its standalone fallback
+        (``live adapter delivery to signal:group:… failed: IDENTITY_FAILURE,
+        falling back to standalone``), and the operator received two copies of
+        every brief.  The fallback could never have helped anyway — a resend
+        through the same account hits the same per-recipient verdict, while
+        duplicating the members that already got it.
+
+        So: at least one *explicit* success ⇒ delivered (unreachable recipients
+        are logged for the operator, not turned into a delivery failure); a
+        non-empty failure list with no explicit success ⇒ real failure, which
+        callers may still retry or report.
+
+        Only an explicit success counts as a success: ``type == "SUCCESS"``, or
+        a truthy ``success`` field (the legacy shape).  An entry carrying
+        neither signal — including a ``results`` item that is not an object at
+        all — is counted as *neither* a success nor a failure and logged at
+        WARNING.  It must never stand in for a delivery: reading an unparseable
+        entry as a success is what let ``[<unparseable>, IDENTITY_FAILURE]``
+        become ``failures=[IDENTITY_FAILURE], successes=1``, i.e. a partial send
+        reported as delivered, where the pre-rewrite code returned a hard
+        failure.  A ``results`` list whose every entry is unclassifiable is
+        still delivered, on the same deliberate no-failure-evidence bias as the
+        shape documented below; the WARNING is its record.
+
+        This is the ONE place signal-cli's per-recipient verdicts are turned
+        into a delivery decision: every ``send``-family call site routes through
+        it — ``send()`` (text), ``send_multiple_images()`` (attachment batches),
+        ``send_image()`` / ``send_document()`` and ``send_voice()`` /
+        ``send_video()``.  Fixing the verdict here fixes all of them at once;
+        the other ``results`` readers in this package
+        (``signal_rate_limit.py``, ``_rpc(raise_on_rate_limit=True)``) only look
+        for ``RATE_LIMIT_FAILURE`` and never decide delivered-vs-failed.
+
+        A response WITHOUT a ``results`` list (the shape signal-cli returns for
+        a plain accepted send) carries no per-recipient evidence at all.  It is
+        treated as delivered, deliberately: a non-None result means the RPC
+        returned without a JSON-RPC error, and "no evidence of failure" must not
+        become "failed" here — the caller's fallback would resend a message that
+        went out, which is the very duplicate this function was fixed for.
+        Logged at DEBUG so the unconfirmable shape stays diagnosable.
         """
         if not result or not isinstance(result, dict):
             return True, None
 
         results = result.get("results")
+        if not isinstance(results, list):
+            logger.debug(
+                "Signal: send response carries no per-recipient results (%s) — "
+                "no failure evidence, treating as delivered",
+                sorted(result.keys()),
+            )
         if isinstance(results, list):
+            failures: list[str] = []
+            successes = 0
+            unparseable: list[str] = []
             for r in results:
                 if not isinstance(r, dict):
+                    # Not a per-recipient object at all: unclassifiable, and it
+                    # cannot be evidence of a delivery.
+                    unparseable.append(type(r).__name__)
                     continue
                 rtype = r.get("type")
                 if rtype and rtype != "SUCCESS":
-                    return False, str(rtype)
+                    failures.append(str(rtype))
+                    continue
                 if "success" in r and not r.get("success"):
                     fail = r.get("failure")
-                    if fail:
-                        return False, str(fail)
-                    return False, "Recipient delivery failed"
+                    failures.append(str(fail) if fail else "Recipient delivery failed")
+                    continue
+                if rtype == "SUCCESS" or r.get("success"):
+                    successes += 1
+                    continue
+                # Neither signal: counted as neither a success nor a failure, so
+                # it can never rescue an all-failure list into a delivery.
+                unparseable.append(",".join(sorted(r.keys())) or "no fields")
+            if unparseable:
+                logger.warning(
+                    "Signal: %d of %d send result entries carried neither a "
+                    "'type' nor a 'success' signal (%s) — neither a delivery "
+                    "nor a failure; an unparseable entry is not evidence that "
+                    "the message reached anyone",
+                    len(unparseable),
+                    len(results),
+                    ", ".join(sorted(set(unparseable))),
+                )
+            if failures and not successes:
+                # Nothing reached anyone — a genuine failure.
+                return False, failures[0]
+            if failures:
+                logger.warning(
+                    "Signal: partial send — %d of %d recipient(s) did not "
+                    "receive the message (%s); treating the send as delivered "
+                    "because a resend would duplicate it for the recipients "
+                    "that did",
+                    len(failures),
+                    len(results),
+                    ", ".join(sorted(set(failures))),
+                )
         return True, None
 
     # ------------------------------------------------------------------
