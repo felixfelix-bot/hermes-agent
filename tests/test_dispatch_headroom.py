@@ -4,7 +4,37 @@ These lock the 2026-09-28 fix: CPU load is a SOFT, per-core dimension, so a
 busy-but-not-dangerous box still gets `soft_floor` workers; only memory, disk
 and swap may hard-zero dispatch. They also lock the config-as-code merge.
 """
-from gateway.dispatch_headroom import DEFAULT_POLICY, fold_target, load_policy, resource_headroom
+from gateway.dispatch_headroom import (
+    DEFAULT_POLICY,
+    board_sort_key,
+    fold_target,
+    load_policy,
+    resource_headroom,
+)
+
+
+# ── board scheduling priority (2026-09-28) ──────────────────────────────────
+
+def test_priority_beats_slug_within_an_urgency():
+    # The starvation shape: tollgate-* (later slug) waited behind plebeian
+    # forever under a cap of 2. A higher priority must sort first.
+    tollgate = board_sort_key("tollgate-module-basic-go", 1, 100)
+    plebeian = board_sort_key("plebeian-pr-reviews", 1, 0)
+    assert sorted([plebeian, tollgate])[0] == tollgate
+
+
+def test_urgent_board_still_beats_priority():
+    urgent_low = board_sort_key("z-board", 1, 0)
+    soon_high = board_sort_key("a-board", 0, 100)
+    assert sorted([soon_high, urgent_low])[0] == urgent_low
+
+
+def test_zero_priority_falls_back_to_slug():
+    assert board_sort_key("a", 1, 0) < board_sort_key("b", 1, 0)
+
+
+def test_none_priority_is_zero():
+    assert board_sort_key("x", 1, None) == board_sort_key("x", 1, 0)
 
 
 def _raw(cpu=0.0, mem=0.0, swap=0.0, disk=0.0):

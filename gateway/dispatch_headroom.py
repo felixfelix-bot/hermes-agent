@@ -62,7 +62,7 @@ def load_policy(home: str | None = None, env: dict | None = None) -> dict:
             if not os.path.exists(path):
                 continue
             import yaml
-            data = yaml.safe_load(Path(path).read_text()) or {}
+            data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
             if isinstance(data, dict):
                 policy.update({k: v for k, v in data.items() if v is not None})
                 break
@@ -115,6 +115,17 @@ def resource_headroom(
         else:
             per_dim[res] = 1.0
     return per_dim
+
+
+def board_sort_key(slug: str, now_count: int, priority: int) -> tuple:
+    """Pure board-ordering key: urgent first, then higher priority, then slug.
+
+    Before 2026-09-28 the dispatcher ordered boards ``(has-now, slug)`` with no
+    priority, so under a small fleet cap the lowest-slug boards were served
+    forever and the boards an operator cared about starved. ``priority`` is
+    per-board config (``board.json`` ``dispatch_priority``).
+    """
+    return (0 if now_count else 1, -int(priority or 0), slug or "")
 
 
 def fold_target(
