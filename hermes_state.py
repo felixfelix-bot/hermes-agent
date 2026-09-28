@@ -1415,7 +1415,11 @@ def classify_persistence_error(exc_or_str) -> str:
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
-    * ``"unknown"`` — anything else (or no visible exception at all).
+    * ``"unknown"`` — anything else (or no visible exception at all), which
+      includes database corruption. Corruption is deliberately kept out of
+      the ``"disk"`` bucket: "database disk image is malformed" merely
+      *contains* the substring "disk", and bucketing it as disk-full sends
+      the operator hunting for free space that was never the problem.
     """
     if exc_or_str is None:
         return "unknown"
@@ -1434,6 +1438,12 @@ def classify_persistence_error(exc_or_str) -> str:
         or "compression lease" in text
     ):
         return "locked"
+    # Corruption is not a disk-full failure even though "database disk image is
+    # malformed" contains the substring "disk". Bucket it as unknown so the
+    # operator gets the "check the state database health" guidance, not advice
+    # to free disk space.
+    if any(marker in text for marker in _MALFORMED_SCHEMA_MARKERS):
+        return "unknown"
     if (
         is_disk_full_error(exc_or_str)
         or "disk" in text
