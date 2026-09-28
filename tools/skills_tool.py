@@ -1797,17 +1797,12 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        from tools.tool_output_limits import cap_json_output
-
-        return cap_json_output(
-            json.dumps(result, ensure_ascii=False),
-            string_fields=("content",),
-            truncation_message=(
-                "Output capped at {cap} chars (tail-truncated '{field}' by "
-                "{dropped} chars). Use skill_view(name, file_path) to read a "
-                "specific linked file, or narrow the skill's content."
-            ),
-        )
+        # Return the skill content in full. A tool-output cap here would
+        # silently tail-truncate a large skill (a hand-placed skill is not
+        # size-constrained at the storage layer) and violate the contract that
+        # instructional tools are read in full — the model must never get a
+        # partial SKILL.md and skip the rest.
+        return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
         return tool_error(str(e), success=False)

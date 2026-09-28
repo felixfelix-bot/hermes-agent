@@ -9407,7 +9407,7 @@ def _touch_urgency_triage() -> None:
     try:
         base = os.path.join(os.path.expanduser("~"), ".hermes", "state")
         os.makedirs(base, exist_ok=True)
-        with open(os.path.join(base, "urgency-triage.touch"), "w") as f:
+        with open(os.path.join(base, "urgency-triage.touch"), "w", encoding="utf-8") as f:
             f.write(str(int(time.time())))
     except Exception:
         pass

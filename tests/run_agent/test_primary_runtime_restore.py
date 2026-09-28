@@ -31,11 +31,19 @@ def _make_tool_defs(*names: str) -> list:
 
 
 def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
-    """Create a minimal AIAgent with optional fallback config."""
+    """Create a minimal AIAgent with optional fallback config.
+
+    Pin model-metadata resolution so construction never probes the network. A
+    live probe against a real endpoint can return a sub-64K context window and
+    abort the constructor (ValueError) before the transport-recovery logic under
+    test ever runs.
+    """
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
+        patch("agent.context_compressor.get_model_context_length", return_value=200_000),
+        patch("agent.model_metadata.get_model_context_length", return_value=200_000),
     ):
         agent = AIAgent(
             api_key="test-key-12345678",
