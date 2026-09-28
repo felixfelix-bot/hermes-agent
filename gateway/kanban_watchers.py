@@ -271,39 +271,42 @@ def _compute_dispatch_headroom(
 ) -> dict:
     """Compute multi-dimensional dispatch headroom in-process.
 
-    Combines the 6-state resource Kalman (memory/cpu/swap/disk/tokens/workers)
-    with the LLM price/quota gate (``/v1/dispatch_gate`` on the zai proxy) into
-    a single ``{target_workers, per_dimension, reason, can_dispatch}`` decision.
+    Combines the resource sample (cpu/memory/swap/disk) with the LLM
+    price/quota gate (``/v1/dispatch_gate`` on the live router) into a single
+    ``{target_workers, per_dimension, reason, can_dispatch}`` decision.
 
-    ``target_workers`` is a throttle (0..static_cap), not a binary gate: each
-    dimension contributes a "how many workers can the box afford" figure and
-    the fleet is limited by the minimum. A floor of 1 is kept unless a
-    dimension is critical.
+    Policy — thresholds, which dimensions are HARD-critical, and the soft floor
+    — is config-as-code (``gateway.dispatch_headroom`` /
+    ``state/fleet/dispatch_headroom.yaml``, deployed by role
+    59-dispatch-health). CPU is SOFT: a CPU breach throttles but still yields
+    ``soft_floor`` workers, so a busy-but-not-dangerous box cannot starve every
+    board; only memory/disk/swap breach can hard-zero dispatch. ``reason`` names
+    the binding dimension so a resource hold is never misreported as a quota
+    hold (the pre-2026-09-28 bug that made a CPU hold read as "primary keys
+    tight").
 
-    Fail-open: any sensor error returns a safe floor (1 worker) so a broken
+    Fail-open: any sensor error degrades to a safe floor (1 worker) so a broken
     sensor can never wedge dispatch (same contract as the estop gate).
     """
     import json as _json
     import urllib.request as _urllib
 
-    per_dim: dict = {}
-    target = static_cap if static_cap and static_cap >= 1 else 3
-    reason = "no sensors"
+    from gateway.dispatch_headroom import (
+        fold_target,
+        load_policy,
+        resource_headroom,
+    )
 
-    # ── 1. Resource pressure (memory / cpu / swap / disk) ──
-    # Current reality (latest raw sample) drives the hard gate; the Kalman is
-    # used only for an early-warning reduction, so a fast-clearing spike can't
-    # hold dispatch on a lagging filtered estimate. Disk hold relaxed to 90%
-    # (operator 2026-09-11): the box runs near-full by design, so only a
-    # genuine 90% emergency holds dispatch; the preventive cleanup task fires
-    # at the softer warning band well before that.
-    _RAW_THRESHOLDS = {
-        "cpu_load": 8.0,
-        "memory_pct": 85.0,
-        "swap_used_pct": 80.0,
-        "disk_used_pct": 90.0,
+    policy = load_policy()
+    cores = os.cpu_count() or 1
+
+    # ── 1. Resource sample (latest raw row drives the gate) ──
+    raw = {
+        "cpu_load": 0.0,
+        "memory_pct": 0.0,
+        "swap_used_pct": 0.0,
+        "disk_used_pct": 0.0,
     }
-    raw = {k: 0.0 for k in _RAW_THRESHOLDS}
     try:
         import sqlite3 as _sqlite3
         _c = _sqlite3.connect(
@@ -344,19 +347,11 @@ def _compute_dispatch_headroom(
     except Exception as exc:
         logger.warning("kanban dispatcher: resource Kalman unavailable (%s)", exc)
 
-    for _res, _thr in _RAW_THRESHOLDS.items():
-        _rv = raw.get(_res, 0.0)
-        if _rv >= _thr:
-            per_dim[_res] = 0.0            # current breach -> hold
-        elif _rv >= _thr * 0.9:
-            per_dim[_res] = 0.5            # close to threshold -> throttle
-        elif _res in kalman_warn:
-            per_dim[_res] = 0.5            # predicted breach -> early throttle
-        else:
-            per_dim[_res] = 1.0
+    per_dim = resource_headroom(raw, policy, cores, kalman_warn)
 
     # ── 2. LLM price/quota gate (market-based live router) ──
     llm_headroom = 1.0
+    llm_reason = ""
     try:
         req = _urllib.Request(
             "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
@@ -365,24 +360,35 @@ def _compute_dispatch_headroom(
         with _urllib.urlopen(req, timeout=5) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
         llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
-        per_dim["llm"] = llm_headroom
-        reason = data.get("reason", reason)
+        llm_reason = data.get("reason", "") or ""
     except Exception as exc:
         logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
-        per_dim.setdefault("llm", 1.0)
+    per_dim["llm"] = llm_headroom
 
     # ── 3. Fold to a target worker count (throttle, not binary) ──
-    # Each dimension's headroom (0..1) scales the cap; the fleet is the min.
-    # A critical dimension (headroom 0) forces target 0 unless it's the only
-    # signal we have (fail-open floor of 1).
+    critical_dims = policy.get("critical_dimensions") or (
+        "memory_pct", "disk_used_pct", "swap_used_pct",
+    )
+    soft_floor = int(policy.get("soft_floor", 1))
+    target = fold_target(per_dim, critical_dims, static_cap, soft_floor)
+
+    # ── 4. Reason: name the binding dimension; never mask a resource hold with
+    #       the LLM gate's text (the 2026-09-28 misreport). ──
     if per_dim:
-        min_headroom = min(per_dim.values())
-        if min_headroom <= 0.0:
-            target = 0
+        binding = min(per_dim, key=per_dim.get)
+        if per_dim[binding] < 1.0 and binding != "llm":
+            reason = (
+                f"resource throttle: {binding} headroom {per_dim[binding]:.1f} "
+                f"(cpu_load={raw.get('cpu_load', 0.0):.1f} on {cores}c)"
+            )
+            if llm_reason:
+                reason += f"; llm: {llm_reason}"
+        elif binding == "llm" and per_dim["llm"] <= 0.0:
+            reason = llm_reason or "llm lane exhausted"
         else:
-            target = max(1, int(round((static_cap or 3) * min_headroom)))
+            reason = llm_reason or "ok"
     else:
-        target = 1  # no sensors at all -> safe floor
+        reason = "no sensors"
 
     result = {
         "target_workers": target,
@@ -394,7 +400,6 @@ def _compute_dispatch_headroom(
     # signal and never revives into a starved box. Fail-open: a write error
     # must not affect the dispatch decision.
     try:
-        import json as _json
         _p = Path.home() / ".hermes" / "bot" / "dispatch_headroom.json"
         _p.parent.mkdir(parents=True, exist_ok=True)
         _p.write_text(_json.dumps(result), encoding="utf-8")
