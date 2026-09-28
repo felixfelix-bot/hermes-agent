@@ -692,13 +692,13 @@ def _capacity_outage_notice() -> str:
                 "details out of chat; check gateway logs for diagnostics."
             )
         try:
-            started = int(sentinel.read_text().strip() or "0")
+            started = int(sentinel.read_text(encoding="utf-8").strip() or "0")
         except Exception:
             started = 0
         hours = 6.0
         try:
             import yaml as _y
-            cfg = _y.safe_load((_P.home() / ".hermes" / "config.yaml").read_text()) or {}
+            cfg = _y.safe_load((_P.home() / ".hermes" / "config.yaml").read_text(encoding="utf-8")) or {}
             hours = float((cfg.get("notifications") or {}).get(
                 "provider_failure_re_notify_hours", 6))
         except Exception:
@@ -706,7 +706,7 @@ def _capacity_outage_notice() -> str:
         state_f = bot / ".capacity_notice_state.json"
         st = {}
         try:
-            st = _j.loads(state_f.read_text())
+            st = _j.loads(state_f.read_text(encoding="utf-8"))
         except Exception:
             st = {}
         now = _t.time()
@@ -717,7 +717,7 @@ def _capacity_outage_notice() -> str:
         st["last_notice_ts"] = now
         st["outage_started"] = started
         try:
-            state_f.write_text(_j.dumps(st))
+            state_f.write_text(_j.dumps(st), encoding="utf-8")
         except Exception:
             pass
         if started:

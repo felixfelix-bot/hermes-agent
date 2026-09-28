@@ -48,7 +48,7 @@ def _reclaim_backoff_path() -> Path:
 
 def _load_reclaim_backoff() -> dict:
     try:
-        data = json.loads(_reclaim_backoff_path().read_text())
+        data = json.loads(_reclaim_backoff_path().read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -59,7 +59,7 @@ def _save_reclaim_backoff(data: dict) -> None:
         path = _reclaim_backoff_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
+        tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(path)
     except Exception:
         pass
@@ -261,7 +261,7 @@ def _board_no_llm_dispatch(slug: str) -> bool:
         import json as _json
         from hermes_constants import get_hermes_home
         bj = get_hermes_home() / "kanban" / "boards" / slug / "board.json"
-        return bool((_json.loads(bj.read_text()) or {}).get("no_llm_dispatch"))
+        return bool((_json.loads(bj.read_text(encoding="utf-8")) or {}).get("no_llm_dispatch"))
     except Exception:
         return False
 

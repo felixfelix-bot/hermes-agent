@@ -176,7 +176,7 @@ class NostrAdapter(BasePlatformAdapter):
             logger.error("Nostr: nsec file not found at %s", self.nsec_path)
             return False
         try:
-            with open(self.nsec_path) as f:
+            with open(self.nsec_path, encoding="utf-8") as f:
                 nsec_str = f.read().strip()
             self._privkey = _privkey_from_nsec(nsec_str)
             self._pubkey = _pubkey_from_privkey(self._privkey)
