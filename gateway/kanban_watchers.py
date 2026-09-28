@@ -266,6 +266,23 @@ def _board_no_llm_dispatch(slug: str) -> bool:
         return False
 
 
+def _board_dispatch_priority(slug: str) -> int:
+    """Board scheduling priority from ``board.json`` ``dispatch_priority``.
+
+    Higher runs first among boards with the same urgency. Config-as-code:
+    ``state/fleet/board_flags.json`` -> ``apply_board_flags.py`` writes the flag
+    into ``board.json``. Default 0; fail-open on any error.
+    """
+    try:
+        import json as _json
+        from hermes_constants import get_hermes_home
+        bj = get_hermes_home() / "kanban" / "boards" / slug / "board.json"
+        return int((_json.loads(bj.read_text(encoding="utf-8")) or {}).get(
+            "dispatch_priority") or 0)
+    except Exception:
+        return 0
+
+
 def _compute_dispatch_headroom(
     static_cap: "Optional[int]" = None,
 ) -> dict:
@@ -1717,13 +1734,17 @@ class GatewayKanbanWatchersMixin:
                             _c.close()
                         except Exception:
                             pass
-            boards = sorted(
-                boards,
-                key=lambda b: (
-                    0 if _board_now_count(b.get("slug") or _kb.DEFAULT_BOARD) else 1,
-                    b.get("slug") or "",
-                ),
-            )
+            from gateway.dispatch_headroom import board_sort_key
+
+            def _sort_key(b):
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                return board_sort_key(
+                    slug,
+                    _board_now_count(slug),
+                    _board_dispatch_priority(slug),
+                )
+
+            boards = sorted(boards, key=_sort_key)
             # Multi-dimensional headroom governor: LLM price/quota + resource
             # Kalman -> a target worker count (throttle). Hold (target 0) when
             # any dimension is critical; otherwise dispatch up to the target.

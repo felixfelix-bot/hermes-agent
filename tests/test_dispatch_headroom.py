@@ -12,10 +12,35 @@ import textwrap
 
 from gateway.dispatch_headroom import (
     DEFAULT_POLICY,
+    board_sort_key,
     fold_target,
     load_policy,
     resource_headroom,
 )
+
+
+# ── board scheduling fairness (2026-09-28) ──────────────────────────────────
+
+def test_priority_beats_slug_within_urgency():
+    # The 2026-09-28 starvation: tollgate-* (slug later) waited behind
+    # plebeian/hermes forever. A higher priority must sort first.
+    key_tollgate = board_sort_key("tollgate-module-basic-go", 1, 100)
+    key_plebeian = board_sort_key("plebeian-pr-reviews", 1, 0)
+    assert sorted([key_plebeian, key_tollgate])[0] == key_tollgate
+
+
+def test_urgency_now_still_first():
+    key_now_lowpri = board_sort_key("z-board", 1, 0)
+    key_soon_highpri = board_sort_key("a-board", 0, 100)
+    assert sorted([key_soon_highpri, key_now_lowpri])[0] == key_now_lowpri
+
+
+def test_no_priority_falls_back_to_slug_order():
+    assert board_sort_key("a-board", 1, 0) < board_sort_key("b-board", 1, 0)
+
+
+def test_priority_none_is_zero():
+    assert board_sort_key("x", 1, None) == board_sort_key("x", 1, 0)
 
 
 # ── fold ────────────────────────────────────────────────────────────────────

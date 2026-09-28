@@ -117,6 +117,17 @@ def resource_headroom(
     return per_dim
 
 
+def board_sort_key(slug: str, now_count: int, priority: int) -> tuple:
+    """Pure board-ordering key: urgent first, then higher priority, then slug.
+
+    Before 2026-09-28 the dispatcher ordered boards ``(has-now, slug)`` with no
+    priority, so under a small fleet cap the lowest-slug boards were served
+    forever and the boards an operator cared about starved. ``priority`` is
+    per-board config (``board.json`` ``dispatch_priority``).
+    """
+    return (0 if now_count else 1, -int(priority or 0), slug or "")
+
+
 def fold_target(
     per_dim: dict,
     critical_dims,
