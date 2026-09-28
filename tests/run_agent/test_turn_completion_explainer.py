@@ -194,6 +194,32 @@ def test_classify_persistence_error_reuses_disk_full_markers():
     ) == "disk"
 
 
+def test_classify_persistence_error_corruption_is_not_disk():
+    """A corrupt database ('database disk image is malformed') contains the
+    substring 'disk' but is NOT a disk-full/ENOSPC failure. Bucketing it as
+    'disk' sends the operator hunting for free space that was never the
+    problem (seen with a corrupt manager state.db). Corruption belongs in the
+    generic 'check the state database health' bucket."""
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) == "unknown"
+    assert classify_persistence_error(
+        "database disk image is malformed"
+    ) == "unknown"
+    assert classify_persistence_error(
+        "malformed database schema (idx_messages_session)"
+    ) == "unknown"
+    # Genuine disk-full / read-only failures must still be 'disk'.
+    assert classify_persistence_error("database or disk is full") == "disk"
+    assert classify_persistence_error(
+        "attempt to write a readonly database"
+    ) == "disk"
+
+
 def test_classify_persistence_error_compression_busy_is_locked():
     """A live compression lease refusing the write is contention, not
     storage damage — but its message contains neither 'locked' nor 'busy',
