@@ -364,7 +364,27 @@ def _compute_dispatch_headroom(
     except Exception as exc:
         logger.warning("kanban dispatcher: resource Kalman unavailable (%s)", exc)
 
-    per_dim = resource_headroom(raw, policy, cores, kalman_warn)
+    # PSI + loadavg (Phase 2, 2026-09-30): fold the *stall* signal — not just
+    # the load AVERAGE in ``raw['cpu_load']`` — into the SAME headroom decision.
+    # PSI measures the fraction of time tasks were stalled on a resource and is
+    # not blind to router queueing, which is exactly the 2026-09-30 failure.
+    # Fail-open: an unreadable /proc yields {} so no extra dimensions appear and
+    # the fold keeps its previous shape.
+    _psi = None
+    try:
+        from gateway.psi import psi_snapshot as _psi_snapshot
+        _psi = _psi_snapshot()
+    except Exception:
+        _psi = None
+    _loadavg = None
+    try:
+        _loadavg = float(open("/proc/loadavg").read().split()[0])
+    except Exception:
+        _loadavg = None
+
+    per_dim = resource_headroom(
+        raw, policy, cores, kalman_warn, psi=_psi, loadavg=_loadavg,
+    )
 
     # ── 2. LLM price/quota gate (market-based live router) ──
     llm_headroom = 1.0
@@ -1580,7 +1600,7 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(slug: str, host_gate: "Optional[dict]" = None) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1588,6 +1608,11 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+
+            ``host_gate`` is this tick's host-pressure decision (shared across
+            boards): ``None`` or ``{ok: True, ...}`` leaves dispatch unchanged;
+            ``{ok: False, reason: ...}`` defers NEW ready-lane spawns on this
+            board while the review lane still spawns.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1632,6 +1657,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                     urgency_required=urgency_required,
+                    host_pressure_gate=host_gate,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1750,6 +1776,25 @@ class GatewayKanbanWatchersMixin:
             # any dimension is critical; otherwise dispatch up to the target.
             headroom = _compute_dispatch_headroom(max_in_progress)
             target = headroom.get("target_workers", 0)
+            # Host-pressure load gate (Phase 2, 2026-09-30): computed ONCE per
+            # tick and threaded into every board's dispatch_once, which applies
+            # it to the READY (new-worker) lane only — the review lane still
+            # spawns so a verdict completes on a loaded box. The cheap PSI read
+            # rides the headroom fold above; the end-to-end 5-token probe runs
+            # here (~<3 s, bounded by its own read timeout). Fail-open: any
+            # error yields a None gate, which simply disables the refusal.
+            _host_gate = None
+            try:
+                from gateway.dispatch_probe import load_gate as _load_gate
+                _host_gate = _load_gate()
+            except Exception as exc:
+                logger.debug("kanban dispatcher: host load gate unavailable (%s)", exc)
+                _host_gate = None
+            if isinstance(_host_gate, dict) and _host_gate.get("ok") is False:
+                logger.warning(
+                    "kanban dispatcher: host pressure — deferring new worker "
+                    "spawns this tick (%s)", _host_gate.get("reason", ""),
+                )
             # Mandatory-urgency sweep (Phase N): park unclassified `ready`
             # cards on EVERY board before the capacity check, so a task is
             # never left dispatchable merely because the fleet is at its cap
@@ -1852,7 +1897,7 @@ class GatewayKanbanWatchersMixin:
                 # "no_llm_dispatch": true (2026-09-17: the PCB autoroute loop).
                 if _board_no_llm_dispatch(slug):
                     continue
-                out.append((slug, _tick_once_for_board(slug)))
+                out.append((slug, _tick_once_for_board(slug, _host_gate)))
             return out
 
         def _ready_nonempty() -> bool:
@@ -2026,7 +2071,10 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
+                    _host_deferred = False
                     for slug, res in (results or []):
+                        if res is not None and getattr(res, "skipped_host_pressure", None):
+                            _host_deferred = True
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
                             # Quiet by default — only log when something actually
@@ -2045,7 +2093,14 @@ class GatewayKanbanWatchersMixin:
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
                     if ready_pending and not any_spawned:
-                        bad_ticks += 1
+                        # A tick deferred by the host-pressure gate is
+                        # intentional backpressure, not a stuck dispatcher —
+                        # don't accrue the "ready queue but 0 spawned" counter
+                        # (that would fire a false stuck warning under load).
+                        if _host_deferred:
+                            bad_ticks = 0
+                        else:
+                            bad_ticks += 1
                     else:
                         bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:

@@ -7779,6 +7779,16 @@ class DispatchResult:
     spawns; the ``urgency-triage`` classifier stamps a level and releases it.
     Empty when the board has no urgency column (pre-migration) or the gate
     is disabled."""
+    skipped_host_pressure: list[tuple[str, str]] = field(default_factory=list)
+    """Ready task ids deferred this tick by the host-pressure load gate
+    (Phase 2, 2026-09-30). Each entry is ``(task_id, reason)``.
+
+    The gate refuses the *ready* (new-worker) lane when ``/proc/pressure``
+    is above threshold or the end-to-end 5-token probe misses its SLO. The
+    host being busy is transient, NOT a task failure: the card stays
+    ``ready`` and is picked up unattended once the pressure clears. The
+    review lane is deliberately NOT gated — a review is on the critical
+    path, a fresh worker is not."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9431,6 +9441,54 @@ def _urgency_required_default() -> bool:
         return False
 
 
+def _host_pressure_event_throttle_seconds() -> int:
+    """Min seconds between ``host_pressure_deferred`` events for one task.
+
+    The dispatcher ticks as often as every ~30-120 s; without throttling a
+    board with a deep ready queue would emit one event per card per tick and
+    drown the timeline. Throttle window is env-overridable for tests
+    (``HERMES_HOST_PRESSURE_EVENT_THROTTLE_S``; ``0`` disables throttling).
+    """
+    try:
+        return max(0, int(os.environ.get("HERMES_HOST_PRESSURE_EVENT_THROTTLE_S", "600")))
+    except (TypeError, ValueError):
+        return 600
+
+
+def _emit_host_pressure_event(conn, task_id: str, reason: str) -> None:
+    """Record a VISIBLE ``host_pressure_deferred`` event on a deferred card.
+
+    The task stays ``ready`` (nothing to unblock), but the operator needs to
+    see the gate fire rather than a silent "0 workers spawned" tick. Throttled
+    per task so a deep queue cannot flood ``task_events``. Best-effort: a
+    logging failure must never break a dispatch tick.
+    """
+    if not task_id:
+        return
+    now = int(time.time())
+    window = _host_pressure_event_throttle_seconds()
+    if window > 0:
+        try:
+            row = conn.execute(
+                "SELECT created_at FROM task_events "
+                "WHERE task_id = ? AND kind = 'host_pressure_deferred' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None and (now - int(row[0] or 0)) < window:
+                return
+        except Exception:
+            pass
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "host_pressure_deferred",
+                {"reason": reason, "retry": "automatic when pressure clears"},
+            )
+    except Exception:
+        pass
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9446,6 +9504,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    host_pressure_gate: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9482,6 +9541,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             urgency_required=urgency_required,
+            host_pressure_gate=host_pressure_gate,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -9500,6 +9560,7 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
             urgency_required=urgency_required,
+            host_pressure_gate=host_pressure_gate,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -9522,6 +9583,7 @@ def _dispatch_once_locked(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
     urgency_required: Optional[bool] = None,
+    host_pressure_gate: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9623,6 +9685,34 @@ def _dispatch_once_locked(
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     spawned = 0
+
+    # ── Host-pressure gate (Phase 2, 2026-09-30) ──────────────────────────
+    # Refuse NEW worker spawns while the host is loaded (PSI above threshold
+    # or the end-to-end 5-token probe missed its SLO). Placement is the
+    # DISPATCHER, never the router: a router-side refusal fabricates the
+    # "all providers exhausted" 503 that already poisoned lane selection and
+    # price learning. The signal is consumed from the SAME headroom decision
+    # the gateway dispatcher already computes (``gateway.dispatch_probe`` /
+    # ``gateway.psi``) and passed in as ``host_pressure_gate``.
+    #
+    # Deliberately scoped to the READY (new-worker) lane ONLY. A review is on
+    # the critical path and MUST still complete with a verdict while the host
+    # is loaded (the 2026-09-30 acceptance criterion); a fresh worker is not.
+    # A busy host is transient, so the card is DEFERRED (left ``ready``) and
+    # NOT failed — no failure counter moves and the tick simply picks it up
+    # once the pressure clears. ``gate`` is None (default) or an ``ok`` dict
+    # → unchanged behaviour. Never gate in dry-run. Fail-open everywhere.
+    _host_gate_reason: Optional[str] = None
+    if (
+        isinstance(host_pressure_gate, dict)
+        and host_pressure_gate.get("ok") is False
+        and not dry_run
+    ):
+        _host_gate_reason = (
+            str(host_pressure_gate.get("reason") or "host pressure").strip()
+            or "host pressure"
+        )
+
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -9662,6 +9752,17 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        # Host-pressure gate: defer ALL new ready spawns this tick rather than
+        # hammer the loaded box. The card is left untouched (still `ready`) and
+        # one visible event records why — so the operator sees "host pressure,
+        # will resume" instead of a bare "0 spawned". No failure counter moves.
+        if _host_gate_reason is not None:
+            result.skipped_host_pressure.append((row["id"], _host_gate_reason))
+            try:
+                _emit_host_pressure_event(conn, row["id"], _host_gate_reason)
+            except Exception:
+                pass
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an

@@ -37,6 +37,21 @@ DEFAULT_POLICY: dict = {
     "critical_dimensions": ["memory_pct", "disk_used_pct", "swap_used_pct"],
     # Workers still allowed when only SOFT dimensions breach (e.g. CPU).
     "soft_floor": 1,
+    # ── PSI + loadavg emergency (Phase 2, 2026-09-30) ──
+    # Pressure Stall Information gauges. PSI measures the fraction of time
+    # tasks were *stalled* on a resource; unlike loadavg it does not count
+    # runnable-but-idle tasks and it is not blind to router queueing. A breach
+    # is a SOFT throttle unless the dimension is listed in
+    # ``critical_dimensions``. Values are PERCENT.
+    "psi_cpu_some_avg60_crit": 40.0,
+    "psi_cpu_some_avg60_soft": 20.0,
+    "psi_io_full_avg60_crit": 15.0,
+    "psi_io_full_avg60_soft": 8.0,
+    "psi_mem_some_avg300_crit": 10.0,
+    "psi_mem_some_avg300_soft": 5.0,
+    # loadavg/core emergency trip (the plan's last-resort signal).
+    "loadavg_per_core_crit": 6.0,
+    "loadavg_per_core_soft": 3.0,
 }
 
 
@@ -76,12 +91,27 @@ def resource_headroom(
     policy: dict,
     cores: int,
     kalman_warn: set | None = None,
+    *,
+    psi: dict | None = None,
+    loadavg: float | None = None,
 ) -> dict:
     """Map raw resource usage to per-dimension headroom (1.0 / 0.5 / 0.0).
 
     ``cpu_load`` is compared as load-per-core. A dimension at/above its
     *critical* threshold gives headroom 0.0, at/above *soft* (or predicted by
     the Kalman early-warning) gives 0.5, else 1.0.
+
+    ``psi`` (Phase 2, 2026-09-30): a PSI snapshot from
+    :func:`gateway.psi.psi_snapshot`. When present, three extra dimensions are
+    emitted — ``cpu_load_psi``, ``io_pressure``, ``memory_pressure`` — each a
+    banded 1.0 / 0.5 / 0.0 from the PSI gauges. A *measured* gauge of ``0.0``
+    maps to headroom 1.0 (an idle box), and an ABSENT gauge (``None``) emits no
+    dimension at all so the fold degrades to its previous shape rather than
+    inventing pressure. Without ``psi`` nothing extra is emitted (back-compat).
+
+    ``loadavg``: the 1-minute load average. When given, an extra
+    ``loadavg_per_core`` dimension bands on ``loadavg / cores`` against its own
+    soft/crit thresholds — the plan's emergency trip, independent of PSI.
     """
     kalman_warn = kalman_warn or set()
     cores = max(1, int(cores or 1))
@@ -114,7 +144,54 @@ def resource_headroom(
             per_dim[res] = 0.5
         else:
             per_dim[res] = 1.0
+
+    def _band(value, crit, soft):
+        v = _opt_float(value)
+        if v is None:
+            return None
+        if v >= crit:
+            return 0.0
+        if v >= soft:
+            return 0.5
+        return 1.0
+
+    if isinstance(psi, dict) and psi:
+        psi_bands = (
+            ("cpu_load_psi", psi.get("cpu_some_avg60"),
+             policy.get("psi_cpu_some_avg60_crit", 40.0),
+             policy.get("psi_cpu_some_avg60_soft", 20.0)),
+            ("io_pressure", psi.get("io_full_avg60"),
+             policy.get("psi_io_full_avg60_crit", 15.0),
+             policy.get("psi_io_full_avg60_soft", 8.0)),
+            ("memory_pressure", psi.get("mem_some_avg300"),
+             policy.get("psi_mem_some_avg300_crit", 10.0),
+             policy.get("psi_mem_some_avg300_soft", 5.0)),
+        )
+        for name, value, crit, soft in psi_bands:
+            band = _band(value, float(crit), float(soft))
+            if band is not None:
+                per_dim[name] = band
+
+    la = _opt_float(loadavg)
+    if la is not None:
+        band = _band(
+            la / cores,
+            _opt_float(policy.get("loadavg_per_core_crit")) or 6.0,
+            _opt_float(policy.get("loadavg_per_core_soft")) or 3.0,
+        )
+        if band is not None:
+            per_dim["loadavg_per_core"] = band
     return per_dim
+
+
+def _opt_float(value):
+    """float(value) or None on any failure (PSI gauges are ``None`` when unread)."""
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def board_sort_key(slug: str, now_count: int, priority: int) -> tuple:
