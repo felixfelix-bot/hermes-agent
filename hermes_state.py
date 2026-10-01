@@ -2207,6 +2207,35 @@ def is_zeroed_state_db(
     return all(byte == 0 for byte in head)
 
 
+def is_malformed_state_db(
+    path: Path, *, probe_bytes: int = 100, force: bool = False
+) -> bool:
+    """Detect a non-SQLite state.db header (zeroed OR clobbered in place).
+
+    Generalises the #68474 zeroed signature. Any non-empty file whose leading
+    bytes are not the SQLite magic is unopenable by SQLite. On 2026-09-30 a
+    manager ``state.db`` was overwritten in place with a non-SQLite payload
+    that was *not* all-NUL, so ``is_zeroed_state_db`` returned False, the DB
+    was opened anyway, and the gateway looped on ``file is not a database``
+    while its "full index rewrite" fallback kept failing. Same pre-connection
+    byte-probe safety rules as ``is_zeroed_state_db``.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(
+        path, length=max(16, probe_bytes), force=force
+    )
+    if not head:
+        return False
+    return not head.startswith(b"SQLite format 3")
+
+
 def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
     """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
 
@@ -2267,10 +2296,10 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
                 path,
             )
             return None
-        if not is_zeroed_state_db(path):
+        if not is_malformed_state_db(path):
             logger.info(
-                "quarantine_zeroed_state_db: %s is no longer zeroed (another "
-                "process quarantined it and a fresh DB was created)",
+                "quarantine_zeroed_state_db: %s is no longer malformed/zeroed "
+                "(another process quarantined it and a fresh DB was created)",
                 path,
             )
             return None
@@ -2764,14 +2793,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not read_only:
                 preflight_db_writability(self.db_path, db_label="state.db")
 
-            # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
-            # generic "file is not a database" with no recovery path. Quarantine
-            # the bytes (do not delete) and continue so a fresh DB can open;
-            # point the operator at pre-update snapshots.
+            # #68474 / 2026-09-30: a zeroed OR otherwise non-SQLite state.db
+            # (size>0, no "SQLite format 3" header) used to fail as a generic
+            # "file is not a database" with no recovery path. Quarantine the
+            # bytes (do not delete) and continue so a fresh DB can open; point
+            # the operator at pre-update snapshots. The 2026-09-30 manager
+            # incident overwrote the header with a non-NUL payload, so the
+            # check must cover any malformed header, not just all-NUL.
             if (
                 not read_only
                 and self.db_path.exists()
-                and is_zeroed_state_db(self.db_path)
+                and is_malformed_state_db(self.db_path)
             ):
                 try:
                     zsize = self.db_path.stat().st_size
@@ -2780,17 +2812,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 qpath = quarantine_zeroed_state_db(self.db_path)
                 snaps = self.db_path.parent / "state-snapshots"
                 msg = (
-                    f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
-                    f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
+                    f"state.db looks MALFORMED/ZEROED ({zsize} bytes, no SQLite "
+                    f"header). Preserved at {qpath or '(quarantine failed — file left in place)'}. "
                     f"Restore from {snaps} via `hermes snapshot list` / "
                     f"`hermes snapshot restore <id>` if available. "
                     "Opening a fresh empty database so the agent can start."
                 )
                 logger.error(msg)
                 _set_last_init_error(msg)
-                # If quarantine failed, do not open the zeroed file (would fail
-                # opaquely or risk further damage). Raise with the clear message.
-                if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
+                # If quarantine failed, do not open the malformed file (would
+                # fail opaquely or risk further damage). Raise with the clear
+                # message.
+                if qpath is None and self.db_path.exists() and is_malformed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
