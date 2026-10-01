@@ -152,3 +152,46 @@ def fold_target(
     if min_headroom <= 0.0:
         return max(0, int(soft_floor))
     return max(1, int(round(cap * min_headroom)))
+
+
+def reviewer_headroom(policy: dict | None = None) -> float:
+    """1.0 when the fleet has >=1 live cross-family reviewer lane, else 0.0.
+
+    Reads the cached probe written by ``~/.hermes/scripts/reviewer_readiness.py``
+    (refreshed by ``reviewer-readiness.timer`` every ~2 min). This lets the
+    dispatcher HOLD work when there is no way to review it: on 2026-09-30
+    workers were spawned, piled up load, and could not be cold-reviewed because
+    the reviewer families were dry (qwen3.5:397b had no lane).
+
+    Fail-open: a missing/stale probe or an unknown router answer returns 1.0, so
+    a broken sensor never wedges dispatch. Kill switch:
+    ``HERMES_REVIEWER_AWARE_DISPATCH=0``; per-policy opt-out:
+    ``reviewer_aware_dispatch: false``.
+    """
+    import json
+    import os
+    import time
+    from pathlib import Path
+
+    if os.environ.get("HERMES_REVIEWER_AWARE_DISPATCH", "1") == "0":
+        return 1.0
+    if isinstance(policy, dict) and policy.get("reviewer_aware_dispatch") is False:
+        return 1.0
+    try:
+        ttl = float(os.environ.get("HERMES_REVIEWER_READY_TTL_S", "900"))
+    except (TypeError, ValueError):
+        ttl = 900.0
+    p = Path.home() / ".hermes" / "bot" / "reviewer_readiness.json"
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return 1.0
+    try:
+        if time.time() - float(data.get("ts") or 0) > ttl:
+            return 1.0
+    except Exception:
+        return 1.0
+    if data.get("ready") is False:
+        return 0.0
+    return 1.0
+

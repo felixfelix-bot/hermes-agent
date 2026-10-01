@@ -382,10 +382,24 @@ def _compute_dispatch_headroom(
         logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
     per_dim["llm"] = llm_headroom
 
+    # ── 2b. Reviewer-aware gate (2026-09-30) ──
+    # Hold dispatch when NO cross-family reviewer lane is live, so we do not
+    # spawn workers whose DoD requires a cold review that cannot be obtained
+    # (the qwen3.5:397b "no lane" class). Fail-open on any sensor error.
+    try:
+        from gateway.dispatch_headroom import reviewer_headroom
+        per_dim["reviewer"] = reviewer_headroom(policy)
+    except Exception:
+        per_dim["reviewer"] = 1.0
+
     # ── 3. Fold to a target worker count (throttle, not binary) ──
-    critical_dims = policy.get("critical_dimensions") or (
+    critical_dims = list(policy.get("critical_dimensions") or (
         "memory_pct", "disk_used_pct", "swap_used_pct",
-    )
+    ))
+    # reviewer is HARD-critical only when we are sure no lane exists; a healthy
+    # probe leaves it as an ordinary (1.0) dimension with no effect.
+    if per_dim.get("reviewer", 1.0) <= 0.0:
+        critical_dims.append("reviewer")
     soft_floor = int(policy.get("soft_floor", 1))
     target = fold_target(per_dim, critical_dims, static_cap, soft_floor)
 
@@ -393,7 +407,11 @@ def _compute_dispatch_headroom(
     #       the LLM gate's text (the 2026-09-28 misreport). ──
     if per_dim:
         binding = min(per_dim, key=per_dim.get)
-        if per_dim[binding] < 1.0 and binding != "llm":
+        if binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
+            reason = "reviewer lane unavailable: no cross-family reviewer served"
+            if llm_reason:
+                reason += f"; llm: {llm_reason}"
+        elif per_dim[binding] < 1.0 and binding != "llm":
             reason = (
                 f"resource throttle: {binding} headroom {per_dim[binding]:.1f} "
                 f"(cpu_load={raw.get('cpu_load', 0.0):.1f} on {cores}c)"
