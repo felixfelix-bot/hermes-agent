@@ -95,19 +95,31 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
-def _cross_node_claim_allows(board: str, task_id: str) -> bool:
+def _cross_node_claim_allows(board: Optional[str], task_id: Optional[str]) -> bool:
     """Optional cross-node dispatch guard (ADR-013/9.2). Default: allow.
 
     When ``KANBAN_SPAWN_CLAIM_CMD`` is set, run it (``{board}``/``{task_id}``
     substituted) BEFORE spawning a worker. Exit 0 = this node won the claim
     (proceed); non-zero = a peer holds it (skip). Unset -> always allow.
     Fail-open on error: the guard must never wedge dispatch.
+
+    Identity-safe: the gateway/CLI tick path calls ``_dispatch_once_locked``
+    with ``board=None``, so a missing (or empty) board / task id must
+    short-circuit to ``True`` rather than reach the ``{board}`` substitution.
+    The whole body is inside the try/except so no unexpected failure --
+    including one raised while *building* the command -- can escape and kill
+    the dispatch tick (that is exactly how every tick died on 2026-10-02).
     """
-    tmpl = os.environ.get("KANBAN_SPAWN_CLAIM_CMD", "").strip()
-    if not tmpl:
-        return True
-    cmd = tmpl.replace("{board}", board).replace("{task_id}", task_id)
     try:
+        tmpl = os.environ.get("KANBAN_SPAWN_CLAIM_CMD", "").strip()
+        if not tmpl:
+            return True
+        if not board or not task_id:
+            # Nothing to claim on -> never wedge (board is None on the tick path).
+            return True
+        cmd = tmpl.replace("{board}", str(board)).replace(
+            "{task_id}", str(task_id)
+        )
         rc = subprocess.run(cmd, shell=True, timeout=15,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL).returncode
