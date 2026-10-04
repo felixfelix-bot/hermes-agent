@@ -472,11 +472,25 @@ class ZaiProfile(ProviderProfile):
         # only the endpoint (aux client) and any client that sets only the env
         # var. No session id, or a non-loopback endpoint → header omitted, so
         # an unattributed call is always preferable to a leaked one.
-        sid = (session_id or os.environ.get("HERMES_SESSION_ID") or "").strip()
-        if sid and _endpoint_is_loopback(base_url or self.base_url):
-            headers = dict(top_level.get("extra_headers") or {})
-            headers[_SESSION_HEADER] = sid
-            top_level["extra_headers"] = headers
+        # Emission is delegated to agent/session_attribution so that every
+        # provider pointed at the loopback router attributes identically — the
+        # zai-only implementation this replaces is exactly why deepseek (the
+        # fleet's actual provider) was unattributed. Loopback-only + fail-closed
+        # is enforced inside the shared helper.
+        try:
+            from agent.session_attribution import (
+                session_attribution_headers as _shared_attribution,
+            )
+
+            _merged_headers = _shared_attribution(
+                top_level.get("extra_headers"),
+                base_url=base_url or self.base_url,
+                session_id=session_id or os.environ.get("HERMES_SESSION_ID") or "",
+            )
+            if _merged_headers:
+                top_level["extra_headers"] = _merged_headers
+        except Exception:  # never let attribution break a request
+            pass
 
         return extra_body, top_level
 
