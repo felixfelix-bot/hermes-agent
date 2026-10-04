@@ -679,6 +679,21 @@ class ChatCompletionsTransport(ProviderTransport):
         )
         api_kwargs.update(top_level_from_profile)
 
+        # Session attribution (productivity-gate §1.4), provider-agnostic.
+        # The live router stamps api_calls.session_id from this header, so
+        # emitting it only from the ``zai`` profile left every other provider
+        # blind — and on this fleet the agents run deepseek/deepseek-flash,
+        # which meant ~100 % of inference (~$5.5/h, 586 calls/h, avg 83k-token
+        # prompts) was recorded with session_id NULL. Loopback-only and
+        # fail-closed; see agent/session_attribution.
+        from agent.session_attribution import apply_session_attribution
+
+        apply_session_attribution(
+            api_kwargs,
+            base_url=params.get("base_url"),
+            session_id=params.get("session_id"),
+        )
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 

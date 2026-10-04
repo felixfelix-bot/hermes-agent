@@ -6,6 +6,24 @@ token burn is attributed to a session, profile, or task. Rows written without it
 land as `caller='ua:OpenAI/Python 2.24.0'` with `session_id=NULL` — spend that
 no per-session report and no productivity gate can see.
 
+## Where the header is emitted (single source of truth)
+
+`agent/session_attribution.py` owns the header name, the loopback guard, and the
+merge. Two seams call it:
+
+| Seam | Covers |
+|------|--------|
+| `agent/transports/chat_completions.py` (`build_kwargs`) | every chat-completions provider: deepseek, zai, custom, relays |
+| `agent/auxiliary_client.py` (`_build_call_kwargs`, `_apply_attribution_headers`) | compression / title / vision / memory |
+
+`plugins/model-providers/zai` delegates to the same helper (it used to hold the
+only implementation, which is why the fleet's actual provider — `deepseek` — was
+unattributed).
+
+**Do not** put the header in client-level `default_headers`: the session id
+changes per turn, so a long-lived client would pin the first session's id and
+misattribute every later one. It is merged per request into `extra_headers`.
+
 ## Contract
 
 | Path | How the header is set |
