@@ -1024,6 +1024,91 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
+HERMES_SESSION_HEADER = "X-Hermes-Session"
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _endpoint_is_loopback(base_url: str | None) -> bool:
+    """True when ``base_url``'s host is literal loopback (never DNS-resolved).
+
+    ``X-Hermes-Session`` is an internal attribution channel: the proxy stamps
+    ``api_calls.session_id`` from it, and it must never leave the machine
+    (design doc §7 risk #5). A schemeless value is normalised so it cannot slip
+    past the guard, and unparseable input counts as non-loopback — fail closed,
+    never leak. Mirrors ``plugins/model-providers/zai``; kept local because
+    importing a plugin from core would invert the dependency.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "//" + raw
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(raw).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOOPBACK_HOSTS
+
+
+def _session_attribution_headers(
+    headers: dict | None = None, base_url: str | None = None
+) -> dict:
+    """Merge the ambient session id onto *headers* as ``X-Hermes-Session``.
+
+    The live router attributes every inference request to a session via the
+    ``X-Hermes-Session`` request header (``zai_proxy.py`` reads it into
+    ``_session_id``). The main agent turn already sends it — the zai provider
+    profile's ``build_api_kwargs_extras`` hook. Auxiliary calls (compression /
+    title / vision / memory) build their own client and previously relied on
+    the ``HERMES_SESSION_ID`` env fallback, which is wrong in a gateway process
+    that serves many sessions at once: the header was either absent or, worse,
+    attributed to whichever session had last exported it. Measured on the fleet
+    box 2026-10-03/04: ~2 600 calls / 213 Mtok in 6 h arrived as
+    ``caller='ua:OpenAI/Python ...'`` with ``session_id=NULL``, invisible to
+    per-session accounting and to the productivity gate.
+
+    The id comes from the context-local runtime published by
+    ``set_runtime_main``, so concurrent gateway sessions can never
+    cross-attribute. Loopback-only, like the profile hook. Returns a new dict;
+    never mutates the input.
+    """
+    merged: dict = dict(headers or {})
+    if merged.get(HERMES_SESSION_HEADER):
+        return merged
+    if not _endpoint_is_loopback(base_url):
+        return merged
+    try:
+        session_id = str(_runtime_main_value("session_id") or "").strip()
+    except Exception:
+        session_id = ""
+    if session_id:
+        merged[HERMES_SESSION_HEADER] = session_id
+    return merged
+
+
+def _apply_attribution_headers(
+    kwargs: dict,
+    extra_headers: Optional[Dict[str, str]] = None,
+    base_url: str | None = None,
+) -> dict:
+    """Attach the ambient session header to *kwargs*, keeping caller headers.
+
+    Callers passing their own ``extra_headers`` (e.g. Copilot's
+    ``x-initiator: user``) previously did ``kwargs["extra_headers"] =
+    dict(extra_headers)``, which overwrote whatever was already there — that
+    would silently drop the session header the profile hook had just set and
+    re-open the attribution hole. Merge instead.
+    """
+    merged = _session_attribution_headers(kwargs.get("extra_headers"), base_url)
+    if extra_headers:
+        merged.update(dict(extra_headers))
+    if merged:
+        kwargs["extra_headers"] = merged
+    return kwargs
+
+
 def _apply_user_default_headers(headers: dict | None) -> dict | None:
     """Merge user-configured ``model.default_headers`` onto resolved headers.
 
@@ -4555,8 +4640,8 @@ def _retry_same_provider_sync(
     # Preserve per-request attribution headers (e.g. Copilot's
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
-    if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    # Merge (not overwrite) so the session attribution header survives too.
+    _apply_attribution_headers(retry_kwargs, extra_headers, retry_base or resolved_base_url)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -4628,9 +4713,9 @@ async def _retry_same_provider_async(
         task=task,
     )
     # Preserve per-request attribution headers across the rebuilt-client
-    # retry — see the sync variant above (#60293).
-    if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    # retry — see the sync variant above (#60293). Merge so the session
+    # attribution header survives as well.
+    _apply_attribution_headers(retry_kwargs, extra_headers, retry_base or resolved_base_url)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -8290,6 +8375,10 @@ def _build_call_kwargs(
                     supports_reasoning=reasoning_config is not None,
                     model=model,
                     base_url=effective_base,
+                    # Context-local session id (never the process-wide env var):
+                    # the gateway runs many sessions in one process, so an env
+                    # fallback would cross-attribute or go missing entirely.
+                    session_id=_runtime_main_value("session_id") or None,
                 )
             )
             profile_reasoning_extra = profile_reasoning_extra or {}
@@ -8364,6 +8453,10 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
+    # Session attribution: every aux request must be attributable to the session
+    # that triggered it, exactly like the main turn. No-op when the provider
+    # profile above already set the header, or on a non-loopback endpoint.
+    _apply_attribution_headers(kwargs, base_url=base_url)
     return kwargs
 
 
@@ -9102,8 +9195,7 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+    _apply_attribution_headers(kwargs, extra_headers, _base_info or resolved_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
