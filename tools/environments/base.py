@@ -526,6 +526,30 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Per-execution identity markers that must ALSO never persist in the shared
+# snapshot (same shared-backend rationale as the session vars above).
+#
+# * ``HERMES_DELEGATED_CHILD_CONTEXT`` is set into a delegate_task child's
+#   command env by ``agent.delegation_context.scrub_kanban_env()`` while the
+#   child ContextVar is active, and is re-injected on every child command.
+# * ``HERMES_KANBAN_*`` is the dispatcher-owned worker identity, carried in the
+#   worker process env and re-injected on every command.
+#
+# Because they are re-injected per command, excluding them from the snapshot
+# loses nothing. Persisting them is a cross-session leak: a delegate child that
+# runs a terminal command in the shared "default" backend dumps the marker into
+# the snapshot, and every later session that sources it then fails the
+# ``kanban_db``/CLI guard with "delegate_task child contexts cannot mutate
+# Kanban tasks or boards" — a manager/operator chat made read-only for no
+# visible reason. These names match neither ``_VAR_MAP`` nor
+# ``_SNAPSHOT_EXCLUDED_ENV_REGEX``.
+_SNAPSHOT_EXCLUDED_IDENTITY_NAMES = (
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+)
+_SNAPSHOT_EXCLUDED_IDENTITY_PREFIXES = (
+    "HERMES_KANBAN_",
+)
+
 
 def _export_dump_excluding_session_vars(
     tmp_path: str,
@@ -563,6 +587,10 @@ def _export_dump_excluding_session_vars(
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
+    identity_names = " ".join(_SNAPSHOT_EXCLUDED_IDENTITY_NAMES)
+    identity_prefixes = " ".join(
+        f"${{!{prefix}*}}" for prefix in _SNAPSHOT_EXCLUDED_IDENTITY_PREFIXES
+    )
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
@@ -573,7 +601,8 @@ def _export_dump_excluding_session_vars(
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
         "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID {identity_names} {identity_prefixes}"
+        f"{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"

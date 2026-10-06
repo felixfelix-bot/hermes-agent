@@ -13,16 +13,28 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
 CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
 ``tools/environments/base.py``; they are re-injected fresh on every command.
+
+The same shared-snapshot leak applies to the per-execution *identity* markers:
+``HERMES_DELEGATED_CHILD_CONTEXT`` (set into a delegate child's command env by
+``agent.delegation_context.scrub_kanban_env()``) and ``HERMES_KANBAN_*``. A
+delegate child that runs one terminal command in the shared "default" backend
+dumped the marker into the snapshot, after which every later manager/operator
+session that sourced it failed the kanban mutation guard
+("delegate_task child contexts cannot mutate Kanban tasks or boards"). Those
+names are now stripped from the dump as well.
 """
 
 import os
 import re
+import shlex
 import sys
 
 import pytest
 
 from tools.environments.base import (
     _SNAPSHOT_EXCLUDED_ENV_REGEX,
+    _SNAPSHOT_EXCLUDED_IDENTITY_NAMES,
+    _SNAPSHOT_EXCLUDED_IDENTITY_PREFIXES,
     _export_dump_excluding_session_vars,
 )
 
@@ -50,6 +62,13 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    # Per-execution identity markers are stripped too (delegation + kanban).
+    for name in _SNAPSHOT_EXCLUDED_IDENTITY_NAMES:
+        assert name in snippet, f"{name} should be excluded from the snapshot"
+    for prefix in _SNAPSHOT_EXCLUDED_IDENTITY_PREFIXES:
+        assert f"${{!{prefix}*}}" in snippet, (
+            f"{prefix}* should be excluded from the snapshot"
+        )
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -106,3 +125,41 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
                 assert "HERMES_SESSION_ID" not in f.read()
     finally:
         env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Unit: the identity-marker leak (delegation + kanban) is stripped from the dump.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_delegation_and_kanban_markers_not_persisted(tmp_path):
+    """A delegate child's env must not survive into the shared snapshot.
+
+    Reproduces the 2026-10-06 incident: a delegate child that runs a terminal
+    command in the shared "default" backend dumps
+    ``HERMES_DELEGATED_CHILD_CONTEXT=1`` (and any ``HERMES_KANBAN_*``) into the
+    snapshot; every later non-child session that sources it then fails the
+    kanban mutation guard.
+    """
+    import subprocess
+
+    snap = tmp_path / "hermes-snap.sh"
+    snippet = _export_dump_excluding_session_vars(shlex.quote(str(snap)))
+    script = "\n".join([
+        "export HERMES_DELEGATED_CHILD_CONTEXT=1",
+        "export HERMES_KANBAN_TASK=t_deadbeef",
+        "export HERMES_KANBAN_BOARD=auditable-voting",
+        "export HERMES_KANBAN_RUN_ID=run-1",
+        "export USER_SHELL_STATE=keepme",
+        snippet,
+    ])
+    subprocess.run(["bash", "-c", script], check=True)
+
+    body = snap.read_text()
+    # Identity markers must not persist...
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in body
+    assert "HERMES_KANBAN_TASK" not in body
+    assert "HERMES_KANBAN_BOARD" not in body
+    assert "HERMES_KANBAN_RUN_ID" not in body
+    # ...but genuine user shell state must.
+    assert "USER_SHELL_STATE" in body
