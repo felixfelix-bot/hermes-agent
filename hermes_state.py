@@ -2725,6 +2725,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Set True by close(). Distinguishes an intentional shutdown from a
+        # lost/never-opened connection, so the write path's reopen hook never
+        # resurrects a connection the caller deliberately closed.
+        self._closed = False
+        # Bound opener captured in __init__ (see _connect_and_init_with_lock_
+        # patience) so _execute_write can reopen a lost connection in place
+        # without duplicating the schema-init logic. None until __init__ sets it.
+        self._reopen_conn = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -2885,6 +2893,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                 max(deadline - now, 0.001),
                             )
                         )
+
+            # Expose the opener to the write path so a lost connection can be
+            # reopened in place (_reopen_or_raise). Set before the first connect
+            # so it is present even if this open fails.
+            self._reopen_conn = _connect_and_init_with_lock_patience
 
             try:
                 _connect_and_init_with_lock_patience()
@@ -3376,6 +3389,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _reopen_or_raise(self) -> None:
+        """Ensure the writer connection is usable, reopening it if it was lost.
+
+        A transient init failure can leave ``self._conn is None``; ``close()``
+        can null it during shutdown while a turn is still appending. Before
+        2026-10-06 that surfaced as an opaque
+        ``'NoneType' object has no attribute 'execute'`` from
+        ``_execute_write``/``append_message`` — aborting the operator's turn.
+        Now we reopen once when possible and otherwise raise a clear
+        OperationalError (a retryable class callers already handle).
+        """
+        if self._conn is not None:
+            return
+        if getattr(self, "_closed", False):
+            raise sqlite3.OperationalError(
+                "state.db connection is closed (session store shut down)"
+            )
+        if self.read_only:
+            raise sqlite3.OperationalError(
+                "state.db read-only connection is unavailable"
+            )
+        opener = getattr(self, "_reopen_conn", None)
+        if opener is not None:
+            try:
+                opener()
+            except Exception:
+                logger.warning("state.db reconnect failed", exc_info=True)
+        if self._conn is None:
+            raise sqlite3.OperationalError(
+                "state.db connection is unavailable (reopen failed)"
+            )
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -3423,6 +3468,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return "no more rows available" in str(exc).lower()
 
         while True:
+            # Reopen a lost/closed connection before touching self._conn; this
+            # prevents the opaque NoneType AttributeError and turns a shutdown
+            # race into a clear OperationalError.
+            self._reopen_or_raise()
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -3723,6 +3772,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 break
             self._close_read_conn(conn)
         with self._lock:
+            # Mark closed before nulling the connection so a concurrent writer
+            # that lost the lock race raises a clear OperationalError instead of
+            # hitting a NoneType AttributeError or reopening after shutdown.
+            self._closed = True
             if self._conn:
                 if not self.read_only:
                     try:
