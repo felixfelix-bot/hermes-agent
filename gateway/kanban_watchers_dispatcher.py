@@ -135,7 +135,11 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        from gateway.dispatch_headroom import board_sort_key
+        return sorted(
+            _board_slugs(self.kb),
+            key=lambda b: board_sort_key(b, _board_now_count(b), _board_dispatch_priority(b)),
+        )
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         path = self.kb.kanban_db_path(slug)
@@ -177,6 +181,8 @@ class _KanbanDispatcher:
         The per-board DB is opened explicitly so boards never share a
         connection or claim across each other.
         """
+        if _board_no_llm_dispatch(slug):
+            return None
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
@@ -502,3 +508,41 @@ def _compute_dispatch_headroom(
     except Exception:
         pass
     return result
+
+
+def _board_no_llm_dispatch(slug: str) -> bool:
+    """True when a board opts out of LLM worker dispatch (board.json ``no_llm_dispatch``)."""
+    try:
+        import json as _json
+        from hermes_constants import get_hermes_home
+        bj = get_hermes_home() / "kanban" / "boards" / slug / "board.json"
+        return bool((_json.loads(bj.read_text(encoding="utf-8")) or {}).get("no_llm_dispatch"))
+    except Exception:
+        return False
+
+
+def _board_dispatch_priority(slug: str) -> int:
+    """Board scheduling priority from board.json ``dispatch_priority`` (higher first)."""
+    try:
+        import json as _json
+        from hermes_constants import get_hermes_home
+        bj = get_hermes_home() / "kanban" / "boards" / slug / "board.json"
+        return int((_json.loads(bj.read_text(encoding="utf-8")) or {}).get("dispatch_priority") or 0)
+    except Exception:
+        return 0
+
+
+def _board_now_count(slug: str) -> int:
+    """Count of ready+'now' tasks on a board (priority tiebreak input; fail-open 0)."""
+    conn = None
+    try:
+        conn = _kbc().connect(board=slug)
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='ready' AND urgency='now'"
+        ).fetchone()[0])
+    except Exception:
+        return 0
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
