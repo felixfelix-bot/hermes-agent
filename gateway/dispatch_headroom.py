@@ -37,6 +37,13 @@ DEFAULT_POLICY: dict = {
     "critical_dimensions": ["memory_pct", "disk_used_pct", "swap_used_pct"],
     # Workers still allowed when only SOFT dimensions breach (e.g. CPU).
     "soft_floor": 1,
+    # D-128 §8.2 fail-open-on-timeout: when the LLM price/quota gate
+    # (/v1/dispatch_gate on the router) is UNAVAILABLE (timeout, refused
+    # connection, garbled answer) — as opposed to answering "no" — dispatch
+    # continues under this conservative cap instead of hard-zeroing. 1 worker
+    # keeps one board moving (and lets the gate recover on the next probe)
+    # without spawning the fleet into an un-evaluated pool.
+    "llm_gate_timeout_cap": 1,
 }
 
 
@@ -152,6 +159,34 @@ def fold_target(
     if min_headroom <= 0.0:
         return max(0, int(soft_floor))
     return max(1, int(round(cap * min_headroom)))
+
+
+def llm_gate_degraded_headroom(per_dim: dict, policy: dict | None = None,
+                               static_cap: int | None = None) -> dict:
+    """Per-dimension view after an UNAVAILABLE llm gate (D-128 §8.2).
+
+    Called when the /v1/dispatch_gate probe timed out / could not be reached
+    (NOT when it answered ``can_dispatch: false`` — an answer is a verdict and
+    must hold). Returns a copy with ``llm`` pinned at 1.0 (an unavailable
+    sensor never blocks) plus the marker dimension ``llm_gate_degraded`` whose
+    headroom is the ratio of the conservative ``llm_gate_timeout_cap`` to the
+    effective static cap — so :func:`fold_target` (called with the same
+    ``static_cap``) lands exactly on the conservative cap instead of the full
+    one.
+
+    A real resource hold still hard-zeroes: only the gate dimension is
+    de-rated (see the unit tests for the memory-hold case).
+    """
+    policy = policy or DEFAULT_POLICY
+    out = dict(per_dim or {})
+    out["llm"] = 1.0  # unknown != "no": never let a silent sensor hold boards
+    try:
+        cap_n = int(static_cap) if static_cap and int(static_cap) >= 1 else 3
+        timeout_cap = max(1, int(policy.get("llm_gate_timeout_cap", 1) or 1))
+        out["llm_gate_degraded"] = timeout_cap / cap_n
+    except (TypeError, ValueError):
+        out["llm_gate_degraded"] = 1.0 / 3
+    return out
 
 
 def reviewer_headroom(policy: dict | None = None) -> float:
