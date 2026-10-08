@@ -26,9 +26,17 @@ from gateway.kanban_watchers_common import (
 )
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.kanban_watchers_dispatcher import (
+    RECLAIM_BACKOFF_BASE_S,
+    RECLAIM_BACKOFF_MAX_S,
+    RECLAIM_BLOCK_AFTER,
     _KanbanDispatcher,
+    _load_reclaim_backoff,
     _log_spawn_results,
+    _reclaim_backoff_path,
+    _reclaim_backoff_seconds,
     _resolve_dispatcher_settings,
+    _save_reclaim_backoff,
+    _strike_dead_pid_workers,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
