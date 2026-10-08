@@ -8,6 +8,7 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import sqlite3
 import time
@@ -222,6 +223,13 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+        # Reclaim-loop breaker: strike dead-pid workers EVERY tick, deliberately
+        # outside the capacity guard, so an immediately-dying worker is blocked
+        # (exponential backoff, hard-block after N) instead of respawning forever.
+        try:
+            _strike_dead_pid_workers(self.kb, [{"slug": b} for b in self._board_slugs()])
+        except Exception:
+            logger.debug("dead-pid strike pass failed", exc_info=True)
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
@@ -546,3 +554,152 @@ def _board_now_count(slug: str) -> int:
         if conn is not None:
             with contextlib.suppress(Exception):
                 conn.close()
+
+
+RECLAIM_BACKOFF_BASE_S = 300          # 5 minutes
+RECLAIM_BACKOFF_MAX_S = 3600          # 1 hour ceiling
+RECLAIM_BLOCK_AFTER = 3               # dead-pid reclaims before a hard block
+
+def _reclaim_backoff_path() -> Path:
+    """Profile-safe path for the strike/backoff ledger (resolved per call)."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "bot" / "reclaim_backoff.json"
+
+
+def _load_reclaim_backoff() -> dict:
+    try:
+        data = json.loads(_reclaim_backoff_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_reclaim_backoff(data: dict) -> None:
+    try:
+        path = _reclaim_backoff_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _reclaim_backoff_seconds(strikes: int) -> int:
+    """Exponential backoff for the Nth dead-pid reclaim (5m, 10m, 20m, ...)."""
+    return min(RECLAIM_BACKOFF_BASE_S * (2 ** max(strikes - 1, 0)),
+               RECLAIM_BACKOFF_MAX_S)
+
+
+def _strike_dead_pid_workers(kb, boards, *, pid_alive=None, now_fn=None,
+                             grace_seconds=None) -> list[str]:
+    """Strike dead-pid workers: backoff-block them, hard-block after N strikes.
+
+    Runs on **every** dispatcher tick, deliberately *outside* the
+    ``running >= target`` deadlock guard. The pass originally lived inside that
+    guard (commit ``10bbb0a8d8``), which left the breaker inert exactly when it
+    was needed: with the fleet below its capacity target the guard never opened,
+    so dead workers fell through to the per-board ``dispatch_once`` ->
+    ``detect_crashed_workers`` path, which re-readies the card as ``crashed``
+    and (by design) clears ``consecutive_failures``. A card whose worker dies
+    immediately was therefore re-spawned every tick forever and never accrued a
+    single strike — and because the failure counter stayed clean, no other
+    breaker saw it either (``fleet_loop_guard`` reported "no looping cards"
+    while the digest showed the card burning worker slots).
+
+    Two guards, both mirroring ``kanban_db.detect_crashed_workers``, keep the
+    now-per-tick pass from striking *healthy* workers:
+
+    * **host-local claims only** — ``worker_pid`` from another host's claim is
+      meaningless here, because ``_pid_alive`` is a local probe;
+    * **launch-window grace** — ``/proc`` visibility can transiently report a
+      freshly forked worker as dead. Measured from ``tasks.started_at`` (the
+      first time the task ever started), exactly as
+      ``detect_crashed_workers`` does; measuring from the *current run* would
+      reset the grace on every re-spawn and neuter the breaker for the
+      fast-crash loop it exists to stop.
+
+    Returns the ids it acted on (struck or hard-blocked). Fail-open per board:
+    a board that raises is skipped, never fatal to the tick.
+    """
+    acted: list[str] = []
+    if not boards:
+        return acted
+    alive_fn = pid_alive or getattr(kb, "_pid_alive", None)
+    if alive_fn is None:
+        return acted
+    if now_fn is None:
+        now_fn = time.time
+    if grace_seconds is None:
+        resolve_grace = getattr(kb, "_resolve_crash_grace_seconds", None)
+        try:
+            grace_seconds = (
+                int(resolve_grace()) if resolve_grace is not None
+                else int(getattr(kb, "DEFAULT_CRASH_GRACE_SECONDS", 30))
+            )
+        except Exception:
+            grace_seconds = 30
+    try:
+        host_prefix = f"{kb._claimer_id().split(':', 1)[0]}:"
+    except Exception:
+        host_prefix = ""
+    now = now_fn()
+    ledger = _load_reclaim_backoff()
+    dirty = False
+    for board in boards:
+        slug = (board or {}).get("slug") or kb.DEFAULT_BOARD
+        conn = None
+        try:
+            conn = kb.connect(board=slug)
+            rows = conn.execute(
+                "SELECT id, worker_pid, claim_lock, started_at "
+                "FROM tasks WHERE status='running'"
+            ).fetchall()
+            for row in rows:
+                tid, wpid = row[0], row[1]
+                lock = row[2] or ""
+                started = row[3]
+                if not wpid:
+                    continue
+                if host_prefix and not lock.startswith(host_prefix):
+                    continue
+                if (started is not None and grace_seconds > 0
+                        and now - int(started) < grace_seconds):
+                    continue
+                if alive_fn(wpid):
+                    continue
+                entry = ledger.get(tid) or {}
+                strikes = int(entry.get("count", 0)) + 1
+                if strikes >= RECLAIM_BLOCK_AFTER:
+                    kb.block_task(
+                        conn, tid,
+                        reason=(f"reclaim loop: worker died {strikes}x "
+                                f"(dispatcher guard) — auto-blocked; "
+                                f"needs human"),
+                    )
+                    ledger.pop(tid, None)
+                    logger.warning(
+                        "kanban reclaim-loop breaker: hard-blocked %s "
+                        "(worker died %dx)", tid, strikes)
+                else:
+                    until = now + _reclaim_backoff_seconds(strikes)
+                    kb.block_task(
+                        conn, tid,
+                        reason=(f"reclaim backoff until {int(until)} "
+                                f"(dead worker pid, strike {strikes})"),
+                    )
+                    ledger[tid] = {"count": strikes, "until": until,
+                                   "board": slug}
+                acted.append(tid)
+                dirty = True
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    if dirty:
+        _save_reclaim_backoff(ledger)
+    return acted
