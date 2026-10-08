@@ -27,6 +27,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms.webhook import _UNTRUSTED_PREAMBLE, _sanitize_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +406,15 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
         )
 
     def _render_prompt(self, notification: Dict[str, Any]) -> str:
+        """Render notification content for the agent.
+
+        Security — MS Graph change notifications carry mailbox-derived data
+        (e.g. email subjects/bodies surfaced in ``resourceData``), which is
+        attacker-controllable. Every rendered value is sanitized
+        (``_sanitize_untrusted``); the rendered prompt is then enclosed in a
+        single ``<untrusted>`` frame with a preamble, mirroring the generic
+        webhook adapter's agent mode (see ``WebhookAdapter._render_prompt``).
+        """
         template = self.config.extra.get("prompt", "")
         if template:
             payload = {
@@ -413,9 +423,17 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
                 "change_type": notification.get("changeType", ""),
                 "subscription_id": notification.get("subscriptionId", ""),
             }
-            return self._render_template(template, payload)
-        rendered = json.dumps(notification, indent=2, sort_keys=True)[:4000]
-        return f"Microsoft Graph change notification:\n\n```json\n{rendered}\n```"
+            rendered = self._render_template(template, payload)
+        else:
+            rendered = (
+                "Microsoft Graph change notification:\n\n```json\n"
+                f"{_sanitize_untrusted(json.dumps(notification, indent=2, sort_keys=True)[:4000])}"
+                "\n```"
+            )
+        return (
+            f"{_UNTRUSTED_PREAMBLE}\n\n"
+            f"<untrusted>\n{rendered}\n</untrusted>"
+        )
 
     def _render_template(self, template: str, payload: Dict[str, Any]) -> str:
         import re
@@ -429,8 +447,10 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
                 else:
                     return f"{{{key}}}"
             if isinstance(value, (dict, list)):
-                return json.dumps(value, sort_keys=True)[:2000]
-            return str(value)
+                rendered = json.dumps(value, sort_keys=True)[:2000]
+            else:
+                rendered = str(value)
+            return _sanitize_untrusted(rendered)
 
         return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _resolve, template)
 
