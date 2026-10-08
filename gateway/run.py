@@ -654,8 +654,69 @@ def _rate_limit_reply(text: str) -> str:
             "Use /retry after that, or /model to switch models.")
 
 
+def _capacity_outage_notice() -> str:
+    """Option-C throttle (Phase K3) for capacity-outage notices.
+
+    Source of truth: the proxy's ``.capacity_outage`` sentinel (start ts) — set
+    while NO lane has remaining headroom, cleared on recovery. While present we
+    emit ONE notice then suppress repeats except a re-notify every
+    ``provider_failure_re_notify_hours`` (default 6h). "" suppresses the message.
+    """
+    try:
+        from pathlib import Path as _P
+        import time as _t, json as _j
+        bot = _P.home() / ".hermes" / "bot"
+        sentinel = bot / ".capacity_outage"
+        if not sentinel.exists():
+            return (
+                "\u26a0\ufe0f The model provider failed after retries. I kept raw provider "
+                "details out of chat; check gateway logs for diagnostics."
+            )
+        try:
+            started = int(sentinel.read_text().strip() or "0")
+        except Exception:
+            started = 0
+        hours = 6.0
+        try:
+            import yaml as _y
+            cfg = _y.safe_load((_P.home() / ".hermes" / "config.yaml").read_text()) or {}
+            hours = float((cfg.get("notifications") or {}).get(
+                "provider_failure_re_notify_hours", 6))
+        except Exception:
+            pass
+        state_f = bot / ".capacity_notice_state.json"
+        try:
+            st = _j.loads(state_f.read_text())
+        except Exception:
+            st = {}
+        now = _t.time()
+        last = float(st.get("last_notice_ts", 0) or 0)
+        stale = hours * 3600
+        if last and (now - last) < stale:
+            return ""  # suppressed (same outage window)
+        st["last_notice_ts"] = now
+        st["outage_started"] = started
+        try:
+            state_f.write_text(_j.dumps(st))
+        except Exception:
+            pass
+        if started:
+            began = _t.strftime("%Y-%m-%d %H:%M", _t.localtime(started))
+            return (f"\u26a0\ufe0f Model capacity outage started {began} \u2014 holding reviews + "
+                    "agent jobs until capacity returns (no repeats; digest on recovery).")
+        return ("\u26a0\ufe0f Model capacity outage \u2014 holding reviews + agent jobs until "
+                "capacity returns (no repeats; digest on recovery).")
+    except Exception:
+        return (
+            "\u26a0\ufe0f The model provider failed after retries. I kept raw provider "
+            "details out of chat; check gateway logs for diagnostics."
+        )
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
+    if "all providers exhausted" in (text or "").lower():
+        return _capacity_outage_notice()
     for pattern, reply in _PROVIDER_ERROR_REPLIES:
         if pattern.search(text):
             return _rate_limit_reply(text) if pattern is _GATEWAY_RATE_LIMIT_RE else reply
