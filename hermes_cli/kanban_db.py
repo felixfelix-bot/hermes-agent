@@ -4530,6 +4530,7 @@ _PLUGIN_COMPAT_LAZY = {
     'add_notify_sub': ('hermes_cli.kanban_db_notify', 'add_notify_sub'),
     'advance_notify_cursor': ('hermes_cli.kanban_db_notify', 'advance_notify_cursor'),
     'check_respawn_guard': ('hermes_cli.kanban_db_dispatch', 'check_respawn_guard'),
+    '_cross_node_claim_allows': ('hermes_cli.kanban_db_dispatch', '_cross_node_claim_allows'),
     'claim_unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'claim_unseen_events_for_sub'),
     'configured_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'configured_max_in_progress'),
     'connect': ('hermes_cli.kanban_db_connect', 'connect'),
