@@ -8637,6 +8637,115 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+# ---------------------------------------------------------------------------
+# Silent death — a worker that exited cleanly without ever reaching the model
+# ---------------------------------------------------------------------------
+#
+# ``clean_exit`` (rc=0, no terminal kanban call) is overwhelmingly "the work
+# succeeded, the paperwork was skipped": the model answered and simply forgot
+# ``kanban_complete``, so a retry usually lands it. There is a second, rarer
+# population with the same exit signature and the OPPOSITE prognosis: the
+# worker never produced a single assistant message because its FIRST API call
+# failed fatally — e.g. a profile whose ``config.yaml`` vanished so
+# ``model.default`` resolves empty and the provider answers
+# ``HTTP 400: No models provided`` (2026-09-27: 6 manager decision cards). No
+# retry can fix that, and the generic violation sentence above
+# ("If the prior run already did the work, verify it…") actively misleads the
+# next worker and the operator reading the board.
+#
+# The two are told apart by the per-task worker log, which the CLI writes on
+# every run: a silent death leaves a run block whose session summary reports a
+# single message (the worker prompt itself — no assistant turn) and zero tool
+# calls, next to a fatal non-retryable API error. Both signals are required, so
+# a run that genuinely used the model can never be misclassified.
+_SILENT_DEATH_BLOCK_KIND = "capability"
+
+# How much of the tail of the worker log to scan. A silent-death run block is
+# a few KB (the failure is printed immediately); anything that took more than
+# this much output certainly reached the model, and the block-header guard
+# below makes that case return None instead of analysing a partial block.
+_SILENT_DEATH_SCAN_BYTES = 256 * 1024
+
+# Each worker run starts a fresh CLI session and its log block with the prompt
+# the dispatcher passed it ("Query: work kanban task t_…"). The log is
+# append-only across attempts, so the LAST header scopes the scan to the most
+# recent run and stale evidence can neither create nor mask a silent death.
+_WORKER_RUN_HEADER_RE = re.compile(r"^Query:", re.M)
+
+# "Messages:       1 (1 user, 0 tool calls)" — printed by `hermes chat -q` at
+# the end of every run.
+_SESSION_SUMMARY_RE = re.compile(
+    r"Messages:\s+(\d+)\s+\((\d+)\s+user,\s*(\d+)\s+tool calls?\)"
+)
+
+# The CLI's fatal-API-failure lines: the "📝 Error:" detail and the
+# "❌ Non-retryable error (HTTP 400):" summary. Retryable failures that later
+# succeed also print these, which is why the session summary must agree.
+_FATAL_API_ERROR_RE = re.compile(
+    r"(?:📝\s*Error:|Non-retryable error \([^)]*\):)\s*(\S[^\r\n]*)"
+)
+
+# "🔌 Provider: openrouter  Model: " — the model is empty when routing broke.
+_PROVIDER_MODEL_RE = re.compile(r"Provider:\s*(\S+)\s+Model:\s*([^\r\n]*)")
+
+
+def _silent_death_reason(
+    task_id: str, board: Optional[str] = None,
+) -> Optional[str]:
+    """Return why the task's last run died before its first API reply.
+
+    ``None`` unless the worker log PROVES the run never completed a successful
+    API call: a fatal first-call error AND a session summary of one message and
+    zero tool calls (i.e. the transcript holds only the worker prompt — the
+    model never replied). Used to say something useful on the card instead of
+    parking it in ``blocked`` with no reason at all.
+    """
+    log = read_worker_log(
+        task_id, tail_bytes=_SILENT_DEATH_SCAN_BYTES, board=board,
+    )
+    if not log:
+        return None
+    starts = [m.start() for m in _WORKER_RUN_HEADER_RE.finditer(log)]
+    if not starts:
+        # No run header in the scanned window: either the log is not a worker
+        # CLI log, or the last run is long enough that the model clearly ran.
+        # Either way there is nothing to conclude — stay silent.
+        return None
+    block = log[starts[-1]:]
+
+    summaries = _SESSION_SUMMARY_RE.findall(block)
+    if not summaries:
+        return None
+    messages, _users, tool_calls = (int(v) for v in summaries[-1])
+    if messages > 1 or tool_calls != 0:
+        return None
+
+    errors = _FATAL_API_ERROR_RE.findall(block)
+    if not errors:
+        return None
+    error = errors[-1].strip()
+    providers = _PROVIDER_MODEL_RE.findall(block)
+    provider, model = providers[-1] if providers else ("unknown", "")
+    model = model.strip() or "(unset)"
+    return (
+        f"the run never completed a successful API call — it failed on its "
+        f"first one with \"{error}\" (provider={provider.strip()}, "
+        f"model={model}) and the session ended after {messages} message, "
+        f"0 tool calls"
+    )
+
+
+def _silent_death_block_reason(reason: str, assignee: Optional[str]) -> str:
+    """Task-facing wording for the ``blocked`` event of a silent death."""
+    profile = assignee or "default"
+    return (
+        f"worker never reached the model: {reason}. This is a profile/config "
+        f"failure, not a task failure — fix `hermes -p {profile} config show` "
+        f"(model.default must resolve) before unblocking; a retry cannot "
+        f"succeed while it is broken."
+    )
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -8673,8 +8782,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, Optional[str], str]] = []
+    # (task_id, pid, claimer, protocol_violation, silent_death, error_text)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8700,6 +8809,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            silent_death: Optional[str] = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8709,14 +8819,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
+                # Distinguish "the model answered but forgot the terminal
+                # kanban call" from "the run never reached the model at all"
+                # (broken profile model routing). The latter cannot be fixed by
+                # retrying and needs a reason on the card, not the generic
+                # verify-the-work guidance (t_ba78cd4e).
+                silent_death = _silent_death_reason(row["id"])
+                if silent_death:
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation, "
+                        f"but {silent_death}. A retry cannot succeed until "
+                        "the worker profile's model routing is fixed."
+                    )
+                else:
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation. "
+                        "If the prior run already did the work, verify it and "
+                        "report the result via kanban_complete; a run that ends "
+                        "without a terminal kanban call counts as failed no "
+                        "matter what it did."
+                    )
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
@@ -8727,6 +8851,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
+                if silent_death:
+                    event_payload["silent_death"] = True
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -8813,7 +8939,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, silent_death, error_text)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -8835,10 +8961,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, _, err_text in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, silent_death, error_text in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8875,15 +9001,39 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
+                    # A silent death is auto-blocked with a typed reason so the
+                    # card says WHY (and the operator can tell it apart from a
+                    # worker that simply parked the card). Ordinary violations
+                    # keep the historical untyped block.
+                    block_kind=_SILENT_DEATH_BLOCK_KIND if silent_death else None,
                     event_payload_extra={
                         "pid": pid,
                         "claimer": claimer,
                         "protocol_violations": streak,
                         "protocol_violation_limit": violation_limit,
+                        **({"silent_death": True} if silent_death else {}),
                     },
                 )
                 if tripped:
                     auto_blocked.append(tid)
+                    if silent_death:
+                        # ``gave_up`` alone renders as raw key=value on the
+                        # board; a ``blocked`` event carries the human-readable
+                        # ``reason`` the dashboard, `kanban show` and the
+                        # stuck-in-blocked diagnostic surface (t_ba78cd4e).
+                        arow = conn.execute(
+                            "SELECT assignee FROM tasks WHERE id = ?", (tid,),
+                        ).fetchone()
+                        _append_event(conn, tid, "blocked", {
+                            "reason": _silent_death_block_reason(
+                                silent_death,
+                                arow["assignee"] if arow is not None else None,
+                            ),
+                            "kind": _SILENT_DEATH_BLOCK_KIND,
+                            "auto": True,
+                            "trigger": "silent_death",
+                            "protocol_violations": streak,
+                        })
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
@@ -8920,6 +9070,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8948,6 +9099,12 @@ def _record_task_failure(
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
+
+    ``block_kind`` (optional) stamps the record kind on the auto-block so the
+    card carries a machine-readable reason alongside ``last_failure_error``.
+    Without it an auto-blocked card keeps ``block_kind = NULL``, which is
+    indistinguishable from a card a worker parked without saying why
+    (t_ba78cd4e).
 
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
@@ -9052,6 +9209,15 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
+            if block_kind:
+                # ``blocked`` on its own records no reason — the reason column
+                # lives on the task (``block_kind``). Stamp it with the same
+                # transaction that flips the status so the two can't diverge.
+                conn.execute(
+                    "UPDATE tasks SET block_kind = ? WHERE id = ?",
+                    (block_kind, task_id),
+                )
+                payload["block_kind"] = block_kind
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
