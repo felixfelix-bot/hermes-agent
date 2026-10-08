@@ -182,6 +182,14 @@ class _KanbanDispatcher:
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # Multi-dimensional dispatch headroom (config-as-code): CPU is SOFT,
+        # memory/disk/swap HARD; the LLM and reviewer gates fold in. The target
+        # worker count overrides the static cap for this tick (fail-open to the cap).
+        try:
+            _hr = _compute_dispatch_headroom(self.settings.max_in_progress)
+            kwargs["max_in_progress"] = _hr.get("target_workers")
+        except Exception:
+            logger.debug("dispatch headroom unavailable", exc_info=True)
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -334,3 +342,163 @@ def _log_spawn_results(results: Optional[list]) -> bool:
                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
             )
     return any_spawned
+
+
+def _compute_dispatch_headroom(
+    static_cap: "Optional[int]" = None,
+) -> dict:
+    """Compute multi-dimensional dispatch headroom in-process.
+
+    Combines the resource sample (cpu/memory/swap/disk) with the LLM
+    price/quota gate (``/v1/dispatch_gate`` on the live router) into a single
+    ``{target_workers, per_dimension, reason, can_dispatch}`` decision.
+
+    Policy — thresholds, which dimensions are HARD-critical, and the soft floor
+    — is config-as-code (``gateway.dispatch_headroom`` /
+    ``state/fleet/dispatch_headroom.yaml``, deployed by role
+    59-dispatch-health). CPU is SOFT: a CPU breach throttles but still yields
+    ``soft_floor`` workers, so a busy-but-not-dangerous box cannot starve every
+    board; only memory/disk/swap breach can hard-zero dispatch. ``reason`` names
+    the binding dimension so a resource hold is never misreported as a quota
+    hold (the pre-2026-09-28 bug that made a CPU hold read as "primary keys
+    tight").
+
+    Fail-open: any sensor error degrades to a safe floor (1 worker) so a broken
+    sensor can never wedge dispatch (same contract as the estop gate).
+    """
+    import json as _json
+    import urllib.request as _urllib
+
+    from gateway.dispatch_headroom import (
+        fold_target,
+        load_policy,
+        resource_headroom,
+    )
+
+    policy = load_policy()
+    cores = os.cpu_count() or 1
+
+    # ── 1. Resource sample (latest raw row drives the gate) ──
+    raw = {
+        "cpu_load": 0.0,
+        "memory_pct": 0.0,
+        "swap_used_pct": 0.0,
+        "disk_used_pct": 0.0,
+    }
+    try:
+        import sqlite3 as _sqlite3
+        _c = _sqlite3.connect(
+            f"file:{Path.home()/'.hermes'/'bot'/'zai_usage.db'}?mode=ro",
+            uri=True, timeout=5,
+        )
+        _row = _c.execute(
+            "SELECT cpu_load_1m, memory_used_percent, swap_used_percent, "
+            "disk_used_percent FROM resource_metrics ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        _c.close()
+        if _row:
+            raw = {
+                "cpu_load": float(_row[0] or 0.0),
+                "memory_pct": float(_row[1] or 0.0),
+                "swap_used_pct": float(_row[2] or 0.0),
+                "disk_used_pct": float(_row[3] or 0.0),
+            }
+    except Exception:
+        pass
+
+    # Kalman early-warning: which dimensions are trending toward a breach.
+    kalman_warn = set()
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path.home() / ".hermes" / "bot"))
+        from multi_resource_kalman import (
+            MultiResourceKalmanPredictor,
+            get_resource_history,
+        )
+        history = get_resource_history(hours=2)
+        if len(history) >= 3:
+            pred = MultiResourceKalmanPredictor()
+            for h in history:
+                pred.update({k: h.get(k, 0.0) for k in pred.RESOURCES})
+            for w in pred.get_resource_warnings(minutes_ahead=30):
+                kalman_warn.add(w.get("resource", "").lower())
+    except Exception as exc:
+        logger.warning("kanban dispatcher: resource Kalman unavailable (%s)", exc)
+
+    per_dim = resource_headroom(raw, policy, cores, kalman_warn)
+
+    # ── 2. LLM price/quota gate (market-based live router) ──
+    llm_headroom = 1.0
+    llm_reason = ""
+    try:
+        req = _urllib.Request(
+            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
+            headers={"Accept": "application/json"},
+        )
+        with _urllib.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
+        llm_reason = data.get("reason", "") or ""
+    except Exception as exc:
+        logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
+    per_dim["llm"] = llm_headroom
+
+    # ── 2b. Reviewer-aware gate (2026-09-30) ──
+    # Hold dispatch when NO cross-family reviewer lane is live, so we do not
+    # spawn workers whose DoD requires a cold review that cannot be obtained
+    # (the qwen3.5:397b "no lane" class). Fail-open on any sensor error.
+    try:
+        from gateway.dispatch_headroom import reviewer_headroom
+        per_dim["reviewer"] = reviewer_headroom(policy)
+    except Exception:
+        per_dim["reviewer"] = 1.0
+
+    # ── 3. Fold to a target worker count (throttle, not binary) ──
+    critical_dims = list(policy.get("critical_dimensions") or (
+        "memory_pct", "disk_used_pct", "swap_used_pct",
+    ))
+    # reviewer is HARD-critical only when we are sure no lane exists; a healthy
+    # probe leaves it as an ordinary (1.0) dimension with no effect.
+    if per_dim.get("reviewer", 1.0) <= 0.0:
+        critical_dims.append("reviewer")
+    soft_floor = int(policy.get("soft_floor", 1))
+    target = fold_target(per_dim, critical_dims, static_cap, soft_floor)
+
+    # ── 4. Reason: name the binding dimension; never mask a resource hold with
+    #       the LLM gate's text (the 2026-09-28 misreport). ──
+    if per_dim:
+        binding = min(per_dim, key=per_dim.get)
+        if binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
+            reason = "reviewer lane unavailable: no cross-family reviewer served"
+            if llm_reason:
+                reason += f"; llm: {llm_reason}"
+        elif per_dim[binding] < 1.0 and binding != "llm":
+            reason = (
+                f"resource throttle: {binding} headroom {per_dim[binding]:.1f} "
+                f"(cpu_load={raw.get('cpu_load', 0.0):.1f} on {cores}c)"
+            )
+            if llm_reason:
+                reason += f"; llm: {llm_reason}"
+        elif binding == "llm" and per_dim["llm"] <= 0.0:
+            reason = llm_reason or "llm lane exhausted"
+        else:
+            reason = llm_reason or "ok"
+    else:
+        reason = "no sensors"
+
+    result = {
+        "target_workers": target,
+        "can_dispatch": target > 0,
+        "per_dimension": per_dim,
+        "reason": reason,
+    }
+    # Persist so the task-lifecycle governor (Phase 7) reads the SAME headroom
+    # signal and never revives into a starved box. Fail-open: a write error
+    # must not affect the dispatch decision.
+    try:
+        _p = Path.home() / ".hermes" / "bot" / "dispatch_headroom.json"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.write_text(_json.dumps(result), encoding="utf-8")
+    except Exception:
+        pass
+    return result
