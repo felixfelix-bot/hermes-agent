@@ -1976,3 +1976,139 @@ class TestSetCronSessionTitle:
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
 
 
+class TestDeliverResultPartialLiveSendNoDuplicate:
+    """End-to-end regression: a live Signal group send that reached SOME
+    members must not be re-sent by the standalone fallback.
+
+    Live symptom (2026-09-22, cred-hardening / vps51 cron jobs):
+
+        cron.scheduler: live adapter delivery to signal:group:… failed:
+        IDENTITY_FAILURE, falling back to standalone
+
+    signal-cli returns ONE result entry per group member.  A single member
+    whose identity is untrusted (IDENTITY_FAILURE) made the whole group send
+    look failed, so `_deliver_result` fell through to the standalone path —
+    and the operator received TWO copies of every brief, thirty minutes apart
+    for hours, because the live send HAD been delivered.
+
+    These tests drive the real path (cron → DeliveryRouter → SignalAdapter →
+    signal-cli RPC stub) and count what actually reaches the wire.
+    """
+
+    CHAT_ID = "group:abc123"
+
+    def _run(self, results_payload):
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.signal import SignalAdapter
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {
+            "http_url": "http://localhost:8080",
+            "account": "+155****4567",
+        }
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SIGNAL: pconfig}
+
+        adapter = SignalAdapter(pconfig)
+        rpc_calls = []
+
+        async def fake_rpc(method, params, *_args, **_kwargs):
+            rpc_calls.append({"method": method, "params": dict(params)})
+            if method == "send":
+                return results_payload
+            return None
+
+        adapter._rpc = fake_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        # Execute the real coroutine (DeliveryRouter → adapter.send) and hand
+        # the cron side a resolved/raised future, exactly like the gateway loop.
+        def run_coro_now(coro, _loop):
+            fut = Future()
+            try:
+                fut.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001 — mirror the loop
+                fut.set_exception(exc)
+            return fut
+
+        job = {
+            "id": "signal-group-brief",
+            "deliver": "origin",
+            "origin": {"platform": "signal", "chat_id": self.CHAT_ID},
+        }
+
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=run_coro_now), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Nightly brief body",
+                adapters={Platform.SIGNAL: adapter},
+                loop=loop,
+            )
+
+        return result, standalone_send, rpc_calls
+
+    @staticmethod
+    def _send_calls(rpc_calls):
+        return [c for c in rpc_calls if c["method"] == "send"]
+
+    def test_partial_group_delivery_is_sent_exactly_once(self):
+        """One member untrusted, one member reachable → ONE message on the wire.
+
+        Before the fix this asserted 2 sends: the live send (which did reach
+        the group) plus the standalone resend.
+        """
+        result, standalone_send, rpc_calls = self._run({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "SUCCESS",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+
+        assert result is None, f"expected delivered, got error: {result!r}"
+        assert len(self._send_calls(rpc_calls)) == 1, (
+            "exactly one send may reach the platform; a second one is the "
+            "duplicate the operator reported"
+        )
+        standalone_send.assert_not_awaited()
+
+    def test_all_recipients_failing_still_falls_back(self):
+        """No recipient reached → the message was NOT delivered, so the
+        standalone fallback must still run (never silently drop a brief)."""
+        result, standalone_send, rpc_calls = self._run({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "IDENTITY_FAILURE",
+                },
+                {
+                    "recipientAddress": {"number": "+155****0000"},
+                    "type": "IDENTITY_FAILURE",
+                },
+            ],
+        })
+
+        standalone_send.assert_awaited_once()
+        assert result is None
+        assert len(self._send_calls(rpc_calls)) == 1
+
+
