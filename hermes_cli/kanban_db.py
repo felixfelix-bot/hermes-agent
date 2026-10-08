@@ -356,6 +356,62 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+# ---------------------------------------------------------------------------
+# Respawn churn protection (D-128 §8.5)
+#
+# Three layers, all checked in dispatch_once BEFORE a claim/spawn:
+#   1. Exponential backoff keyed on consecutive_failures / last_failure_at
+#      (guard reason "backoff") — a failing task waits base*2^(failures-1),
+#      capped, so a crash loop slows down instead of hot-looping.
+#   2. Windowed max-respawn cap counting EVERY "spawned" event in 24h —
+#      catches rate-limit bounces and TTL reclaims that never increment
+#      consecutive_failures (the CW 67-spawn incident class).
+#   3. Quarantine after N identical normalized failure fingerprints —
+#      a task dying the SAME way repeatedly is stuck, not flaky; park it
+#      sticky-blocked with a needs_input reason so the digest escalates.
+# All knobs are env-tunable; setting a knob to 0 disables that layer.
+# ---------------------------------------------------------------------------
+DEFAULT_RESPAWN_BACKOFF_BASE_SECONDS = 60
+DEFAULT_RESPAWN_BACKOFF_MAX_SECONDS = 3600
+DEFAULT_MAX_RESPAWNS_PER_WINDOW = 6
+DEFAULT_QUARANTINE_IDENTICAL_SPAWNS = 3
+_RESPAWN_WINDOW_SECONDS = 24 * 3600
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse a non-negative int env knob; default when absent/invalid."""
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return default
+
+
+def _respawn_backoff_delay(consecutive_failures: int) -> int:
+    """Exponential respawn backoff delay in seconds (D-128 §8.5).
+
+    ``base * 2**(failures-1)`` capped at ``max``. ``failures <= 0`` returns 0
+    (no failures recorded — nothing to back off). Setting the base env knob
+    to 0 disables the layer entirely (delay always 0).
+    """
+    base = _env_int(
+        "HERMES_KANBAN_RESPAWN_BACKOFF_BASE_SECONDS",
+        DEFAULT_RESPAWN_BACKOFF_BASE_SECONDS,
+    )
+    if base <= 0 or consecutive_failures <= 0:
+        return 0
+    cap = _env_int(
+        "HERMES_KANBAN_RESPAWN_BACKOFF_MAX_SECONDS",
+        DEFAULT_RESPAWN_BACKOFF_MAX_SECONDS,
+    )
+    delay = base * (2 ** (consecutive_failures - 1))
+    return min(delay, cap)
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -1246,6 +1302,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     worker_pid           INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
+    -- Unix ts of the most recent failure; anchors the exponential
+    -- respawn backoff (D-128 §8.5). NULL when the counter is clean.
+    last_failure_at      INTEGER,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
@@ -2410,6 +2469,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "last_failure_at" not in cols:
+        # D-128 §8.5 — anchor for the exponential respawn backoff.
+        _add_column_if_missing(
+            conn, "tasks", "last_failure_at", "last_failure_at INTEGER"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -6610,7 +6674,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "last_failure_at = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7779,6 +7844,12 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    quarantined: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks parked by the respawn-churn quarantine (D-128 §8.5), as
+    ``(task_id, kind)`` pairs. ``kind`` is ``max_respawns`` (windowed spawn
+    cap exceeded) or ``identical_failures`` (N identical failure
+    fingerprints). The task is sticky-blocked with a ``needs_input
+    [quarantine/...]`` reason so the blocked-cards digest escalates it."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -8940,9 +9011,10 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], int(time.time()), task_id),
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
@@ -8950,9 +9022,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], int(time.time()), task_id),
                 )
             run_id = None
             if end_run:
@@ -9006,16 +9079,17 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "last_failure_at = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
+                    (retry_status, failures, error[:500], int(time.time()), task_id),
                 )
             else:
                 # Timeout/crash path: caller already restored the source phase.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    "last_failure_error = ?, last_failure_at = ? WHERE id = ?",
+                    (failures, error[:500], int(time.time()), task_id),
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
@@ -9093,7 +9167,8 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, last_failure_at = NULL "
+            "WHERE id = ?",
             (task_id,),
         )
 
@@ -9205,6 +9280,26 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
+    # 1b. Exponential respawn backoff (D-128 §8.5): the task failed
+    #     ``consecutive_failures`` times in a row; the next respawn must wait
+    #     ``base * 2**(failures-1)`` seconds (capped at ``max``) counted from
+    #     ``tasks.last_failure_at``. A crash loop therefore slows down
+    #     exponentially instead of hot-looping every tick. Checked AFTER the
+    #     rate-limit cooldown (the more specific signal — that path never
+    #     counts failures) and BEFORE ``blocker_auth`` so a deterministic
+    #     quota/auth error still defers via its own rule once backoff elapses.
+    row2 = conn.execute(
+        "SELECT consecutive_failures, last_failure_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row2 is not None:
+        _failures = int(row2["consecutive_failures"] or 0)
+        _last_at = row2["last_failure_at"]
+        _delay = _respawn_backoff_delay(_failures)
+        if _delay > 0 and _last_at is not None:
+            if (now - int(_last_at)) < _delay:
+                return "backoff"
+
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -9251,6 +9346,156 @@ def check_respawn_guard(
             return "active_pr"
 
     return None
+
+
+def check_respawn_churn(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[tuple[str, str]]:
+    """Return ``(kind, detail)`` when a task shows respawn CHURN, else None.
+
+    Two failure families the consecutive-failure breaker can never see
+    (D-128 §8.5 — the CW 67-spawn incident class):
+
+    ``max_respawns``
+        The task accumulated >= ``HERMES_KANBAN_MAX_RESPAWNS_PER_WINDOW``
+        (default 6) ``spawned`` events within the trailing 24h. Counts
+        EVERY spawn — including rate-limit bounces and claim-TTL reclaims,
+        which reset/restore the task without incrementing
+        ``consecutive_failures`` — so a bounce loop cannot spin forever
+        just because no counter was ticked.
+
+    ``identical_failures``
+        The trailing ``HERMES_KANBAN_QUARANTINE_IDENTICAL_SPAWNS``
+        (default 3) CLOSED failure runs (``crashed`` / ``timed_out`` /
+        ``spawn_failed`` / ``gave_up``) all normalize to the same error
+        fingerprint (see :func:`_error_fingerprint`). A task dying the
+        exact same way repeatedly is deterministically stuck, not flaky;
+        retrying a fourth time burns the same tokens for the same corpse.
+        ``rate_limited`` runs are excluded — a quota wall is a lane
+        outage, not a task fault (and the cooldown layer already spaces
+        those probes).
+
+    Both layers are independently env-tunable; setting either knob to 0
+    disables that layer. Pure read — callers decide what to do (the
+    dispatcher quarantines via :func:`quarantine_task`).
+    """
+    now = int(time.time())
+
+    # Layer 2: windowed spawn cap.
+    max_respawns = _env_int(
+        "HERMES_KANBAN_MAX_RESPAWNS_PER_WINDOW", DEFAULT_MAX_RESPAWNS_PER_WINDOW
+    )
+    if max_respawns > 0:
+        cutoff = now - _RESPAWN_WINDOW_SECONDS
+        n = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'spawned' AND created_at >= ?",
+            (task_id, cutoff),
+        ).fetchone()[0]
+        if int(n) >= max_respawns:
+            return (
+                "max_respawns",
+                f"{int(n)} spawns in the last "
+                f"{_RESPAWN_WINDOW_SECONDS // 3600}h "
+                f"(cap {max_respawns})",
+            )
+
+    # Layer 3: identical-failure fingerprint quarantine.
+    identical = _env_int(
+        "HERMES_KANBAN_QUARANTINE_IDENTICAL_SPAWNS",
+        DEFAULT_QUARANTINE_IDENTICAL_SPAWNS,
+    )
+    if identical > 0:
+        cutoff = now - _RESPAWN_WINDOW_SECONDS
+        rows = conn.execute(
+            "SELECT outcome, error FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "AND outcome IN ('crashed', 'timed_out', 'spawn_failed', 'gave_up') "
+            "AND ended_at >= ? ORDER BY ended_at DESC LIMIT ?",
+            (task_id, cutoff, identical),
+        ).fetchall()
+        if len(rows) >= identical:
+            fps = {_error_fingerprint(r["error"] or r["outcome"] or "") for r in rows}
+            if len(fps) == 1:
+                fp = next(iter(fps))
+                return (
+                    "identical_failures",
+                    f"{len(rows)} identical consecutive failures "
+                    f"({fp[:60]})",
+                )
+
+    return None
+
+
+def quarantine_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    kind: str,
+) -> bool:
+    """Sticky-block a churning task with an operator-actionable reason.
+
+    Writes a ``quarantined`` audit event, then blocks the task with a
+    ``needs_input [quarantine/<kind>]``-prefixed reason so the
+    blocked-cards digest escalates it to the operator. The trailing
+    ``blocked`` event is what makes the block sticky —
+    ``recompute_ready`` must not auto-promote a quarantined task back
+    into the dispatch lane.
+
+    The active run (if any) is closed with outcome ``quarantined`` so
+    run history shows why the lane went quiet. An explicit
+    ``unblock_task`` clears the quarantine and resets the failure
+    counters (the dispatcher treats a deliberate unblock as a fresh
+    start).
+
+    Returns True when the task transitioned to ``blocked``.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        blocked_reason = f"needs_input [quarantine/{kind}]: {reason}"
+        _append_event(
+            conn, task_id, "quarantined",
+            {"reason": reason, "kind": kind, "quarantined": True},
+        )
+        run_id = _end_run(
+            conn, task_id, outcome="quarantined",
+            error=reason[:500],
+            metadata={"quarantine_kind": kind},
+        )
+        if run_id is None:
+            # Task was never claimed (ready/review lane, or the run already
+            # closed): synthesize a zero-duration run so the quarantine is
+            # visible in attempt history — without it, latest_run() would
+            # show a stale attempt (or none) for a freshly-parked card.
+            run_id = _synthesize_ended_run(
+                conn, task_id,
+                outcome="quarantined",
+                error=reason[:500],
+                metadata={"quarantine_kind": kind},
+            )
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "last_failure_error = ? WHERE id = ? "
+            "AND status IN ('ready', 'review', 'running')",
+            (blocked_reason[:500], task_id),
+        )
+        _append_event(
+            conn, task_id, "blocked",
+            {
+                "reason": blocked_reason,
+                "quarantined": True,
+                "kind": kind,
+            },
+            run_id=run_id,
+        )
+    return True
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -9775,6 +10020,25 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Respawn-churn quarantine (D-128 §8.5): a task that already burned
+        # its windowed spawn budget, or died N times with the identical
+        # fingerprint, is parked sticky-blocked instead of spawned again.
+        # The dispatch loop is the chokepoint where every spawn decision is
+        # made, so the check lives here (not in check_respawn_guard) to keep
+        # the deferral layer and the quarantine layer independently tunable.
+        churn = check_respawn_churn(conn, row["id"])
+        if churn is not None:
+            kind, detail = churn
+            if dry_run:
+                result.quarantined.append((row["id"], kind))
+                continue
+            if quarantine_task(conn, row["id"], detail, kind=kind):
+                result.quarantined.append((row["id"], kind))
+                _log.info(
+                    "kanban dispatch: quarantined %s (%s: %s)",
+                    row["id"], kind, detail,
+                )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -9906,8 +10170,23 @@ def _dispatch_once_locked(
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        {"reason": guard_reason, "lane": "review"},
                     )
+            continue
+        # Same respawn-churn quarantine as the ready lane (D-128 §8.5) —
+        # a review card can loop exactly like a ready card.
+        churn = check_respawn_churn(conn, row["id"])
+        if churn is not None:
+            kind, detail = churn
+            if dry_run:
+                result.quarantined.append((row["id"], kind))
+                continue
+            if quarantine_task(conn, row["id"], detail, kind=kind):
+                result.quarantined.append((row["id"], kind))
+                _log.info(
+                    "kanban dispatch: quarantined review task %s (%s: %s)",
+                    row["id"], kind, detail,
+                )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
