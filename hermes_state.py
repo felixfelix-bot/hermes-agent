@@ -1431,6 +1431,13 @@ def classify_persistence_error(exc_or_str) -> str:
     if isinstance(exc_or_str, CompressionSessionBusyError):
         return "locked"
     text = str(exc_or_str).lower()
+    # 2026-10-08: a C-level sqlite3 call that returned NULL without setting an
+    # exception (CPython raises SystemError "<conn> returned NULL without
+    # setting an exception") is a transient binding failure under write
+    # contention, not storage damage. Bucket it as locked/busy so the operator
+    # gets "storage was busy, send it again" instead of the corruption advice.
+    if "returned null without setting an exception" in text:
+        return "locked"
     if (
         "locked" in text
         or "busy" in text
@@ -3467,6 +3474,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_transient_binding_error(exc: BaseException) -> bool:
+            # A C-level sqlite3 call returned NULL without setting an exception
+            # (CPython raises SystemError). Under write contention it is
+            # transient — the identical write succeeds standalone.
+            return "returned null without setting an exception" in str(exc).lower()
+
         while True:
             # Reopen a lost/closed connection before touching self._conn; this
             # prevents the opaque NoneType AttributeError and turns a shutdown
@@ -3562,6 +3575,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # untouched.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                raise
+            except Exception as exc:
+                # 2026-10-08 CobradorWave: a transient CPython/sqlite3 binding
+                # failure (SystemError "… returned NULL without setting an
+                # exception") is NOT a sqlite3.Error, so it escaped every
+                # handler above and aborted the operator's turn as
+                # session_persistence_failed. Force a reconnect (the connection's
+                # C state can be left wedged) and ride it out within patience.
+                if _is_transient_binding_error(exc):
+                    try:
+                        if self._conn is not None:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                    if self._sleep_before_write_retry(deadline, patience_s):
+                        continue
                 raise
 
     def _sleep_before_write_retry(
