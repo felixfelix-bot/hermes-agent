@@ -214,6 +214,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    NOSTR = "nostr"  # NIP-29 group chat via strfry relays
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
 
     @classmethod
@@ -565,6 +566,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.YUANBAO: _needs_extra("app_id", "app_secret"),
     # Relay dials OUT: "connected" once an endpoint URL is configured. EXPERIMENTAL.
     Platform.RELAY: lambda cfg: bool(cfg.extra.get("relay_url") or cfg.extra.get("url")),
+    Platform.NOSTR: lambda cfg: bool(
+        cfg.extra.get("relays") or os.getenv("NOSTR_RELAYS")
+    ),
 }
 
 
