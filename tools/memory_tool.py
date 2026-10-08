@@ -35,9 +35,108 @@ logger = logging.getLogger(__name__)
 _memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar("memory_surface_flags", default=None)
 
 
+_NON_MESSAGING_SURFACES = frozenset(
+    {
+        "api_server",
+        "cli",
+        "codex",
+        "desktop",
+        "gateway",
+        "kanban",
+        "local",
+        "msgraph_webhook",
+        "tool",
+        "tui",
+        "webhook",
+    }
+)
+
+
+def _slugify_group(name: str) -> str:
+    """Filesystem-safe slug for a context-window (chat/group) display name."""
+    if not name:
+        return ""
+    import re
+
+    s = re.sub(r"[^a-z0-9]+", "-", str(name).lower().strip()).strip("-")
+    return s[:80].strip("-")
+
+
+def _current_group_slug() -> str:
+    """Return a stable slug for the current context window, or ``""``.
+
+    Messaging gateway sessions (Signal groups/DMs, Telegram, ...) are
+    namespaced so each context window keeps its OWN MEMORY.md / USER.md.
+    CLI, cron, kanban workers, the API server and other non-messaging surfaces
+    return ``""`` and share the profile-default memories dir.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:  # pragma: no cover - import guards
+        get_session_env = None
+
+    def _env(key):
+        if get_session_env is not None:
+            return (get_session_env(key, "") or "")
+        import os
+
+        return os.environ.get(key, "") or ""
+
+    if _env("HERMES_CRON_SESSION") == "1":
+        return ""
+    source = _env("HERMES_SESSION_SOURCE").strip().lower()
+    platform = _env("HERMES_SESSION_PLATFORM").strip().lower()
+    if source in _NON_MESSAGING_SURFACES:
+        return ""
+    if platform in _NON_MESSAGING_SURFACES or platform == "":
+        return ""
+    chat_name = _env("HERMES_SESSION_CHAT_NAME").strip()
+    chat_id = _env("HERMES_SESSION_CHAT_ID").strip()
+    slug = _slugify_group(chat_name) if chat_name else ""
+    if not slug and chat_id:
+        raw = chat_id.split(":", 1)[-1] if ":" in chat_id else chat_id
+        slug = _slugify_group(raw)
+    return slug
+
+
+def _seed_group_from_default(base: Path, mem_dir: Path) -> None:
+    """One-time seed of a fresh per-group memory dir from the profile default."""
+    try:
+        if base == mem_dir or not base.is_dir():
+            return
+        import shutil
+
+        for fn in ("MEMORY.md", "USER.md"):
+            src = base / fn
+            dst = mem_dir / fn
+            if src.is_file() and not dst.exists():
+                shutil.copyfile(src, dst)
+    except Exception:
+        logger.debug("Memory group seed skipped", exc_info=True)
+
+
 def get_memory_dir() -> Path:
-    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import)."""
-    return get_hermes_home() / "memories"
+    """Profile- and context-window-scoped memories dir, resolved per call.
+
+    ``<hermes_home>/memories`` by default; a messaging context window gets
+    ``<hermes_home>/memories/<group-slug>`` so each group/DM keeps its own
+    MEMORY.md/USER.md (no cross-CW bleed). A fresh group dir is one-time
+    seeded from the profile default so no CW loses the operator profile.
+    """
+    base = get_hermes_home() / "memories"
+    try:
+        slug = _current_group_slug()
+    except Exception:
+        slug = ""
+    if not slug:
+        return base
+    mem_dir = base / slug
+    try:
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        _seed_group_from_default(base, mem_dir)
+    except Exception:
+        logger.debug("memory group dir prepare skipped", exc_info=True)
+    return mem_dir
 
 
 from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
