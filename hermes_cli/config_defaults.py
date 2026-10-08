@@ -1630,6 +1630,13 @@ DEFAULT_CONFIG = {
         "free_response_rooms": "",  # comma-separated room IDs answered without mention
         "allowed_rooms": "",  # if set, ONLY respond in these room IDs (whitelist)
     },
+
+    # Nostr platform settings (gateway mode, NIP-29 groups)
+    "nostr": {
+        "relays": [],  # NIP-29 relay URLs (ws://host:port)
+        "groups": [],  # NIP-29 group names to listen on
+        "nsec_path": "~/.hermes/state/nip29-relay-nsec.key",  # nsec hex key file
+    },
     # Approvals for dangerous commands.
     # mode: manual (always prompt) | smart (aux LLM auto-approves low-risk) | off (= --yolo)
     # cron_mode / single_query_mode / unattended_mode: deny | approve — what to do when a
@@ -3034,6 +3041,13 @@ OPTIONAL_ENV_VARS = {
         "Matrix recovery key for cross-signing verification after device key rotation (from "
         "Element: Settings → Security → Recovery Key)", "Matrix recovery key", None, password=True,
         advanced=True),
+    # ── Nostr (NIP-29 groups) ──
+    "NOSTR_RELAYS": _msg(
+        "Comma-separated Nostr NIP-29 relay URLs (e.g. ws://relay.example.com:7780)",
+        "Nostr relay URLs (comma-separated)", None, advanced=True),
+    "NOSTR_NSEC_PATH": _msg(
+        "Path to the file containing the nsec hex key for the Nostr relay bot identity",
+        "Nostr nsec key file path", None, password=True, advanced=True),
     "BLUEBUBBLES_SERVER_URL": _msg(
         "BlueBubbles server URL for iMessage integration (e.g. http://192.168.1.10:1234)",
         "BlueBubbles server URL", "https://bluebubbles.app/"),
