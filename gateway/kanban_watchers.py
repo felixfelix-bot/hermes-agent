@@ -283,6 +283,36 @@ def _board_dispatch_priority(slug: str) -> int:
         return 0
 
 
+def _write_dispatch_gate_degraded(reason: str, now: float | None = None) -> None:
+    """Persist the D-128 §8.2 fail-open degradation marker (best-effort).
+
+    ``~/.hermes/bot/dispatch_gate_degraded.json`` is the alert surface fleet
+    watchdogs (dispatch_health_check / capacity_recovery_digest /
+    task-lifecycle-governor) already know how to read: a JSON state file next
+    to the other bot-state JSONs. Writing it must never affect the dispatch
+    decision — every failure mode is swallowed.
+    """
+    try:
+        p = Path.home() / ".hermes" / "bot" / "dispatch_gate_degraded.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        import time as _time
+        ts = now if now is not None else _time.time()
+        try:
+            prev = _json.loads(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            prev = {}
+        p.write_text(_json.dumps({
+            "mode": "timeout-fail-open",
+            "last_reason": reason,
+            "last_ts": ts,
+            "first_seen": prev.get("first_seen") or ts,
+            "count": int(prev.get("count", 0)) + 1,
+        }), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _compute_dispatch_headroom(
     static_cap: "Optional[int]" = None,
 ) -> dict:
@@ -367,8 +397,14 @@ def _compute_dispatch_headroom(
     per_dim = resource_headroom(raw, policy, cores, kalman_warn)
 
     # ── 2. LLM price/quota gate (market-based live router) ──
+    # D-128 §8.2 fail-open-on-timeout: an ANSWERED "no" (can_dispatch false)
+    # is a real verdict and holds; an UNAVAILABLE gate (timeout, refused
+    # connection, garbled body) is a dead sensor and must never block all
+    # spawns — dispatch continues at the conservative `llm_gate_timeout_cap`
+    # and the degradation is surfaced (reason + state file alert).
     llm_headroom = 1.0
     llm_reason = ""
+    llm_gate_degraded = False
     try:
         req = _urllib.Request(
             "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
@@ -379,8 +415,19 @@ def _compute_dispatch_headroom(
         llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
         llm_reason = data.get("reason", "") or ""
     except Exception as exc:
-        logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
+        llm_gate_degraded = True
+        llm_reason = f"dispatch_gate timeout/unavailable ({exc.__class__.__name__}): fail-open"
+        logger.warning(
+            "kanban dispatcher: LLM dispatch_gate unavailable (%s) — "
+            "failing OPEN at the conservative cap (D-128 §8.2)", exc)
+        _write_dispatch_gate_degraded(llm_reason)
     per_dim["llm"] = llm_headroom
+    if llm_gate_degraded:
+        try:
+            from gateway.dispatch_headroom import llm_gate_degraded_headroom
+            per_dim = llm_gate_degraded_headroom(per_dim, policy, static_cap)
+        except Exception:
+            per_dim["llm_gate_degraded"] = 1.0
 
     # ── 2b. Reviewer-aware gate (2026-09-30) ──
     # Hold dispatch when NO cross-family reviewer lane is live, so we do not
@@ -407,7 +454,14 @@ def _compute_dispatch_headroom(
     #       the LLM gate's text (the 2026-09-28 misreport). ──
     if per_dim:
         binding = min(per_dim, key=per_dim.get)
-        if binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
+        # Degraded-gate reason claims the line ONLY when the fail-open ratio
+        # is the binding constraint; a real resource hold (memory/disk/swap at
+        # 0.0 binds lower) still names the resource — never mask a hold with
+        # gate text (the 2026-09-28 misreport).
+        if binding == "llm_gate_degraded":
+            reason = llm_reason or (
+                "dispatch_gate timeout: fail-open at conservative cap (D-128 8.2)")
+        elif binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
             reason = "reviewer lane unavailable: no cross-family reviewer served"
             if llm_reason:
                 reason += f"; llm: {llm_reason}"
@@ -431,6 +485,18 @@ def _compute_dispatch_headroom(
         "per_dimension": per_dim,
         "reason": reason,
     }
+    if llm_gate_degraded:
+        # Surface the D-128 §8.2 fail-open state on the persisted snapshot so
+        # watchdogs reading dispatch_headroom.json see WHY the target is low.
+        result["llm_gate_degraded"] = True
+    else:
+        # Gate answered: clear any stale degradation marker (recovery).
+        try:
+            _p = Path.home() / ".hermes" / "bot" / "dispatch_gate_degraded.json"
+            if _p.exists():
+                _p.unlink()
+        except Exception:
+            pass
     # Persist so the task-lifecycle governor (Phase 7) reads the SAME headroom
     # signal and never revives into a starved box. Fail-open: a write error
     # must not affect the dispatch decision.
