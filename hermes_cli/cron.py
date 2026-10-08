@@ -24,6 +24,7 @@ from hermes_cli.colors import Colors, color
 from cron.lifecycle_guard import (  # noqa: F401  (re-exported for terminal_tool)
     contains_gateway_lifecycle_command as _contains_gateway_lifecycle_command,
 )
+from cron.jobs import TICKER_STALE_AFTER_SECONDS  # noqa: F401 (shared w/ get_ticker_liveness)
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -266,13 +267,12 @@ def cron_status():
             get_ticker_heartbeat_age,
             get_ticker_last_error,
             get_ticker_success_age,
-            TICKER_INTERVAL_SECONDS,
         )
 
         # Allow ~3 missed ticker iterations (+ a little slack) before declaring
-        # trouble. Derived from the shared interval constant so this threshold
-        # tracks the ticker cadence instead of assuming a hardcoded 60s.
-        STALE_AFTER = TICKER_INTERVAL_SECONDS * 3 + 20  # = 200s at the 60s default
+        # trouble. Same shared constant as get_ticker_liveness (cronjob tool
+        # dead-letter warning) so the CLI and the tool can never disagree.
+        STALE_AFTER = TICKER_STALE_AFTER_SECONDS  # = 200s at the 60s default
         hb_age = get_ticker_heartbeat_age()
         ok_age = get_ticker_success_age()
 
