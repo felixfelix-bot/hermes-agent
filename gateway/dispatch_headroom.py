@@ -183,7 +183,7 @@ def reviewer_headroom(policy: dict | None = None) -> float:
         ttl = 900.0
     p = Path.home() / ".hermes" / "bot" / "reviewer_readiness.json"
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return 1.0
     try:
