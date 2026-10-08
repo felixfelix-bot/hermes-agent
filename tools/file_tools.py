@@ -758,6 +758,41 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
         return None
 
 
+def _check_shared_notes_write(path: str) -> str | None:
+    """Refuse a full-replace write to shared notes (patch-only rule).
+
+    Shared notes are the per-context-window files ``state/notes/*.md`` plus the
+    regenerated ``state/session-notes.md`` index. They are patch-only: a
+    full-replace from one CW destroys every other CW's notes (the 2026-09-05
+    cross-CW clobber; the watchdog re-fired 2026-09-23). Appends go through
+    ``append_note.py`` (group-resolved), or the patch tool.
+
+    Returns an error string when blocked, else ``None``.
+    """
+    try:
+        parts = PurePosixPath(str(path).replace("\\", "/")).parts
+    except Exception:
+        return None
+    blocked = (
+        (len(parts) >= 2 and parts[-2:] == ("state", "session-notes.md"))
+        or (
+            len(parts) >= 3
+            and parts[-3] == "state"
+            and parts[-2] == "notes"
+            and parts[-1].endswith(".md")
+        )
+    )
+    if not blocked:
+        return None
+    return (
+        "BLOCKED: refusing a full-replace write to shared notes "
+        f"({path}). Shared notes are patch-only - use the append helper "
+        "(resolve your group with `append_note.py --my-group` first, then pass "
+        "--topic/--what/--outcome/--next), or the patch tool to append in "
+        "place. See D-164 / NOTES-SPLIT-DESIGN.md."
+    )
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
                           cross_profile: bool) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
@@ -772,7 +807,7 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
         if err:
             return err
     for p in content_paths:
-        err = _check_binary_document_write(p, task_id)
+        err = _check_binary_document_write(p, task_id) or _check_shared_notes_write(p)
         if err:
             return err
     return (_check_protected_instruction_write(paths, task_id)
