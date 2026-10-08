@@ -343,6 +343,14 @@ def _preflight_compression(
         out.current_turn_user_idx = _reanchor(agent, out.messages, user_message)
 
 
+def _preflight_token_display(real_tokens: int, approx_tokens: int) -> str:
+    """Token label for the preflight notice: a measured count when the
+    compressor knows the real prompt size, else the estimated count."""
+    if real_tokens and real_tokens > 0:
+        return f"{real_tokens:,} real"
+    return f"~{approx_tokens:,} est."
+
+
 def _run_preflight_passes(
     agent: Any, out: CompactionOutcome, _compressor: Any, _preflight_tokens: int,
     system_message: Optional[str], effective_task_id: str,
@@ -360,13 +368,18 @@ def _run_preflight_passes(
         f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}", agent.model,
         f"{_compressor.context_length:,}",
     )
+    _real = getattr(_compressor, "last_real_prompt_tokens", 0) or 0
+    _shown = _preflight_token_display(_real, _preflight_tokens)
     _preflight_status = automatic_compaction_status_message(
         _compressor,
         phase="preflight",
-        default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-            tokens=_preflight_tokens, threshold=_compressor.threshold_tokens
+        default_message=(
+            f"📦 Preflight compression: {_shown} tokens "
+            f">= {_compressor.threshold_tokens:,} threshold. "
+            "This may take a moment."
         ),
         approx_tokens=_preflight_tokens,
+        real_tokens=_real,
         threshold_tokens=_compressor.threshold_tokens,
         context_length=_compressor.context_length,
         model=agent.model,
