@@ -461,6 +461,31 @@ def _consume_interrupted_flag(job_id: str) -> bool:
         return False
 
 
+def _is_recurring_job(job: dict) -> bool:
+    """True when the job fires again on its own.
+
+    Used to decide whether a shutdown-interrupted run may stay silent. A
+    recurring job's next tick produces the real result, so its interrupt alert
+    is noise the recipient cannot act on; a one-shot job would otherwise never
+    tell the user its work never ran.
+
+    Unknown/absent ``repeat`` shapes count as recurring: every real job carries
+    ``repeat`` (see ``claim_dispatch``), so a job we cannot classify is
+    overwhelmingly more likely to fire again -- and the run is recorded as a
+    failure either way, so nothing is hidden.
+    """
+    repeat = job.get("repeat") or {}
+    if not isinstance(repeat, dict):
+        return True
+    times = repeat.get("times")
+    if times is None:
+        return True
+    try:
+        return int(times) > 1
+    except (TypeError, ValueError):
+        return True
+
+
 # Sequential (env-mutating) cron jobs — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
@@ -4674,7 +4699,14 @@ def run_one_job(
             # "this run was interrupted" summary instead of that response.
             # Peek-only: the flag stays set for the authoritative check
             # right before mark_job_run below.
-            if success and _is_interrupted(job["id"]):
+            #
+            # Peeked regardless of ``success``: a shutdown-swept run can also
+            # reach here having already failed (its killed tool subprocess
+            # makes run_job return False). That is still a shutdown artefact,
+            # not a job fault, so the recurring-job silence rule below must
+            # cover both shapes.
+            interrupted_by_shutdown = _is_interrupted(job["id"])
+            if success and interrupted_by_shutdown:
                 success = False
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
@@ -4728,6 +4760,23 @@ def run_one_job(
             # tolerance the cron contract relies on.
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                should_deliver = False
+
+            # A shutdown-interrupted run of a RECURRING job must not page a
+            # chat. The shutdown path already logged the bulk marking and
+            # wrote the authoritative failure status, and the recipient cannot
+            # act on "the gateway restarted while this was running" -- the next
+            # tick produces the real result. Observed 2026-10-09: one gateway
+            # drain marked 60 in-flight jobs interrupted, 26 of which deliver
+            # to a human chat, so this fired dozens of false alarms in one
+            # restart. One-shot jobs still deliver below: nothing else will
+            # ever run them, so silence there would lose the work.
+            if interrupted_by_shutdown and _is_recurring_job(job):
+                logger.info(
+                    "Job '%s': interrupted by gateway shutdown — recorded, "
+                    "not delivered (recurring job re-runs on its next tick)",
+                    job["id"],
+                )
                 should_deliver = False
 
             if should_deliver:
