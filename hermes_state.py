@@ -2572,8 +2572,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # _WRITE_RETRY_SLOW_AFTER_S (fast reclaim on millisecond contention),
     # then backs off so a long hold isn't hammered with BEGIN IMMEDIATE
     # attempts.
-    _WRITE_PATIENCE_S = 20.0
-    _TRANSCRIPT_WRITE_PATIENCE_S = 60.0
+    #
+    # The class constants below are the SHIPPED DEFAULTS, not the last word.
+    # On a loaded host (a dozen systemd timers + a gateway + cron + CLI all
+    # sharing one state.db) the write lock is starved long enough that 20s /
+    # 60s lose the race: measured, 59 routine-budget expiries at 20s and 7
+    # turn-killing transcript expiries at 60s in one host's retained logs,
+    # including a sustained ~20-minute stretch where every gateway routing
+    # save failed.  An operator tunes the budgets from config.yaml —
+    # ``database.write_patience_s`` / ``database.transcript_write_patience_s``
+    # — resolved per instance by :meth:`_resolve_write_patience`.  Behavioral
+    # settings belong in config.yaml, never in a HERMES_* env var.
+    _WRITE_PATIENCE_S = 45.0
+    _TRANSCRIPT_WRITE_PATIENCE_S = 180.0
+    # Upper clamp on config-supplied budgets: patience is only useful while
+    # it is shorter than the operator's own patience, and an unbounded value
+    # would let a typo (``write_patience_s: 1e12``) wedge every writer.
+    _PATIENCE_MAX_S = 900.0
+    # A failed open is as destructive as a failed transcript write — every
+    # caller disables persistence for the whole run — so the open path rides
+    # the transcript budget, not the shorter routine one (#74478).
+    _OPEN_PATIENCE_IS_TRANSCRIPT = True
     # Observation-only activity heartbeat/label writes (#76354 review S1):
     # these run on (or adjacent to) the response-critical path and must never
     # wait out the full routine patience under contention. Sub-second budget;
@@ -2620,6 +2639,68 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
+    @classmethod
+    def _coerce_patience(
+        cls, raw: Any, default: float, label: str
+    ) -> float:
+        """Coerce one config-supplied patience value, falling back on junk.
+
+        A non-numeric, non-finite, non-positive, or absurdly large value must
+        never wedge writers: log and return *default*. ``0 < value`` is False
+        for NaN, so NaN takes this path too.
+        """
+        if raw is None:
+            return default
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "state.db: ignoring non-numeric database.%s=%r", label, raw
+            )
+            return default
+        if not 0 < value <= cls._PATIENCE_MAX_S:
+            logger.warning(
+                "state.db: ignoring out-of-range database.%s=%r "
+                "(expected 0 < seconds <= %.0f)",
+                label, raw, cls._PATIENCE_MAX_S,
+            )
+            return default
+        return value
+
+    @classmethod
+    def _resolve_write_patience(cls) -> "tuple[float, float]":
+        """Return ``(routine_s, transcript_s)`` writer-patience budgets.
+
+        Defaults are the shipped class constants; ``config.yaml``'s
+        ``database.write_patience_s`` / ``database.transcript_write_patience_s``
+        override them. The transcript budget is never allowed below the routine
+        one — the invariant that lets background writers give up while the
+        turn-critical append keeps waiting.
+
+        Best-effort: any config-load failure falls back to the shipped defaults
+        so DB init never breaks on a malformed ``database:`` section.
+        """
+        routine = cls._WRITE_PATIENCE_S
+        transcript = cls._TRANSCRIPT_WRITE_PATIENCE_S
+        try:
+            # Local import avoids a circular import with hermes_cli.config.
+            from hermes_cli.config import cfg_get, load_config_readonly
+
+            cfg = load_config_readonly()
+        except Exception:
+            return routine, transcript
+        routine = cls._coerce_patience(
+            cfg_get(cfg, "database", "write_patience_s", default=None),
+            routine,
+            "write_patience_s",
+        )
+        transcript = cls._coerce_patience(
+            cfg_get(cfg, "database", "transcript_write_patience_s", default=None),
+            transcript,
+            "transcript_write_patience_s",
+        )
+        return routine, max(transcript, routine)
+
     @staticmethod
     def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
         if system_prompt is None:
@@ -2657,6 +2738,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
+
+        # Writer-patience budgets. These are INSTANCE attributes that shadow
+        # the class-level defaults on purpose: every writer in this module
+        # reads ``self._WRITE_PATIENCE_S`` / ``self._TRANSCRIPT_WRITE_PATIENCE_S``
+        # (the ``_execute_write`` default, the transcript call sites, and the
+        # open path), so resolving the config once here makes the whole class
+        # honour config.yaml without touching 69 call sites. See
+        # :meth:`_resolve_write_patience` for the config keys and clamping.
+        (
+            self._WRITE_PATIENCE_S,
+            self._TRANSCRIPT_WRITE_PATIENCE_S,
+        ) = self._resolve_write_patience()
+        # The open path is turn-critical (a failed open disables persistence
+        # for the whole run), so it rides the transcript budget.
+        self._open_patience_s = (
+            self._TRANSCRIPT_WRITE_PATIENCE_S
+            if self._OPEN_PATIENCE_IS_TRANSCRIPT
+            else self._WRITE_PATIENCE_S
+        )
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
