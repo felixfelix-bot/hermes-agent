@@ -475,6 +475,8 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
+**One exception — gateway-shutdown sweeps.** When the gateway shuts down or restarts while runs are in flight, it kills the process tree and marks *every* in-flight job interrupted. For a **recurring** job that alert is recorded (the failure lands in the job's `last_status` and the gateway logs the sweep) but **not delivered**: the recipient cannot act on "the gateway restarted while this was running", and one restart can hit dozens of jobs at once — the next tick produces the real result anyway. A **one-shot** job (`repeat: {times: 1}`) is still delivered, because nothing else will ever run it and silence would hide that the work never happened.
+
 ## Script timeout
 
 Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:
@@ -504,6 +506,9 @@ Semantics:
 - Script stdout (trimmed) → delivered verbatim as the message.
 - **Empty stdout → silent tick**, no delivery. This is the watchdog pattern: "only say something when something is wrong".
 - Non-zero exit or timeout → an error alert is delivered, so a broken watchdog can't fail silently.
+    One carve-out: a script killed by a *gateway shutdown* on a **recurring**
+    job is recorded but not delivered — the next tick re-runs it (see the
+    shutdown-sweep exception under Silent suppression above).
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 

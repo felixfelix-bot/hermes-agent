@@ -159,8 +159,11 @@ class TestRunOneJobHonoursInterruptedFlag:
     """run_one_job() must not let a job's own completion overwrite a
     status the shutdown path already wrote for the same run."""
 
-    def _make_job(self, job_id="job-1"):
-        return {"id": job_id, "name": "test job", "prompt": "do work"}
+    def _make_job(self, job_id="job-1", repeat=None):
+        job = {"id": job_id, "name": "test job", "prompt": "do work"}
+        if repeat is not None:
+            job["repeat"] = repeat
+        return job
 
     def test_success_path_skipped_when_interrupted(self):
         import cron.scheduler as sched
@@ -197,10 +200,13 @@ class TestRunOneJobHonoursInterruptedFlag:
         must not have that response sent to the user just because the
         eventual status write gets suppressed. Interrupted jobs must route
         through the same failure-summary delivery path a real failure
-        would."""
+        would. This is the ONE-SHOT case (``repeat.times == 1``): nothing will
+        ever run the job again, so the user must still be told the work did not
+        happen. Recurring jobs are silenced instead -- see
+        TestShutdownInterruptDoesNotPageRecurringJobs."""
         import cron.scheduler as sched
 
-        job = self._make_job()
+        job = self._make_job(repeat={"times": 1})
         sched._interrupted_job_ids.add(job["id"])
 
         with patch("cron.scheduler.claim_dispatch", return_value=True), \
@@ -247,3 +253,130 @@ class TestRunOneJobHonoursInterruptedFlag:
 
         assert result is False
         mock_mark.assert_not_called()
+
+
+class TestIsRecurringJob:
+    """``repeat`` shape -> "will this job fire again by itself?"
+
+    The silence rule keys off this: only a job that re-runs on its own may
+    swallow a shutdown-interrupt alert.
+    """
+
+    @pytest.mark.parametrize(
+        "repeat,expected",
+        [
+            ({"times": None}, True),      # unlimited (the common case)
+            ({"times": 999999}, True),
+            ({"times": 12}, True),        # bounded, but still fires again
+            ({"times": 1}, False),        # one-shot
+            ({}, True),                   # unknown shape -> assume recurring
+            (None, True),
+            ("forever", True),            # non-dict shape -> assume recurring
+        ],
+    )
+    def test_classifies_repeat_shapes(self, repeat, expected):
+        import cron.scheduler as sched
+
+        assert sched._is_recurring_job({"id": "j", "repeat": repeat}) is expected
+
+    def test_garbage_times_value_is_not_a_crash(self):
+        import cron.scheduler as sched
+
+        assert sched._is_recurring_job({"id": "j", "repeat": {"times": "lots"}}) is True
+
+
+class TestShutdownInterruptDoesNotPageRecurringJobs:
+    """Regression for the 2026-10-09 mass false alarm.
+
+    One gateway drain marked 60 in-flight cron jobs interrupted at once and 26
+    of them deliver to a human chat, so a single restart paged operators with
+    dozens of identical, unactionable "Interrupted by gateway shutdown" alerts.
+    The gateway already logs the bulk marking and the shutdown path already
+    wrote the authoritative failure status, so for a job that fires again on its
+    own the alert is pure noise and must not be delivered.
+
+    One-shot jobs keep the old behaviour: see
+    ``TestRunOneJobHonoursInterruptedFlag.test_interrupted_job_delivers_failure_summary_not_raw_response``.
+    """
+
+    def _run(self, sched, job):
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("agent.secret_scope.set_secret_scope", return_value=None), \
+             patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+             patch("agent.secret_scope.reset_secret_scope"), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(True, "full output", "a plausible final response", None),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md") as mock_save, \
+             patch(
+                 "cron.scheduler._summarize_cron_failure_for_delivery",
+                 return_value="Interrupted by gateway shutdown.",
+             ), \
+             patch("cron.scheduler._is_cron_silence_response", return_value=False), \
+             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler.mark_job_run") as mock_mark:
+            result = sched.run_one_job(job)
+        return result, mock_deliver, mock_save, mock_mark
+
+    def test_recurring_job_interrupt_is_recorded_but_not_delivered(self):
+        import cron.scheduler as sched
+
+        job = {"id": "job-rec", "name": "recurring", "prompt": "do work",
+               "repeat": {"times": None}}
+        sched._interrupted_job_ids.add(job["id"])
+
+        result, mock_deliver, mock_save, mock_mark = self._run(sched, job)
+
+        assert result is True
+        # The whole point: no chat message for a self-healing run.
+        mock_deliver.assert_not_called()
+        # ...but the run is still auditable: output saved, status already
+        # written by the shutdown path (so run_one_job must not overwrite it).
+        mock_save.assert_called_once()
+        mock_mark.assert_not_called()
+        assert job["id"] not in sched._interrupted_job_ids
+
+    def test_already_failed_recurring_job_swept_by_shutdown_is_silenced(self):
+        """The other shape: the killed tool subprocess made run_job return
+        False, so the run reaches the delivery block as a plain failure with
+        the shutdown flag set. Still a shutdown artefact -- still silent."""
+        import cron.scheduler as sched
+
+        job = {"id": "job-failed-sweep", "name": "recurring", "prompt": "do work",
+               "repeat": {"times": None}}
+        sched._interrupted_job_ids.add(job["id"])
+
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("agent.secret_scope.set_secret_scope", return_value=None), \
+             patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+             patch("agent.secret_scope.reset_secret_scope"), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(False, "partial output", "", "script exited -9"),
+             ), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch(
+                 "cron.scheduler._summarize_cron_failure_for_delivery",
+                 return_value="Script failed.",
+             ), \
+             patch("cron.scheduler._is_cron_silence_response", return_value=False), \
+             patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
+             patch("cron.scheduler.mark_job_run") as mock_mark:
+            result = sched.run_one_job(job)
+
+        assert result is True
+        mock_deliver.assert_not_called()
+        mock_mark.assert_not_called()
+
+    def test_bounded_recurring_job_is_also_silenced(self):
+        import cron.scheduler as sched
+
+        job = {"id": "job-rec-24", "name": "recurring bounded", "prompt": "do work",
+               "repeat": {"times": 24}}
+        sched._interrupted_job_ids.add(job["id"])
+
+        result, mock_deliver, _mock_save, _mock_mark = self._run(sched, job)
+
+        assert result is True
+        mock_deliver.assert_not_called()
