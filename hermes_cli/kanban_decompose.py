@@ -269,13 +269,14 @@ def _normalize_assignee_choice(
     return chosen
 
 
-def _decompose_gate(conn, task) -> "tuple[bool, str]":
-    """Free pre-gate: skip cards already handled or explicitly opted out.
+def _decompose_gate(conn, task, kanban_cfg=None) -> "tuple[bool, str]":
+    """Free pre-gate: skip cards already handled, opted out, or not opted in.
 
     Prevents the auto-decompose sweep from re-sending the same ineligible card
     to the aux LLM every dispatcher tick (board flood + quota burn). Reads only
     local rows — never spends an LLM call.
     """
+    kcfg = kanban_cfg or {}
     has_children = False
     specified = decomposed = False
     try:
@@ -304,6 +305,43 @@ def _decompose_gate(conn, task) -> "tuple[bool, str]":
         decomposed=decomposed,
         title=getattr(task, "title", "") or "",
         body=getattr(task, "body", "") or "",
+        created_by=getattr(task, "created_by", "") or "",
+        opt_in_only=bool(kcfg.get("auto_decompose_opt_in_only", False)),
+        opt_in_created_by=kcfg.get("decompose_opt_in_created_by") or (),
+        require_multi_deliverable=bool(
+            kcfg.get("decompose_require_multi_deliverable", False)),
+    )
+
+
+def _promote_single(task, parsed, *, default_assignee, valid_names,
+                    author) -> DecomposeOutcome:
+    """Promote a triage card to a single specified task (no fan-out)."""
+    new_title = parsed.get("title")
+    new_body = parsed.get("body")
+    title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
+    body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
+    assignee_val = None
+    if not task.assignee:
+        assignee_val = _normalize_assignee_choice(
+            parsed.get("assignee"),
+            default_assignee=default_assignee,
+            valid_names=valid_names,
+        )
+    if title_val is None and body_val is None:
+        return DecomposeOutcome(
+            task.id, False, "decomposer returned fanout=false with no title/body",
+        )
+    with kb.connect_closing() as conn:
+        ok = kb.specify_triage_task(
+            conn, task.id, title=title_val, body=body_val,
+            assignee=assignee_val, author=author,
+        )
+    if not ok:
+        return DecomposeOutcome(
+            task.id, False, "task moved out of triage before promotion",
+        )
+    return DecomposeOutcome(
+        task.id, True, "single task (no fanout)", fanout=False, new_title=title_val,
     )
 
 
@@ -329,18 +367,20 @@ def decompose_task(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
 
-    # Free pre-gate: never spend an aux-LLM call on a card that is already
-    # specified/decomposed or carries an explicit no-decompose marker.
-    with kb.connect_closing() as conn:
-        gate_ok, gate_reason = _decompose_gate(conn, task)
-    if not gate_ok:
-        return DecomposeOutcome(task_id, False, gate_reason)
-
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+    max_recon = int(kanban_cfg.get("decompose_max_recon_children", 0) or 0)
+
+    # Free pre-gate: never spend an aux-LLM call on a card that is already
+    # specified/decomposed, opted out, or not opted in.
+    with kb.connect_closing() as conn:
+        gate_ok, gate_reason = _decompose_gate(conn, task, kanban_cfg)
+    if not gate_ok:
+        return DecomposeOutcome(task_id, False, gate_reason)
+
     roster, valid_names = _build_roster()
 
     try:
@@ -392,37 +432,9 @@ def decompose_task(
 
     if not fanout:
         # Fall back to single-task spec promotion (same effect as specify).
-        new_title = parsed.get("title")
-        new_body = parsed.get("body")
-        title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
-        body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
-        assignee_val = None
-        if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
-                default_assignee=default_assignee,
-                valid_names=valid_names,
-            )
-        if title_val is None and body_val is None:
-            return DecomposeOutcome(
-                task_id, False, "decomposer returned fanout=false with no title/body",
-            )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
-            )
-        if not ok:
-            return DecomposeOutcome(
-                task_id, False, "task moved out of triage before promotion",
-            )
-        return DecomposeOutcome(
-            task_id, True, "single task (no fanout)",
-            fanout=False, new_title=title_val,
+        return _promote_single(
+            task, parsed, default_assignee=default_assignee,
+            valid_names=valid_names, author=audit_author,
         )
 
     raw_tasks = parsed.get("tasks") or []
@@ -475,6 +487,30 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    # Value gate: drop read-only recon children beyond the cap. If fewer than
+    # two children remain, a fan-out is not worth it — collapse to a single
+    # specification instead of creating a one-child graph.
+    children, dropped_recon = decompose_gate.filter_children(
+        children, max_recon_children=max_recon)
+    if dropped_recon:
+        logger.info(
+            "decompose: %s dropped %d recon child(ren) (cap=%d)",
+            task_id, dropped_recon, max_recon,
+        )
+    if len(children) < 2:
+        if not children:
+            return DecomposeOutcome(
+                task_id, False, "fan-out collapsed: no non-recon child",
+            )
+        first = children[0]
+        return _promote_single(
+            task,
+            {"title": first["title"], "body": first["body"],
+             "assignee": first["assignee"]},
+            default_assignee=default_assignee, valid_names=valid_names,
+            author=audit_author,
+        )
+
     try:
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
@@ -500,6 +536,23 @@ def decompose_task(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
     )
+
+
+def is_decomposable(task_id: str, kanban_cfg=None) -> bool:
+    """Cheap, no-LLM eligibility check (the gateway's per-tick pre-filter).
+
+    Lets the auto-decompose tick skip ineligible cards *without* spending its
+    per-tick budget, so opted-in work is reached promptly.
+    """
+    if kanban_cfg is None:
+        cfg = _load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            return False
+        ok, _reason = _decompose_gate(conn, task, kanban_cfg)
+    return ok
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

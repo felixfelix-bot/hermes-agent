@@ -2040,6 +2040,17 @@ class GatewayKanbanWatchersMixin:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        # Free pre-filter: don't spend the per-tick budget on
+                        # cards the gate will just skip (opt-in/opt-out/already
+                        # specified), so opted-in work is reached promptly.
+                        try:
+                            if not _decomp.is_decomposable(tid):
+                                continue
+                        except Exception:
+                            logger.debug(
+                                "kanban auto-decompose: is_decomposable failed "
+                                "on %s; attempting anyway", tid,
+                            )
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
