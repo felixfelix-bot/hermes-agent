@@ -187,3 +187,73 @@ def test_decompose_skips_no_decompose_marker_without_llm(kanban_home):
     m.assert_not_called()
 
 
+def _cfg(kanban: dict):
+    return patch("hermes_cli.kanban_decompose._load_config",
+                 return_value={"kanban": kanban})
+
+
+def test_decompose_skips_when_opt_in_required_and_absent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="a plain idea", triage=True)
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _cfg({"auto_decompose_opt_in_only": True}), \
+                patch("agent.auxiliary_client.call_llm") as m:
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok is False
+    assert "not opted in" in outcome.reason
+    m.assert_not_called()
+
+
+def test_decompose_single_child_fanout_collapses_to_specify(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="#decompose split me", triage=True)
+    payload = jsonlib.dumps({"fanout": True, "rationale": "x", "tasks": [
+        {"title": "the only child", "body": "b", "assignee": "orchestrator",
+         "parents": []}]})
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), _patch_extra_body(), \
+                _cfg({"decompose_max_recon_children": 0}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok and outcome.fanout is False
+    with kb.connect() as conn:
+        # specify promotes the sole card out of triage (todo, or ready when it
+        # has no open parents).
+        assert kb.get_task(conn, tid).status in ("todo", "ready")
+
+
+def test_decompose_filters_recon_children(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="#decompose split me", triage=True)
+    payload = jsonlib.dumps({"fanout": True, "rationale": "x", "tasks": [
+        {"title": "Implement the change", "body": "code",
+         "assignee": "engineer", "parents": []},
+        {"title": "Read-only recon of the lane", "body": "look",
+         "assignee": "researcher", "parents": []},
+        {"title": "Ship the release", "body": "release",
+         "assignee": "engineer", "parents": []}]})
+    patches = _patch_list_profiles(["orchestrator", "engineer", "researcher"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), _patch_extra_body(), \
+                _cfg({"decompose_max_recon_children": 0}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok and outcome.fanout is True
+    assert len(outcome.child_ids) == 2
+
+
