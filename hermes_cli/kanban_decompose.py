@@ -43,6 +43,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from hermes_cli import decompose_gate
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
 
@@ -268,6 +269,44 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _decompose_gate(conn, task) -> "tuple[bool, str]":
+    """Free pre-gate: skip cards already handled or explicitly opted out.
+
+    Prevents the auto-decompose sweep from re-sending the same ineligible card
+    to the aux LLM every dispatcher tick (board flood + quota burn). Reads only
+    local rows — never spends an LLM call.
+    """
+    has_children = False
+    specified = decomposed = False
+    try:
+        has_children = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1",
+            (task.id,),
+        ).fetchone() is not None
+    except Exception:  # pragma: no cover - schema-drift safety
+        pass
+    try:
+        for (kind,) in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? "
+            "AND kind IN ('specified', 'decomposed')",
+            (task.id,),
+        ).fetchall():
+            if kind == "specified":
+                specified = True
+            elif kind == "decomposed":
+                decomposed = True
+    except Exception:  # pragma: no cover - schema-drift safety
+        pass
+    return decompose_gate.should_decompose(
+        status=getattr(task, "status", "triage"),
+        has_children=has_children,
+        specified=specified,
+        decomposed=decomposed,
+        title=getattr(task, "title", "") or "",
+        body=getattr(task, "body", "") or "",
+    )
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -289,6 +328,13 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+
+    # Free pre-gate: never spend an aux-LLM call on a card that is already
+    # specified/decomposed or carries an explicit no-decompose marker.
+    with kb.connect_closing() as conn:
+        gate_ok, gate_reason = _decompose_gate(conn, task)
+    if not gate_ok:
+        return DecomposeOutcome(task_id, False, gate_reason)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)

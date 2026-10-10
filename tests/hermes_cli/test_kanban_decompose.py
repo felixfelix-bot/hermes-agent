@@ -161,3 +161,29 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_skips_already_specified_without_llm(kanban_home):
+    """A triage card already carrying a `specified` event must be skipped
+    before any aux-LLM call (the auto-decompose re-sweep burn)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already handled", triage=True)
+    with kb.connect() as conn:
+        kb._append_event(conn, tid, "specified", None)
+
+    with patch("agent.auxiliary_client.call_llm") as m:
+        outcome = decomp.decompose_task(tid, author="me")
+    assert outcome.ok is False
+    assert outcome.reason == "already specified/decomposed"
+    m.assert_not_called()
+
+
+def test_decompose_skips_no_decompose_marker_without_llm(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no-decompose this card", triage=True)
+
+    with patch("agent.auxiliary_client.call_llm") as m:
+        outcome = decomp.decompose_task(tid, author="me")
+    assert outcome.ok is False
+    assert outcome.reason == "no-decompose marker"
+    m.assert_not_called()
+
+
