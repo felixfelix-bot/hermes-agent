@@ -7,7 +7,12 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
-    "fallback_providers": [],
+    # 2026-10-11 (pr/market-router-consolidation): NO "fallback_providers"
+    # default. The market router (zai_proxy + flat_router) is the single
+    # chooser of endpoint+model; a profile that wants a static chain sets the
+    # key explicitly. Every consumer reads it with .get(...), so its absence
+    # is the market-routed default and the empty [] residue no longer appears
+    # in generated profiles.
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the
