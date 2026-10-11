@@ -107,3 +107,80 @@ def test_load_policy_falls_back_to_defaults_without_a_file(tmp_path, monkeypatch
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = load_policy(home=str(tmp_path))
     assert policy == dict(DEFAULT_POLICY)
+
+
+# ── price deferral vs capacity hold (2026-10-11) ────────────────────────────
+# The router's dispatch gate answers can_dispatch=False in TWO different
+# situations: the pool is UNDELIVERABLE (capacity -> hold the fleet), or its
+# cheapest DELIVERABLE lane is merely above this urgency's willingness-to-pay
+# ceiling (spend -> alert, keep soft_floor workers). Conflating them parked the
+# whole fleet on a $0.61/M market against the $0.50/M `soon` ceiling, with no
+# hysteresis, so it flapped with every market sample (2026-10-11 incident).
+
+def _gate(**over):
+    base = {
+        "can_dispatch": True,
+        "deliverable": True,
+        "price_ceiling_per_m": 0.5,
+        "effective_price_per_m": 0.4,
+        "reason": "ok",
+    }
+    base.update(over)
+    return base
+
+
+def test_deliverable_lane_above_the_ceiling_is_a_spend_deferral():
+    from gateway.dispatch_headroom import is_price_deferral
+    assert is_price_deferral(
+        _gate(can_dispatch=False, effective_price_per_m=0.61)
+    )
+
+
+def test_undeliverable_pool_is_a_capacity_hold_not_a_deferral():
+    from gateway.dispatch_headroom import is_price_deferral
+    assert not is_price_deferral(_gate(can_dispatch=False, deliverable=False))
+
+
+def test_answered_no_without_price_fields_is_not_a_deferral():
+    from gateway.dispatch_headroom import is_price_deferral
+    assert not is_price_deferral({"can_dispatch": False, "deliverable": True})
+
+
+def test_a_dispatchable_verdict_is_never_a_deferral():
+    from gateway.dispatch_headroom import is_price_deferral
+    assert not is_price_deferral(_gate())
+
+
+def test_a_spend_deferral_must_not_hard_zero_the_fleet():
+    from gateway.dispatch_headroom import (
+        DEFAULT_POLICY, fold_target, price_defer_headroom,
+    )
+    policy = dict(DEFAULT_POLICY)
+    policy["critical_dimensions"] = [
+        "memory_pct", "disk_used_pct", "swap_used_pct", "llm",
+    ]
+    healthy = {"cpu_load": 1.0, "memory_pct": 1.0, "swap_used_pct": 1.0,
+               "disk_used_pct": 1.0, "llm": 0.0}
+    # as the policy stands today: a critical llm at 0.0 zeroes the whole fleet
+    assert fold_target(healthy, policy["critical_dimensions"], 3, 1) == 0
+    # after the deferral view: soft_floor workers keep every board moving
+    per_dim = price_defer_headroom(healthy, policy, 3)
+    assert per_dim["llm"] == 1.0, "spend is not capacity: never a hard hold"
+    assert fold_target(per_dim, policy["critical_dimensions"], 3, 1) == 1
+
+
+def test_a_spend_deferral_lands_on_soft_floor_for_any_cap():
+    from gateway.dispatch_headroom import (
+        DEFAULT_POLICY, fold_target, price_defer_headroom,
+    )
+    policy = dict(DEFAULT_POLICY)
+    policy["critical_dimensions"] = [
+        "memory_pct", "disk_used_pct", "swap_used_pct", "llm",
+    ]
+    for cap in (1, 2, 3, 4, 6, 8, 12):
+        per_dim = price_defer_headroom({"llm": 0.0, "cpu_load": 1.0}, policy, cap)
+        target = fold_target(per_dim, policy["critical_dimensions"], cap, 1)
+        assert target == int(policy["soft_floor"]), (
+            f"cap={cap}: a spend deferral must land exactly on soft_floor, "
+            f"got {target} (per_dim={per_dim})"
+        )

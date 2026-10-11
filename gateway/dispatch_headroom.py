@@ -37,6 +37,13 @@ DEFAULT_POLICY: dict = {
     "critical_dimensions": ["memory_pct", "disk_used_pct", "swap_used_pct"],
     # Workers still allowed when only SOFT dimensions breach (e.g. CPU).
     "soft_floor": 1,
+    # D-128 §8.2 fail-open-on-timeout: when the LLM price/quota gate
+    # (/v1/dispatch_gate on the router) is UNAVAILABLE (timeout, refused
+    # connection, garbled answer) — as opposed to answering "no" — dispatch
+    # continues under this conservative cap instead of hard-zeroing. 1 worker
+    # keeps one board moving (and lets the gate recover on the next probe)
+    # without spawning the fleet into an un-evaluated pool.
+    "llm_gate_timeout_cap": 1,
 }
 
 
@@ -152,6 +159,89 @@ def fold_target(
     if min_headroom <= 0.0:
         return max(0, int(soft_floor))
     return max(1, int(round(cap * min_headroom)))
+
+
+def is_price_deferral(gate: dict | None) -> bool:
+    """True when an ANSWERED ``can_dispatch: false`` is a SPEND deferral.
+
+    The router's dispatch gate says "no" in two very different situations:
+
+    * the pool is **undeliverable** (no lane can serve the task at any price) —
+      a *capacity* verdict: the fleet must hold (2026-10-03: spawning
+      soft_floor workers into guaranteed 503s burned a full context each);
+    * the pool is **deliverable** but its cheapest lane is above this urgency's
+      willingness-to-pay ceiling — a *spend* deferral, not a capacity verdict.
+
+    ``state/fleet/dispatch_budget.yaml`` states the ceiling "bounds SPEND, not
+    availability — it can never re-introduce a quota veto", so the second case
+    must never hard-park the fleet. Distinguishing them is what stops a price
+    ceiling from masquerading as an exhausted pool (2026-10-11 incident).
+
+    Deliberately conservative: any missing/None price field returns False, i.e.
+    the verdict keeps its existing (holding) meaning.
+    """
+    if not isinstance(gate, dict) or gate.get("can_dispatch", True):
+        return False
+    if not bool(gate.get("deliverable", True)):
+        return False  # undeliverable pool -> real capacity verdict
+    ceiling = gate.get("price_ceiling_per_m")
+    effective = gate.get("effective_price_per_m")
+    if ceiling is None or effective is None:
+        return False  # uncapped, or a verdict with no price basis: not a deferral
+    try:
+        return float(effective) > float(ceiling)
+    except (TypeError, ValueError):
+        return False
+
+
+def price_defer_headroom(per_dim: dict, policy: dict | None = None,
+                         static_cap: int | None = None) -> dict:
+    """Per-dimension view after a *spend* deferral (see :func:`is_price_deferral`).
+
+    Returns a copy with ``llm`` pinned at 1.0 — spend is not capacity, so it must
+    never be the dimension that hard-zeroes dispatch — plus the marker dimension
+    ``price_defer`` whose headroom is the ratio of the conservative
+    ``soft_floor`` to the effective static cap, so :func:`fold_target` (called
+    with the same ``static_cap``) lands exactly on ``soft_floor``: the fleet
+    keeps moving and the price is surfaced (reason + state file) as an ALERT.
+
+    A real hold still hard-zeroes: only the price dimension is de-rated (see the
+    unit tests for the undeliverable-pool case).
+    """
+    out = dict(per_dim or {})
+    out["llm"] = 1.0  # spend != unavailability: never a hard hold
+    cap = static_cap if static_cap and static_cap >= 1 else 3
+    floor = int((policy or DEFAULT_POLICY).get("soft_floor", 1))
+    out["price_defer"] = min(1.0, max(0.0, floor / float(cap)))
+    return out
+
+
+def llm_gate_degraded_headroom(per_dim: dict, policy: dict | None = None,
+                               static_cap: int | None = None) -> dict:
+    """Per-dimension view after an UNAVAILABLE llm gate (D-128 §8.2).
+
+    Called when the /v1/dispatch_gate probe timed out / could not be reached
+    (NOT when it answered ``can_dispatch: false`` — an answer is a verdict and
+    must hold). Returns a copy with ``llm`` pinned at 1.0 (an unavailable
+    sensor never blocks) plus the marker dimension ``llm_gate_degraded`` whose
+    headroom is the ratio of the conservative ``llm_gate_timeout_cap`` to the
+    effective static cap — so :func:`fold_target` (called with the same
+    ``static_cap``) lands exactly on the conservative cap instead of the full
+    one.
+
+    A real resource hold still hard-zeroes: only the gate dimension is
+    de-rated (see the unit tests for the memory-hold case).
+    """
+    policy = policy or DEFAULT_POLICY
+    out = dict(per_dim or {})
+    out["llm"] = 1.0  # unknown != "no": never let a silent sensor hold boards
+    try:
+        cap_n = int(static_cap) if static_cap and int(static_cap) >= 1 else 3
+        timeout_cap = max(1, int(policy.get("llm_gate_timeout_cap", 1) or 1))
+        out["llm_gate_degraded"] = timeout_cap / cap_n
+    except (TypeError, ValueError):
+        out["llm_gate_degraded"] = 1.0 / 3
+    return out
 
 
 def reviewer_headroom(policy: dict | None = None) -> float:

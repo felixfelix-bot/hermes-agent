@@ -21,7 +21,12 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
-    "fallback_providers": [],
+    # 2026-10-11 (market-router consolidation): NO "fallback_providers"
+    # default. The market router (zai_proxy + flat_router) is the single
+    # chooser of endpoint+model; a profile that wants a static chain sets the
+    # key explicitly. Every consumer reads it with .get(...), so its absence
+    # is the market-routed default and the empty [] residue no longer appears
+    # in generated profiles.
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.

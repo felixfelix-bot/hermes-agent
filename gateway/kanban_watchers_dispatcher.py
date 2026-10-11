@@ -287,6 +287,17 @@ class _KanbanDispatcher:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        # Free pre-filter: don't spend the per-tick budget on
+                        # cards the gate will just skip (opt-in/opt-out/already
+                        # specified), so opted-in work is reached promptly.
+                        try:
+                            if not _decomp.is_decomposable(tid):
+                                continue
+                        except Exception:
+                            logger.debug(
+                                "kanban auto-decompose: is_decomposable failed "
+                                "on %s; attempting anyway", tid,
+                            )
                         attempted += 1
                         successes += self._decompose_one(_decomp, slug, tid)
                 finally:
@@ -358,6 +369,36 @@ def _log_spawn_results(results: Optional[list]) -> bool:
     return any_spawned
 
 
+def _write_dispatch_gate_degraded(reason: str, now: "float | None" = None) -> None:
+    """Persist the D-128 §8.2 fail-open degradation marker (best-effort).
+
+    ``~/.hermes/bot/dispatch_gate_degraded.json`` is the alert surface fleet
+    watchdogs (dispatch_health_check / capacity_recovery_digest /
+    task-lifecycle-governor) already know how to read: a JSON state file next
+    to the other bot-state JSONs. Writing it must never affect the dispatch
+    decision — every failure mode is swallowed.
+    """
+    try:
+        p = Path.home() / ".hermes" / "bot" / "dispatch_gate_degraded.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        import time as _time
+        ts = now if now is not None else _time.time()
+        try:
+            prev = _json.loads(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            prev = {}
+        p.write_text(_json.dumps({
+            "mode": "timeout-fail-open",
+            "last_reason": reason,
+            "last_ts": ts,
+            "first_seen": prev.get("first_seen") or ts,
+            "count": int(prev.get("count", 0)) + 1,
+        }), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _compute_dispatch_headroom(
     static_cap: "Optional[int]" = None,
 ) -> dict:
@@ -385,7 +426,10 @@ def _compute_dispatch_headroom(
 
     from gateway.dispatch_headroom import (
         fold_target,
+        is_price_deferral,
+        llm_gate_degraded_headroom,
         load_policy,
+        price_defer_headroom,
         resource_headroom,
     )
 
@@ -442,20 +486,56 @@ def _compute_dispatch_headroom(
     per_dim = resource_headroom(raw, policy, cores, kalman_warn)
 
     # ── 2. LLM price/quota gate (market-based live router) ──
+    # D-128 §8.2 fail-open-on-timeout: an ANSWERED "no" (can_dispatch false)
+    # is a real verdict and holds; an UNAVAILABLE gate (timeout, refused
+    # connection, garbled body) is a dead sensor and must never block all
+    # spawns — dispatch continues at the conservative `llm_gate_timeout_cap`
+    # and the degradation is surfaced (reason + state file alert).
     llm_headroom = 1.0
     llm_reason = ""
+    llm_gate_degraded = False
+    price_defer = False
     try:
+        # urgency=now (2026-10-11): the coarse headroom probe must use the HIGHEST
+        # willingness-to-pay (the `urgent`/`now` ceiling) so that `now` work can
+        # run during work-hour peak. Per-card ceilings are applied by the urgency
+        # gate; probing with the default (`standard`->`soon`) held even `now`
+        # cards at the lower ceiling.
         req = _urllib.Request(
-            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
+            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding&urgency=now",
             headers={"Accept": "application/json"},
         )
         with _urllib.urlopen(req, timeout=5) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
         llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
         llm_reason = data.get("reason", "") or ""
+        # A price-ceiling "no" is a SPEND deferral, not a capacity verdict: the
+        # market is deliverable and a lane exists, it is merely above this
+        # urgency's willingness-to-pay. It must never hard-park the fleet.
+        try:
+            price_defer = is_price_deferral(data)
+        except Exception:
+            price_defer = False
     except Exception as exc:
-        logger.warning("kanban dispatcher: LLM dispatch_gate unavailable (%s)", exc)
+        llm_gate_degraded = True
+        llm_reason = f"dispatch_gate timeout/unavailable ({exc.__class__.__name__}): fail-open"
+        logger.warning(
+            "kanban dispatcher: LLM dispatch_gate unavailable (%s) — "
+            "failing OPEN at the conservative cap (D-128 §8.2)", exc)
+        _write_dispatch_gate_degraded(llm_reason)
     per_dim["llm"] = llm_headroom
+    if llm_gate_degraded:
+        try:
+            per_dim = llm_gate_degraded_headroom(per_dim, policy, static_cap)
+        except Exception:
+            per_dim["llm_gate_degraded"] = 1.0
+    elif price_defer:
+        try:
+            per_dim = price_defer_headroom(per_dim, policy, static_cap)
+        except Exception:
+            # Conservative fallback: keep the hold rather than widening spend
+            # on an unexpected error (mirrors the degraded-gate branch).
+            per_dim["price_defer"] = 1.0
 
     # ── 2b. Reviewer-aware gate (2026-09-30) ──
     # Hold dispatch when NO cross-family reviewer lane is live, so we do not
@@ -482,10 +562,23 @@ def _compute_dispatch_headroom(
     #       the LLM gate's text (the 2026-09-28 misreport). ──
     if per_dim:
         binding = min(per_dim, key=per_dim.get)
-        if binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
+        # Degraded-gate reason claims the line ONLY when the fail-open ratio is
+        # the binding constraint; a real resource hold (memory/disk/swap at 0.0
+        # binds lower) still names the resource — never mask a hold with gate
+        # text (the 2026-09-28 misreport).
+        if binding == "llm_gate_degraded":
+            reason = llm_reason or (
+                "dispatch_gate timeout: fail-open at conservative cap (D-128 8.2)")
+        elif binding == "reviewer" and per_dim.get("reviewer", 1.0) <= 0.0:
             reason = "reviewer lane unavailable: no cross-family reviewer served"
             if llm_reason:
                 reason += f"; llm: {llm_reason}"
+        elif binding == "price_defer":
+            # The alert half: say WHY, and say it is a cost deferral, not a hold.
+            reason = llm_reason or (
+                "price ceiling: cheapest deliverable lane is above this "
+                "urgency's willingness-to-pay ceiling; deferred to soft_floor "
+                "(alert, not a hold)")
         elif per_dim[binding] < 1.0 and binding != "llm":
             reason = (
                 f"resource throttle: {binding} headroom {per_dim[binding]:.1f} "
@@ -506,6 +599,22 @@ def _compute_dispatch_headroom(
         "per_dimension": per_dim,
         "reason": reason,
     }
+    if price_defer:
+        # Surface the spend deferral on the persisted snapshot so watchdogs
+        # reading dispatch_headroom.json can ALERT without blocking dispatch.
+        result["price_defer"] = True
+    if llm_gate_degraded:
+        # Surface the D-128 §8.2 fail-open state on the persisted snapshot so
+        # watchdogs reading dispatch_headroom.json see WHY the target is low.
+        result["llm_gate_degraded"] = True
+    else:
+        # Gate answered: clear any stale degradation marker (recovery).
+        try:
+            _p = Path.home() / ".hermes" / "bot" / "dispatch_gate_degraded.json"
+            if _p.exists():
+                _p.unlink()
+        except Exception:
+            pass
     # Persist so the task-lifecycle governor (Phase 7) reads the SAME headroom
     # signal and never revives into a starved box. Fail-open: a write error
     # must not affect the dispatch decision.
