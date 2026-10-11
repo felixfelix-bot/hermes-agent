@@ -816,6 +816,9 @@ _RENAMED_TASK_COLUMNS = (
 _LATER_TASK_COLUMNS = (
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
+    # Unix ts of the most recent failure; anchors the exponential respawn
+    # backoff (D-128 §8.5).
+    ("last_failure_at", "last_failure_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
     ("workflow_template_id", "workflow_template_id TEXT"),
     ("current_step_key", "current_step_key TEXT"),

@@ -87,6 +87,91 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Respawn churn protection (D-128 §8.5)
+#
+# Upstream already covers per-tick systemic same-error crashes (>= 3 identical
+# fingerprints in one detect tick -> sticky block, ``_account_crashes``) and
+# spaces quota/infra bounces via the cooldowns above. Two churn families remain
+# unaddressed and are added here as respawn-GUARD reasons (deferral, surfaced
+# via the ``respawn_guarded`` event; the dispatcher re-evaluates next tick):
+#   1. Exponential backoff on ``consecutive_failures`` anchored at
+#      ``last_failure_at``: a crash loop waits base*2^(failures-1) (capped)
+#      between attempts instead of hot-looping every tick.
+#   2. A windowed max-respawn cap counting EVERY ``spawned`` event in 24h —
+#      catches rate-limit bounces and TTL reclaims that never increment
+#      ``consecutive_failures`` (the CW 67-spawn incident class).
+# Both are env-tunable; setting a knob to 0 disables that layer.
+# ---------------------------------------------------------------------------
+DEFAULT_RESPAWN_BACKOFF_BASE_SECONDS = 60
+DEFAULT_RESPAWN_BACKOFF_MAX_SECONDS = 3600
+DEFAULT_MAX_RESPAWNS_PER_WINDOW = 6
+_RESPAWN_WINDOW_SECONDS = 24 * 3600
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse a non-negative int env knob; default when absent/invalid."""
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return default
+
+
+def _respawn_backoff_delay(consecutive_failures: int) -> int:
+    """Exponential respawn backoff delay in seconds (D-128 §8.5).
+
+    ``base * 2**(failures-1)`` capped at ``max``. ``failures <= 0`` returns 0
+    (no failures recorded — nothing to back off). Setting the base env knob to
+    0 disables the layer entirely (delay always 0).
+    """
+    base = _env_int(
+        "HERMES_KANBAN_RESPAWN_BACKOFF_BASE_SECONDS",
+        DEFAULT_RESPAWN_BACKOFF_BASE_SECONDS,
+    )
+    if base <= 0 or consecutive_failures <= 0:
+        return 0
+    cap = _env_int(
+        "HERMES_KANBAN_RESPAWN_BACKOFF_MAX_SECONDS",
+        DEFAULT_RESPAWN_BACKOFF_MAX_SECONDS,
+    )
+    delay = base * (2 ** (consecutive_failures - 1))
+    return min(delay, cap)
+
+
+def _respawn_churn_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Windowed max-respawn cap (D-128 §8.5 layer 2), else None.
+
+    Counts EVERY ``spawned`` event for the task in the trailing 24h — including
+    rate-limit bounces and claim-TTL reclaims, which reset/restore the task
+    without incrementing ``consecutive_failures`` — so a bounce loop cannot spin
+    forever just because no counter was ticked. Env-tunable
+    (``HERMES_KANBAN_MAX_RESPAWNS_PER_WINDOW``); 0 disables the layer.
+    """
+    max_respawns = _env_int(
+        "HERMES_KANBAN_MAX_RESPAWNS_PER_WINDOW", DEFAULT_MAX_RESPAWNS_PER_WINDOW)
+    if max_respawns <= 0:
+        return None
+    cutoff = int(time.time()) - _RESPAWN_WINDOW_SECONDS
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'spawned' AND created_at >= ?",
+            (task_id, cutoff),
+        ).fetchone()[0]
+    except Exception:
+        return None
+    if int(n) >= max_respawns:
+        return (
+            f"respawn_churn: {int(n)} spawns in the last "
+            f"{_RESPAWN_WINDOW_SECONDS // 3600}h (cap {max_respawns})"
+        )
+    return None
+
 
 @dataclass
 class DispatchResult:
@@ -1394,15 +1479,15 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, last_failure_at = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error, task_id),
+                    (retry_status, failures, error, int(time.time()), task_id),
                 )
             else:
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error, task_id),
+                    "last_failure_error = ?, last_failure_at = ? WHERE id = ?",
+                    (failures, error, int(time.time()), task_id),
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
@@ -1421,9 +1506,9 @@ def _record_task_failure(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
+            + "consecutive_failures = ?, last_failure_error = ?, last_failure_at = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            (failures, error, int(time.time()), task_id),
         )
         payload = {
             "failures": failures,
@@ -1483,7 +1568,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, last_failure_at = NULL WHERE id = ?",
             (task_id,),
         )
 
@@ -1494,12 +1579,16 @@ def check_respawn_guard(
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
+    ``"respawn_churn"`` (>= ``HERMES_KANBAN_MAX_RESPAWNS_PER_WINDOW`` ``spawned``
+    events in the trailing 24h — a bounce/reclaim loop; D-128 §8.5 layer 2),
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    path never increments ``consecutive_failures``), ``"backoff"``
+    (``consecutive_failures`` in the exponential respawn backoff window,
+    ``last_failure_at`` anchor; D-128 §8.5 layer 1), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -1517,6 +1606,13 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+
+    # 0. Windowed max-respawn cap (D-128 §8.5 layer 2) — checked FIRST so it
+    #    also catches rate-limit bounces and TTL reclaims, which never
+    #    increment ``consecutive_failures`` and otherwise early-return below.
+    churn = _respawn_churn_reason(conn, task_id)
+    if churn:
+        return churn
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
@@ -1547,6 +1643,24 @@ def check_respawn_guard(
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
+
+    # 1b. Exponential respawn backoff (D-128 §8.5 layer 1): the task failed
+    #     ``consecutive_failures`` times in a row; the next respawn must wait
+    #     ``base * 2**(failures-1)`` seconds (capped), counted from
+    #     ``last_failure_at`` — a crash loop slows down instead of hot-looping.
+    #     Checked AFTER the rate-limit cooldown (the more specific signal — that
+    #     path never counts failures) and BEFORE ``blocker_auth`` so a
+    #     deterministic quota/auth error still defers via its own rule.
+    row2 = conn.execute(
+        "SELECT consecutive_failures, last_failure_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row2 is not None:
+        _failures = int(row2["consecutive_failures"] or 0)
+        _last_at = row2["last_failure_at"]
+        _delay = _respawn_backoff_delay(_failures)
+        if _delay > 0 and _last_at is not None and (now - int(_last_at)) < _delay:
+            return "backoff"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
