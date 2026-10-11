@@ -161,6 +161,61 @@ def fold_target(
     return max(1, int(round(cap * min_headroom)))
 
 
+def is_price_deferral(gate: dict | None) -> bool:
+    """True when an ANSWERED ``can_dispatch: false`` is a SPEND deferral.
+
+    The router's dispatch gate says "no" in two very different situations:
+
+    * the pool is **undeliverable** (no lane can serve the task at any price) —
+      a *capacity* verdict: the fleet must hold (2026-10-03: spawning
+      soft_floor workers into guaranteed 503s burned a full context each);
+    * the pool is **deliverable** but its cheapest lane is above this urgency's
+      willingness-to-pay ceiling — a *spend* deferral, not a capacity verdict.
+
+    ``state/fleet/dispatch_budget.yaml`` states the ceiling "bounds SPEND, not
+    availability — it can never re-introduce a quota veto", so the second case
+    must never hard-park the fleet. Distinguishing them is what stops a price
+    ceiling from masquerading as an exhausted pool (2026-10-11 incident).
+
+    Deliberately conservative: any missing/None price field returns False, i.e.
+    the verdict keeps its existing (holding) meaning.
+    """
+    if not isinstance(gate, dict) or gate.get("can_dispatch", True):
+        return False
+    if not bool(gate.get("deliverable", True)):
+        return False  # undeliverable pool -> real capacity verdict
+    ceiling = gate.get("price_ceiling_per_m")
+    effective = gate.get("effective_price_per_m")
+    if ceiling is None or effective is None:
+        return False  # uncapped, or a verdict with no price basis: not a deferral
+    try:
+        return float(effective) > float(ceiling)
+    except (TypeError, ValueError):
+        return False
+
+
+def price_defer_headroom(per_dim: dict, policy: dict | None = None,
+                         static_cap: int | None = None) -> dict:
+    """Per-dimension view after a *spend* deferral (see :func:`is_price_deferral`).
+
+    Returns a copy with ``llm`` pinned at 1.0 — spend is not capacity, so it must
+    never be the dimension that hard-zeroes dispatch — plus the marker dimension
+    ``price_defer`` whose headroom is the ratio of the conservative
+    ``soft_floor`` to the effective static cap, so :func:`fold_target` (called
+    with the same ``static_cap``) lands exactly on ``soft_floor``: the fleet
+    keeps moving and the price is surfaced (reason + state file) as an ALERT.
+
+    A real hold still hard-zeroes: only the price dimension is de-rated (see the
+    unit tests for the undeliverable-pool case).
+    """
+    out = dict(per_dim or {})
+    out["llm"] = 1.0  # spend != unavailability: never a hard hold
+    cap = static_cap if static_cap and static_cap >= 1 else 3
+    floor = int((policy or DEFAULT_POLICY).get("soft_floor", 1))
+    out["price_defer"] = min(1.0, max(0.0, floor / float(cap)))
+    return out
+
+
 def llm_gate_degraded_headroom(per_dim: dict, policy: dict | None = None,
                                static_cap: int | None = None) -> dict:
     """Per-dimension view after an UNAVAILABLE llm gate (D-128 §8.2).
