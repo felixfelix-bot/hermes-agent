@@ -407,8 +407,15 @@ def _compute_dispatch_headroom(
     llm_gate_degraded = False
     price_defer = False
     try:
+        # urgency=now (2026-10-11): the coarse headroom probe must use the HIGHEST
+        # willingness-to-pay (the `urgent`/`now` ceiling, e.g. $0.70) so that
+        # `now` work can run during work-hour peak. Per-card ceilings are applied
+        # by the urgency gate (kanban urgency_gate parks `soon`/`defer`/`batch`
+        # cards when the market is above THEIR ceiling, e.g. $0.50 for `soon`).
+        # Probing with the default (`standard`->`soon`, $0.50) held even `now`
+        # cards at the lower ceiling.
         req = _urllib.Request(
-            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
+            "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding&urgency=now",
             headers={"Accept": "application/json"},
         )
         with _urllib.urlopen(req, timeout=5) as resp:
