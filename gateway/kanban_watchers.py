@@ -405,6 +405,7 @@ def _compute_dispatch_headroom(
     llm_headroom = 1.0
     llm_reason = ""
     llm_gate_degraded = False
+    price_defer = False
     try:
         req = _urllib.Request(
             "http://localhost:9099/v1/dispatch_gate?estimated_tokens=200000&task_type=coding",
@@ -414,6 +415,14 @@ def _compute_dispatch_headroom(
             data = _json.loads(resp.read().decode("utf-8"))
         llm_headroom = 1.0 if data.get("can_dispatch", True) else 0.0
         llm_reason = data.get("reason", "") or ""
+        # A price-ceiling "no" is a SPEND deferral, not a capacity verdict: the
+        # market is deliverable and a lane exists, it is merely above this
+        # urgency's willingness-to-pay. It must never hard-park the fleet.
+        try:
+            from gateway.dispatch_headroom import is_price_deferral
+            price_defer = is_price_deferral(data)
+        except Exception:
+            price_defer = False
     except Exception as exc:
         llm_gate_degraded = True
         llm_reason = f"dispatch_gate timeout/unavailable ({exc.__class__.__name__}): fail-open"
@@ -428,6 +437,14 @@ def _compute_dispatch_headroom(
             per_dim = llm_gate_degraded_headroom(per_dim, policy, static_cap)
         except Exception:
             per_dim["llm_gate_degraded"] = 1.0
+    elif price_defer:
+        try:
+            from gateway.dispatch_headroom import price_defer_headroom
+            per_dim = price_defer_headroom(per_dim, policy, static_cap)
+        except Exception:
+            # Conservative fallback: keep the hold rather than widening spend
+            # on an unexpected error (mirrors the degraded-gate branch).
+            per_dim["price_defer"] = 1.0
 
     # ── 2b. Reviewer-aware gate (2026-09-30) ──
     # Hold dispatch when NO cross-family reviewer lane is live, so we do not
@@ -465,6 +482,12 @@ def _compute_dispatch_headroom(
             reason = "reviewer lane unavailable: no cross-family reviewer served"
             if llm_reason:
                 reason += f"; llm: {llm_reason}"
+        elif binding == "price_defer":
+            # The alert half: say WHY, and say it is a cost deferral, not a hold.
+            reason = llm_reason or (
+                "price ceiling: cheapest deliverable lane is above this "
+                "urgency's willingness-to-pay ceiling; deferred to soft_floor "
+                "(alert, not a hold)")
         elif per_dim[binding] < 1.0 and binding != "llm":
             reason = (
                 f"resource throttle: {binding} headroom {per_dim[binding]:.1f} "
@@ -485,6 +508,10 @@ def _compute_dispatch_headroom(
         "per_dimension": per_dim,
         "reason": reason,
     }
+    if price_defer:
+        # Surface the spend deferral on the persisted snapshot so watchdogs
+        # reading dispatch_headroom.json can ALERT without blocking dispatch.
+        result["price_defer"] = True
     if llm_gate_degraded:
         # Surface the D-128 §8.2 fail-open state on the persisted snapshot so
         # watchdogs reading dispatch_headroom.json see WHY the target is low.
