@@ -21,9 +21,12 @@ window so a starved card is eventually claimed by any fitting node.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+_log = logging.getLogger("gateway.fleet_placement")
 
 HERMES = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 BOT = HERMES / "bot"
@@ -84,4 +87,10 @@ def select_peer() -> str | None:
 
 def local_dispatch_allowed() -> bool:
     """True if the dispatcher may spawn batch workers on THIS node."""
-    return select_peer() is None
+    try:
+        peer = select_peer()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("fleet-placement: gate error, failing open: %r", exc)
+        return True
+    _log.warning("fleet-placement: peer=%s local_dispatch_allowed=%s", peer, peer is None)
+    return peer is None
