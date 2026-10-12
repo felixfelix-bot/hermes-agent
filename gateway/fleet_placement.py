@@ -28,17 +28,22 @@ from pathlib import Path
 
 _log = logging.getLogger("gateway.fleet_placement")
 
-HERMES = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-BOT = HERMES / "bot"
+# Fleet ops data lives under ~/.hermes/bot regardless of the active profile:
+# the gateway repoints HERMES_HOME at a profile dir at runtime, so HERMES_HOME
+# cannot be trusted for fleet co-ordination files.
+FLEET_BOT = Path(os.environ.get(
+    "HERMES_FLEET_BOT", str(Path.home() / ".hermes" / "bot")))
+FLEET_SCRIPTS = FLEET_BOT.parent / "scripts"
+POLICY_PATH = FLEET_BOT / "placement_policy.json"
 
 SCOPE = "kanban_worker"
 
 
 def _load_placement_module():
-    """Import the fleet's placement_policy.py from the deployed scripts dir."""
-    scripts = HERMES / "scripts"
-    if str(scripts) not in sys.path:
-        sys.path.insert(0, str(scripts))
+    """Import the fleet's placement_policy.py from the scripts dir."""
+    for d in (str(FLEET_SCRIPTS),):
+        if d not in sys.path:
+            sys.path.insert(0, d)
     import placement_policy  # type: ignore
     return placement_policy
 
@@ -53,7 +58,7 @@ def _read_json(p: Path):
 def _peer_healths() -> list[dict]:
     """Peer health dicts, deduped by node preferring ``*.health.json``."""
     best: dict[str, dict] = {}
-    peers = BOT / "peers"
+    peers = FLEET_BOT / "peers"
     if not peers.is_dir():
         return []
     for f in sorted(peers.glob("*.json")):
@@ -75,22 +80,20 @@ def select_peer() -> str | None:
     """
     try:
         pp = _load_placement_module()
-        policy = pp.load_policy()
-        me = _read_json(BOT / "fleet_health.json")
+        policy = pp.load_policy(POLICY_PATH)
+        me = _read_json(FLEET_BOT / "fleet_health.json")
         node = me.get("node") or os.environ.get("FLEET_NODE")
         if not pp.is_gateway_host(node, policy):
             return None
         return pp.select_node(_peer_healths(), policy, scope=SCOPE)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("fleet-placement: gate error, failing open: %r", exc)
         return None
 
 
 def local_dispatch_allowed() -> bool:
     """True if the dispatcher may spawn batch workers on THIS node."""
-    try:
-        peer = select_peer()
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("fleet-placement: gate error, failing open: %r", exc)
-        return True
-    _log.warning("fleet-placement: peer=%s local_dispatch_allowed=%s", peer, peer is None)
+    peer = select_peer()
+    _log.info("fleet-placement: peer=%s local_dispatch_allowed=%s",
+              peer, peer is None)
     return peer is None
