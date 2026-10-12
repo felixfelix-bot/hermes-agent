@@ -1868,6 +1868,17 @@ class GatewayKanbanWatchersMixin:
             # any dimension is critical; otherwise dispatch up to the target.
             headroom = _compute_dispatch_headroom(max_in_progress)
             target = headroom.get("target_workers", 0)
+            # Max-headroom fleet placement (2026-10-12): never spawn batch
+            # workers on a gateway host while a fitting peer has more
+            # (Kalman-predicted) headroom. The cross-node fleet queue places
+            # the work; this node holds local dispatch. Fail-open: a missing
+            # policy or peer telemetry leaves dispatch unchanged.
+            try:
+                from gateway.fleet_placement import local_dispatch_allowed
+                if not local_dispatch_allowed():
+                    target = 0
+            except Exception:
+                pass
             # Mandatory-urgency sweep (Phase N): park unclassified `ready`
             # cards on EVERY board before the capacity check, so a task is
             # never left dispatchable merely because the fleet is at its cap
