@@ -1051,3 +1051,345 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# HERMES_KANBAN_TASK id-form normalization (qualified vs bare-PK mismatch)
+# ---------------------------------------------------------------------------
+#
+# Regression tests for the ownership-gate / DB-PK id-form mismatch.
+#
+# Canonical convention (documented in _worker_task_scope): HERMES_KANBAN_TASK
+# carries the BARE tasks.id PK — the exact value the dispatcher writes at
+# spawn time (kanban_db._default_spawn: env["HERMES_KANBAN_TASK"] = task.id)
+# and the exact value every lifecycle UPDATE ... WHERE id = ? matches.
+# External layers sometimes hand a worker a board-QUALIFIED id
+# ("e80-bench:t_1bc0ce3d" — the fleet-offload session-id format leaking into
+# the env var). Before the fix, the only id that passed the ownership gate
+# (qualified) never matched a DB row, and the only id that matched a row
+# (bare) was refused by the gate — a worker could not complete/block its own
+# card. The gate and the normalization now agree on the bare form; a foreign
+# board qualifier is still refused, and no LIKE/prefix matching was added.
+
+import pytest
+
+
+@pytest.fixture
+def worker_env_board(monkeypatch, tmp_path):
+    """Worker pinned to a non-default board with a claimed task.
+
+    Mirrors _default_spawn: HERMES_KANBAN_BOARD + HERMES_KANBAN_DB are set
+    alongside HERMES_KANBAN_TASK so path resolution can't drift to the
+    'default' board via the <root>/kanban/current symlink.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="qualified-id-test", assignee="test-worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    return tid
+
+
+def _reclaim(conn, kb, tid):
+    """Reset a terminal/intermediate task back to a completable state."""
+    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+    conn.commit()
+
+
+def test_worker_scope_env_id_bare_form(worker_env_board):
+    """Bare env id resolves to itself (unchanged canonical behaviour)."""
+    from tools import kanban_tools as kt
+    import os
+    os.environ["HERMES_KANBAN_TASK"] = worker_env_board
+    os.environ["HERMES_KANBAN_BOARD"] = "e80-bench"
+    bare, raw = kt._worker_task_scope()
+    assert bare == worker_env_board == raw
+
+
+def test_worker_scope_env_id_qualified_form(worker_env_board):
+    """Board-qualified env id matching the pinned board strips to the bare PK."""
+    from tools import kanban_tools as kt
+    import os
+    os.environ["HERMES_KANBAN_TASK"] = f"e80-bench:{worker_env_board}"
+    os.environ["HERMES_KANBAN_BOARD"] = "e80-bench"
+    bare, raw = kt._worker_task_scope()
+    assert bare == worker_env_board
+    assert raw == f"e80-bench:{worker_env_board}"
+
+
+def test_worker_scope_env_id_foreign_board_qualifier(worker_env_board):
+    """A qualifier naming a different board than the pin is NOT stripped."""
+    from tools import kanban_tools as kt
+    import os
+    os.environ["HERMES_KANBAN_TASK"] = f"admin:{worker_env_board}"
+    os.environ["HERMES_KANBAN_BOARD"] = "e80-bench"
+    bare, _raw = kt._worker_task_scope()
+    assert bare == f"admin:{worker_env_board}"  # stays qualified -> gate refuses
+
+
+def test_worker_scope_env_id_without_board_pin(worker_env_board, monkeypatch):
+    """No HERMES_KANBAN_BOARD pin: qualifier is not stripped (fail-closed)."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{worker_env_board}")
+    bare, _raw = kt._worker_task_scope()
+    assert bare == f"e80-bench:{worker_env_board}"
+
+
+def test_worker_scope_fleet_session_id_is_opaque(worker_env_board):
+    """A fleet session id (multi-segment) is never treated as a task id."""
+    from tools import kanban_tools as kt
+    import os
+    os.environ["HERMES_KANBAN_TASK"] = f"fleet:dq05:e80-bench:{worker_env_board}:dq05-1"
+    os.environ["HERMES_KANBAN_BOARD"] = "e80-bench"
+    bare, _raw = kt._worker_task_scope()
+    assert bare == f"fleet:dq05:e80-bench:{worker_env_board}:dq05-1"
+
+
+def test_normalize_task_id_forms(worker_env_board, monkeypatch):
+    """_normalize_task_id accepts bare + own-board-qualified, refuses others."""
+    from tools import kanban_tools as kt
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+    assert kt._normalize_task_id(tid) == tid
+    assert kt._normalize_task_id(f"e80-bench:{tid}") == tid
+    assert kt._normalize_task_id(f"admin:{tid}") == f"admin:{tid}"
+    assert kt._normalize_task_id("") is None
+    assert kt._normalize_task_id(None) is None
+    assert kt._normalize_task_id("  ") is None
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    # Without a pin the qualified form passes through unchanged (fail-closed).
+    assert kt._normalize_task_id(f"e80-bench:{tid}") == f"e80-bench:{tid}"
+
+
+def test_worker_can_complete_own_card_with_qualified_env_id(
+    worker_env_board, monkeypatch
+):
+    """THE regression: qualified env id, worker completes its OWN card.
+
+    Before the fix: the gate refused the bare id ("worker is scoped to task
+    e80-bench:t_x; refusing to mutate t_x") and completing with the qualified
+    id hit "unknown id" (no row matches). Either way the worker was stuck.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    out = kt._handle_complete({"summary": "done with qualified env id"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_worker_can_complete_own_card_with_bare_env_id(worker_env_board, monkeypatch):
+    """Bare env id (dispatcher-written form) keeps working."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    out = kt._handle_complete({"summary": "done with bare env id"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_worker_can_block_own_card_with_qualified_env_id(worker_env_board, monkeypatch):
+    """Qualified env id, worker blocks its OWN card (second lifecycle path)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    out = kt._handle_block({"reason": "need input", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+    finally:
+        conn.close()
+
+
+def test_worker_complete_with_qualified_arg_id(worker_env_board, monkeypatch):
+    """Explicit task_id arg in qualified form also resolves to the bare PK."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    out = kt._handle_complete({"task_id": f"e80-bench:{tid}", "summary": "qualified arg"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_worker_complete_rejects_foreign_card_with_qualified_env(
+    worker_env_board, monkeypatch
+):
+    """Ownership still refuses a sibling card — qualified env id must not
+    widen the blast radius."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="sibling")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # bare foreign id
+    out = kt._handle_complete({"task_id": other, "summary": "HIJACK"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d.get("error", "")
+
+    # qualified foreign id
+    out = kt._handle_complete({"task_id": f"e80-bench:{other}", "summary": "HIJACK"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_worker_complete_rejects_mismatched_board_pin(worker_env_board, monkeypatch):
+    """Qualified env id naming a DIFFERENT board than the pin is refused.
+
+    This pins the 'mismatched tenant/foreign card must still be refused'
+    acceptance criterion: e.g. an admin-board worker must not be able to
+    mutate an e80-bench card by quoting 'e80-bench:t_x' in its env.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "admin")  # mismatched pin
+
+    out = kt._handle_complete({"summary": "should be refused"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    # Refusal can surface at either layer, both fail-closed:
+    #  - the ownership gate ("refusing to mutate") when the normalized ids
+    #    differ, or
+    #  - the DB exact-match ("could not complete <qualified-id> (unknown
+    #    id ...)") because a qualified id never matches any tasks.id row.
+    # Either way the card must remain untouched.
+    assert (
+        "refusing to mutate" in d.get("error", "")
+        or "could not complete" in d.get("error", "")
+    ), f"expected a refusal, got: {d}"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_no_like_or_prefix_matching_introduced(worker_env_board, monkeypatch):
+    """Exact-match semantics: no row may be matched by prefix/substring.
+
+    kanban_complete with a truncated or padded id must fail cleanly with
+    'unknown id', never silently mutate a row whose id shares a prefix.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    conn = kb.connect()
+    try:
+        near_miss = kb.create_task(conn, title="near-miss sibling")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Prefix of the sibling's id (id minus last char) must not complete it.
+    for bad in (near_miss[:-1], near_miss + "x", near_miss[:6]):
+        # clear ownership scoping for a direct DB-semantics probe
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        out = kt._handle_complete({"task_id": bad, "summary": "probe"})
+        d = json.loads(out)
+        if d.get("ok") is True:
+            # If bad == tid (impossible: different lengths) — skip
+            pass
+        else:
+            assert "refusing to mutate" in d.get("error", "") or (
+                "could not complete" in d.get("error", "")
+            ), f"prefix id {bad!r} unexpectedly mutated a row: {d}"
+
+    # The sibling was never mutated by any prefix probe.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, near_miss).status in ("ready", "todo")
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_show_defaults_to_env_task_id_qualified(worker_env_board, monkeypatch):
+    """kanban_show with a qualified env id resolves the card (read path)."""
+    from tools import kanban_tools as kt
+
+    tid = worker_env_board
+    monkeypatch.setenv("HERMES_KANBAN_TASK", f"e80-bench:{tid}")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "e80-bench")
+
+    out = kt._handle_show({})
+    d = json.loads(out)
+    assert d["task"]["id"] == tid
+    assert d["task"]["status"] == "running"
