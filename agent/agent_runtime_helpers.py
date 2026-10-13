@@ -3458,7 +3458,16 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     seen_assistant_call_ids.add(cid)
                 kept_tcs.append(tc)
             if len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {**msg, "tool_calls": kept_tcs}
+                # If dedup emptied the list, DROP the key rather than send
+                # tool_calls: [] — strict OpenAI-compatible upstreams (DeepSeek)
+                # reject an empty array with HTTP 400 ("Expected an array with
+                # minimum length 1"). This runs AFTER the empty-tool_calls drop
+                # above, so it must re-normalize here.
+                msg = {**msg}
+                if kept_tcs:
+                    msg["tool_calls"] = kept_tcs
+                else:
+                    msg.pop("tool_calls", None)
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
