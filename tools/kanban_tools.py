@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -140,9 +141,15 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
-    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
+    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set.
+
+    Both sides are normalized to the bare DB PK via :func:`_normalize_task_id`
+    (the dispatcher writes the bare ``task.id``; a leading ``board:`` prefix
+    from external schedulers is tolerated and stripped when it matches the
+    worker's own board).
+    """
     if arg:
-        return arg
+        return _normalize_task_id(arg)
     if _is_delegated_child_context():
         return None
     if not _is_dispatcher_owned_worker():
@@ -150,12 +157,13 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
         # worker's task id as an implicit default.
         return None
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    return env_tid or None
+    return _normalize_task_id(env_tid) if env_tid else None
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    env_tid, _raw = _worker_task_scope()
+    if env_tid is None or task_id != env_tid:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
@@ -170,7 +178,8 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    env_tid, _raw = _worker_task_scope()
+    if env_tid is None or task_id != env_tid:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
@@ -178,6 +187,66 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+def _worker_task_scope() -> tuple[Optional[str], Optional[str]]:
+    """Return ``(bare_task_id, raw_env_value)`` for this worker, or ``(None, None)``.
+
+    The canonical value of ``HERMES_KANBAN_TASK`` is the **bare** ``tasks.id``
+    PK — exactly what the dispatcher writes at spawn time
+    (``kanban_db._default_spawn``: ``env["HERMES_KANBAN_TASK"] = task.id``)
+    and what every lifecycle ``UPDATE ... WHERE id = ?`` matches. External
+    schedulers (e.g. the fleet-offload layer) sometimes hand a worker a
+    *board-qualified* id (``board:task``) — the fleet session-id format
+    ``fleet:<node>:<board>:<task>:<run>`` leaks into this var when an
+    operator re-exports it by hand. Tolerate that form on input by
+    stripping the qualifier, but only when it matches the board this
+    worker is actually pinned to (``HERMES_KANBAN_BOARD`` env); a
+    *foreign* board qualifier never silently rewrites into a bare id.
+    """
+    raw = os.environ.get("HERMES_KANBAN_TASK")
+    if not raw or not raw.strip():
+        return None, None
+    raw = raw.strip()
+    bare, qualifier = _split_task_id_qualifier(raw)
+    if qualifier is None:
+        return raw, raw
+    pinned_board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+    if not pinned_board or qualifier != pinned_board:
+        # Unknown pin or foreign board: keep the raw (qualified) string so
+        # the ownership gate refuses rather than silently retargeting.
+        return raw, raw
+    return bare, raw
+
+
+def _split_task_id_qualifier(value: str) -> tuple[str, Optional[str]]:
+    """Split ``"board:t_abcd"`` into ``("t_abcd", "board")``.
+
+    Returns ``(value, None)`` when there is no qualifier. Only a single
+    leading ``<board-slug>:`` segment is recognized: task ids themselves
+    never contain ``:`` (they are ``t_`` + hex), and multi-segment values
+    such as the fleet session id ``fleet:node:board:task:run`` are *not*
+    task ids at all — the bare tail is returned unchanged with no
+    qualifier, leaving exact-match semantics intact (no LIKE/prefix
+    matching anywhere).
+    """
+    if ":" not in value:
+        return value, None
+    head, sep, tail = value.partition(":")
+    if not sep or not tail or tail != tail.strip():
+        # "board:" / "board: x" / trailing whitespace — not a qualified
+        # task id; treat the whole string as opaque.
+        return value, None
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]{0,63}$", head):
+        # Not a board slug (e.g. "fleet:dq05:..."). Opaque — return as-is.
+        return value, None
+    if ":" in tail:
+        # Multi-segment (fleet session id) — never a qualified task id.
+        # Return the ORIGINAL string untouched: no qualifier, no rewrite.
+        return value, None
+    if not tail.startswith("t_"):
+        return value, None
+    return tail, head
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -189,6 +258,13 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     prompt-injected worker that passed an explicit ``task_id`` for some
     other task could corrupt sibling or cross-tenant runs (see #19534).
 
+    Comparison is on **bare** ids (the DB PK form) on both sides: the
+    caller's ``tid`` is normalized by ``_default_task_id`` and the env
+    value is normalized by ``_worker_task_scope``. A qualified env value
+    whose board qualifier does not match the worker's pinned board is
+    kept qualified on purpose — it can then never equal a bare row id,
+    so the gate refuses (cross-board writes stay impossible).
+
     Orchestrator profiles (kanban toolset enabled but **no**
     ``HERMES_KANBAN_TASK`` in env) aren't subject to this check — their
     job is routing, and they sometimes legitimately close out child
@@ -199,7 +275,7 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid, _raw = _worker_task_scope()
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
@@ -210,6 +286,29 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"tasks, or kanban_create to spawn follow-up work."
         )
     return None
+
+
+def _normalize_task_id(tid: Optional[str]) -> Optional[str]:
+    """Normalize a task id to the bare DB PK form.
+
+    Accepts ``t_abcd`` or ``<board>:t_abcd`` (only when the board matches
+    the worker's pinned board, mirroring :func:`_worker_task_scope`).
+    Returns ``None`` for empty input. Any other shape passes through
+    unchanged so downstream exact-match lookups surface a clean
+    "unknown id" error instead of a silent rewrite.
+    """
+    if tid is None:
+        return None
+    tid = str(tid).strip()
+    if not tid:
+        return None
+    bare, qualifier = _split_task_id_qualifier(tid)
+    if qualifier is None:
+        return tid
+    pinned_board = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+    if not pinned_board or qualifier != pinned_board:
+        return tid
+    return bare
 
 
 def _connect(board: Optional[str] = None):
@@ -320,7 +419,7 @@ def heartbeat_current_worker_from_env() -> bool:
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
-    tid = os.environ.get("HERMES_KANBAN_TASK")
+    tid, _raw = _worker_task_scope()
     if not tid:
         return False
     import time as _time
@@ -381,7 +480,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     the run started are injected. The worker's own authored comments (matched
     by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
     """
-    tid = os.environ.get("HERMES_KANBAN_TASK")
+    tid, _raw = _worker_task_scope()
     if not tid or agent is None or not hasattr(agent, "steer"):
         return False
     global _comment_poll_last_attempt
@@ -1080,7 +1179,7 @@ def _handle_comment(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
     if delegated_err:
         return delegated_err
-    tid = args.get("task_id")
+    tid = _normalize_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
             "task_id is required (use the current task id if that's what "
@@ -1427,7 +1526,7 @@ def _handle_create(args: dict, **kw) -> str:
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+                _self_tid, _raw = _worker_task_scope()
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.project_id:
@@ -1613,7 +1712,7 @@ def _handle_unblock(args: dict, **kw) -> str:
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
-    tid = args.get("task_id")
+    tid = _normalize_task_id(args.get("task_id"))
     if not tid:
         return tool_error("task_id is required")
     ownership_err = _enforce_worker_task_ownership(str(tid))
@@ -1675,9 +1774,14 @@ _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
     "active board the usual way: HERMES_KANBAN_DB env → "
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "home → 'default'. NOTE for dispatcher-spawned workers: the "
+    "dispatcher pins HERMES_KANBAN_DB + HERMES_KANBAN_BOARD to your own "
+    "board, so omitting 'board' is correct for your own card. Only pass "
+    "an explicit slug when you deliberately need to override the "
+    "env-pinned active board for this one call (e.g. a routing layer); "
+    "board-qualified task ids like 'board:t_abcd' are NOT a way to "
+    "address another board — the ownership gate normalizes only your "
+    "own board's qualifier and refuses every other one."
 )
 
 
