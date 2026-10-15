@@ -266,6 +266,38 @@ def _board_no_llm_dispatch(slug: str) -> bool:
         return False
 
 
+def _board_has_spawnable_work(slug: str, *, review_probe: bool) -> bool:
+    """True when *slug* holds at least one task the dispatcher would spawn for.
+
+    Shared by the tick loop and the stuck-probe so the two can't drift. Honors
+    the board's ``no_llm_dispatch`` opt-out: a deterministic-tooling board with
+    a full ready queue is "correctly idle", not "stuck", so it must never count
+    toward spawnable work (2026-10-15: the ready queue on three opted-out boards
+    kept the stuck-warn firing while zero cards were actually dispatchable).
+    Fail-closed (False) on any error — an unreadable board cannot be proven to
+    have spawnable work.
+    """
+    if _board_no_llm_dispatch(slug):
+        return False
+    conn = None
+    try:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=slug)
+        if _kb.has_spawnable_ready(conn):
+            return True
+        if review_probe and _kb.has_spawnable_review(conn):
+            return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _board_dispatch_priority(slug: str) -> int:
     """Board scheduling priority from ``board.json`` ``dispatch_priority``.
 
@@ -1998,21 +2030,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
+                if _board_has_spawnable_work(slug, review_probe=_review_probe):
+                    return True
             return False
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs

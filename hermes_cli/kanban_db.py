@@ -7771,6 +7771,20 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Filesystem / workspace access errors are NOT credential or quota blockers.
+# A denied workspace operation fails identically on every retry, so it must be
+# allowed to respawn and trip the ``failure_limit`` breaker via the normal path
+# — parking it as ``blocker_auth`` defers it forever, because this guard runs
+# BEFORE any spawn and therefore never increments ``consecutive_failures``.
+# Measured 2026-10-14: 3 net4sats cards stuck on
+# ``workspace: [Errno 13] Permission denied: '/home/c08r4d0r'`` were mis-matched
+# by the ``permission[\s_]denied`` alternation above.
+_FILESYSTEM_ACCESS_ERROR_RE = re.compile(
+    r"(\[errno\s*\d+\]|errno\s*\d+|workspace:|"
+    r"no such file or directory|not a directory|read-only file system)",
+    re.IGNORECASE,
+)
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -9301,8 +9315,16 @@ def check_respawn_guard(
                 return "backoff"
 
     # 2. Quota / auth blocker: retrying immediately will not help.
+    #    Filesystem/workspace access errors share the "access denied" /
+    #    "permission denied" wording but are NOT credential blockers — they
+    #    must fall through so the normal retry/backoff path can trip the
+    #    failure breaker. See _FILESYSTEM_ACCESS_ERROR_RE.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and _RESPAWN_BLOCKER_RE.search(err)
+        and not _FILESYSTEM_ACCESS_ERROR_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
