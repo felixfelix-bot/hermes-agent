@@ -18834,6 +18834,41 @@ def main(
                         elif response:
                             print(response)
 
+                        # Kanban exit reconciliation (kanban_protocol_violation).
+                        # A worker must end with kanban_complete/kanban_block. The
+                        # in-loop nudge in agent.kanban_stop only runs on the
+                        # conversation loop's NORMAL exit; ~27 early `return`s
+                        # (thinking-budget exhaustion, output truncation,
+                        # truncated tool args, compression failure, iteration
+                        # budget break) bypass it and the dispatcher then records
+                        # a bare protocol_violation with no reason attached.
+                        # This is the single point every quiet-mode worker turn
+                        # funnels through before sys.exit, so reconciling here
+                        # covers all of those paths. It never completes the task
+                        # on the worker's behalf — it records WHY the run did not
+                        # land, and never raises.
+                        try:
+                            from agent.kanban_terminal_guard import (
+                                reconcile_worker_exit as _kb_reconcile,
+                            )
+                            _kb_action = _kb_reconcile(
+                                completed=bool(
+                                    isinstance(result, dict)
+                                    and result.get("completed")
+                                ),
+                                result=result if isinstance(result, dict) else None,
+                            )
+                            if _kb_action == "recorded":
+                                print(
+                                    "kanban: run ended without a terminal board "
+                                    "call — recorded protocol_violation",
+                                    file=sys.stderr,
+                                )
+                        except Exception:
+                            logger.debug(
+                                "kanban exit reconcile failed", exc_info=True
+                            )
+
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an
                         # auxiliary judge agrees the card is done, the worker
