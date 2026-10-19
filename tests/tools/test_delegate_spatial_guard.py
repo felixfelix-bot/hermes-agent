@@ -242,9 +242,28 @@ def test_malformed_floor_fails_closed_even_for_a_floor_meeting_model(bot):
     "classes:\n  spatial_required:\n    axes: [strong]",   # axes is a list
     "classes:\n  spatial_required:\n    axes: {}",        # axes is empty
     "classes:\n  spatial_required:\n    axes: {spatial: ultra}",  # unknown level
+    "classes:\n  spatial_required:\n    axes: {spatial: null, vision: null}",
+    "classes:\n  spatial_required:\n    axes: {spatial: false}",
+    "classes:\n  spatial_required:\n    axes: {spatial: 0}",
+    "classes:\n  spatial_required:\n    axes: {spatial: 1}",
+    "classes:\n  spatial_required:\n    axes: {spatial: ''}",
+    "classes:\n  spatial_required:\n    axes: {spatial: none}",
 ])
 def test_present_but_invalid_policy_refuses_everything(bot, content):
     _set_policy(bot, content)
+    assert lane_has_spatial("gpt-6-astra") is False
+    assert lane_has_spatial("glm-5.3") is False   # missing axes never satisfy
+    assert lane_has_spatial("tier/spatial-worker") is False
+
+
+def test_policy_path_that_exists_but_is_unusable_fails_closed(bot):
+    _set_policy(bot, "unused")  # replaced by a directory below
+    pol = bot / "capability_routing.yaml"
+    pol.unlink()
+    pol.mkdir()
+    assert lane_has_spatial("gpt-6-astra") is False
+    pol.rmdir()
+    pol.symlink_to(bot / "does-not-exist.yaml")  # dangling symlink
     assert lane_has_spatial("gpt-6-astra") is False
     assert lane_has_spatial("tier/spatial-worker") is False
 

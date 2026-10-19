@@ -63,6 +63,10 @@ _NONE_VALUES = {"none", "n/a", "na", "false", "off", "no", "-",
 _DEFAULT_FLOOR = {"spatial": "basic", "vision": "basic"}
 _LEVELS = {"": 0, "none": 0, "basic": 1, "good": 2, "strong": 3,
            "excellent": 4, "advanced": 4}
+# A configured MINIMUM must be a real, named, non-zero level. "none"/""/null/
+# false/0 are not minimums: a floor of "no requirement" is not a floor, and
+# accepting it would let a model with MISSING axes satisfy the class.
+_MINIMUM_LEVELS = {"basic", "good", "strong", "excellent", "advanced"}
 DEFAULT_LOG = Path.home() / ".hermes" / "state" / "delegation-spatial-guard.jsonl"
 
 
@@ -134,8 +138,13 @@ _UNSATISFIABLE = {"__malformed_policy__": "basic"}
 
 
 def _policy_floor(path: Path) -> dict:
-    if not path.is_file():
+    # Only a GENUINELY ABSENT policy selects the default floor. A path that is
+    # present but unusable (a directory, a dangling symlink, unreadable YAML)
+    # is a present-but-invalid policy and fails closed.
+    if not path.exists() and not path.is_symlink():
         return _DEFAULT_FLOOR
+    if not path.is_file():
+        return _UNSATISFIABLE
     doc = _yaml(path)
     if not doc:
         return _UNSATISFIABLE  # present but unreadable/invalid YAML
@@ -152,9 +161,11 @@ def _policy_floor(path: Path) -> dict:
     for axis, minimum in axes.items():
         if not str(axis).strip():
             return _UNSATISFIABLE
-        level = str(minimum or "").strip().lower()
-        if level not in _LEVELS:
-            return _UNSATISFIABLE  # unknown minimum can never be a weaker floor
+        if not isinstance(minimum, str):
+            return _UNSATISFIABLE  # null/bool/number is not a minimum level
+        level = minimum.strip().strip("\"'").lower()
+        if level not in _MINIMUM_LEVELS:
+            return _UNSATISFIABLE  # an unknown minimum is never a weaker floor
         floor[str(axis)] = level
     return floor
 
