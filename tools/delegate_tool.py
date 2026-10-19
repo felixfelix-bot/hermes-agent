@@ -3281,6 +3281,24 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # WS-B (operator directive: forbid + alert first): a task that DECLARES
+    # spatial intent must not ride a delegation lane with no spatial-capable
+    # candidate (the manager pins tier/delegation, whose spatial claim is a
+    # placeholder). Refuse before any child is spawned. A guard bug must not
+    # brick delegation, so an unexpected exception is logged and we proceed;
+    # an unknown/missing capability config is a deliberate refusal.
+    try:
+        from tools.delegate_spatial_guard import guard as _spatial_guard
+
+        _spatial_refusal = _spatial_guard(
+            task_list, cfg, parent_model=getattr(parent_agent, "model", "") or ""
+        )
+        if _spatial_refusal:
+            return tool_error(_spatial_refusal)
+    except Exception:
+        logger.warning("delegate spatial guard failed; allowing delegation",
+                       exc_info=True)
+
     overall_start = time.monotonic()
     results = []
 
