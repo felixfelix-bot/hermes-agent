@@ -52,13 +52,12 @@ except Exception:  # pragma: no cover - PyYAML is a repo dependency
 
 logger = logging.getLogger(__name__)
 
-# Line-anchored declaration syntax: optional markdown decoration, the key,
-# then a single non-empty token (optionally quoted). Values that are comments
-# or opt-outs never trigger the guard.
-_SPATIAL_TAG = re.compile(
-    r"^[ \t>*+\-#]*spatial_tag[ \t]*[:=][ \t]*(\S+)", re.I | re.M)
-_VISUAL_ARTIFACT = re.compile(
-    r"^[ \t>*+\-#]*visual_artifact[ \t]*[:=][ \t]*(\S+)", re.I | re.M)
+# Line-anchored declaration syntax: optional markdown decoration, the key, then
+# the value — a double- or single-QUOTED string (may contain spaces) or a bare
+# non-empty token. Values that are comments or opt-outs never trigger the guard.
+_DECLARATION = re.compile(
+    r"^[ \t>*+\-#]*(?:spatial_tag|visual_artifact)[ \t]*[:=][ \t]*"
+    r"(?:\"([^\"\n]*)\"|'([^'\n]*)'|(\S+))", re.I | re.M)
 _NONE_VALUES = {"none", "n/a", "na", "false", "off", "no", "-",
                 "<path>", "<none>", "<value>"}
 _DEFAULT_FLOOR = {"spatial": "basic", "vision": "basic"}
@@ -74,17 +73,19 @@ def _clean(value: str) -> str:
     return v
 
 
-def _declared(text: str, pattern: re.Pattern) -> bool:
-    for m in pattern.finditer(text):
-        if _clean(m.group(1)) and _clean(m.group(1)) not in _NONE_VALUES:
+def declares_spatial(text: str | None) -> bool:
+    """True when the text carries a real (non-opt-out) spatial declaration.
+
+    EVERY occurrence is checked, so an earlier opt-out cannot mask a later
+    real declaration. A quoted value keeps its inner whitespace (a quoted
+    empty string is not a declaration).
+    """
+    for m in _DECLARATION.finditer(text or ""):
+        raw = next(g for g in m.groups() if g is not None)
+        v = _clean(raw)
+        if v and v not in _NONE_VALUES:
             return True
     return False
-
-
-def declares_spatial(text: str | None) -> bool:
-    """True when the text carries a real (non-opt-out) spatial declaration."""
-    text = text or ""
-    return _declared(text, _SPATIAL_TAG) or _declared(text, _VISUAL_ARTIFACT)
 
 
 def _bot_dir() -> Path:
@@ -157,8 +158,10 @@ def _meets_floor(model_id: str, rec: dict, floor: dict) -> bool:
         return False
     for axis, minimum in floor.items():
         declared = _LEVELS.get(str(rec.get(axis) or "").strip().lower())
-        need = _LEVELS.get(str(minimum or "").strip().lower(), 1)
-        if declared is None or declared < need:
+        # An UNKNOWN configured minimum is not a weaker floor: nothing
+        # satisfies it, so a malformed policy fails closed (refuses).
+        need = _LEVELS.get(str(minimum or "").strip().lower())
+        if need is None or declared is None or declared < need:
             return False
     return True
 
@@ -287,16 +290,33 @@ def guard(task_list: list, cfg: dict, parent_model: str = "") -> str | None:
     except Exception:
         logger.exception("delegate spatial guard failed; failing closed for "
                          "declared-spatial tasks only")
+        ref = _safe_meta(str(cfg.get("model") or "").strip()
+                         or parent_model or "<inherited>")
+        declared: list[int] = []
         for i, task in enumerate(task_list or []):
             if not isinstance(task, dict):
                 continue
+            goal = str(task.get("goal") or "")
             text = "\n".join(str(task.get(k) or "") for k in ("goal", "context"))
             if declares_spatial(text):
-                return _refusal_message(
-                    [i], (str(cfg.get("model") or "").strip()
-                          or parent_model or "<inherited>"),
-                    "lane capability could not be verified (guard internal "
-                    "error)",
-                    ", ".join(f"{k}>={v}" for k, v in _DEFAULT_FLOOR.items()),
-                    str(_log_path()))
-        return None
+                declared.append(i)
+                _log_refusal({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "refused",
+                    "task_index": i,
+                    "ref": ref,
+                    "reason": "guard-internal-error",
+                    "goal_sha256": hashlib.sha256(
+                        goal.encode("utf-8")).hexdigest(),
+                    "goal_chars": len(goal),
+                    "pid": os.getpid(),
+                    "profile": _safe_meta(os.environ.get("HERMES_PROFILE")
+                                          or os.environ.get("HERMES_PROFILE_NAME")),
+                })
+        if not declared:
+            return None
+        return _refusal_message(
+            declared, ref,
+            "lane capability could not be verified (guard internal error)",
+            ", ".join(f"{k}>={v}" for k, v in _DEFAULT_FLOOR.items()),
+            str(_log_path()))

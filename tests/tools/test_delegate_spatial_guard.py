@@ -95,6 +95,13 @@ def test_empty_and_comment_values_never_declare():
     assert not declares_spatial("visual_artifact: <path>")
 
 
+def test_quoted_values_keep_inner_whitespace():
+    assert declares_spatial('spatial_tag: " basic"')
+    assert declares_spatial("visual_artifact: \"reports/my map.png\"")
+    assert not declares_spatial("spatial_tag: ''")
+    assert not declares_spatial("spatial_tag: 'none'")
+
+
 def test_every_occurrence_is_checked_so_opt_out_cannot_mask_a_declaration():
     # An earlier opt-out must not hide a later real declaration (finditer).
     assert declares_spatial("visual_artifact: none\nvisual_artifact: map.png")
@@ -192,15 +199,36 @@ def test_guard_fails_closed_when_the_lane_is_unknown(bot, tmp_path):
     assert msg and "unknown" in msg.lower()
 
 
-def test_guard_fails_closed_for_declared_spatial_on_internal_error(bot, monkeypatch):
+def test_guard_fails_closed_for_declared_spatial_on_internal_error(bot, monkeypatch,
+                                                                   tmp_path):
     def boom(*a, **k):
         raise RuntimeError("guard bug")
     monkeypatch.setattr("tools.delegate_spatial_guard._guard_inner", boom)
-    msg = guard([{"goal": "x", "context": "spatial_tag: basic"}],
-                {"model": "tier/delegation"})
-    assert msg and "could not be verified" in msg
+    msg = guard([
+        {"goal": "x", "context": "spatial_tag: basic"},
+        {"goal": "y"},
+        {"goal": "z", "context": "visual_artifact: m.png"},
+    ], {"model": "tier/delegation"})
+    assert msg and "could not be verified" in msg and "tasks 0, 2" in msg
+    # every declared-spatial task is accounted for in the log
+    rows = (tmp_path / "guard.jsonl").read_text().splitlines()
+    assert [json.loads(r)["task_index"] for r in rows] == [0, 2]
+    assert all(json.loads(r)["reason"] == "guard-internal-error" for r in rows)
     # a non-spatial task must still proceed on a guard bug
     assert guard([{"goal": "fix the login bug"}], {"model": "tier/delegation"}) is None
+
+
+def test_malformed_floor_fails_closed_even_for_a_floor_meeting_model(bot):
+    import yaml
+    (bot / "capability_routing.yaml").write_text(yaml.safe_dump({
+        "classes": {"spatial_required": {
+            "axes": {"spatial": ["strong"], "vision": "basic"}}}}))
+    # a malformed configured minimum must not become a weaker one
+    assert lane_has_spatial("gpt-6-astra") is False
+    assert lane_has_spatial("tier/spatial-worker") is False
+    msg = guard([{"goal": "x", "context": "spatial_tag: basic"}],
+                {"model": "tier/spatial-worker"})
+    assert msg and "no spatial-capable candidate" in msg
 
 
 def test_inherited_parent_model_is_checked(bot):
@@ -293,3 +321,22 @@ def test_delegate_task_fails_closed_on_a_guard_bug_with_spatial_declared(bot, mo
                               parent_agent=_StubParent())
     assert "WS-B" in result and "BUILDER REACHED" not in result
     assert calls == []
+
+def test_delegate_task_fallback_is_independent_of_a_broken_guard_module(bot, monkeypatch):
+    # the guard module itself fails to import: the call-site fallback must
+    # still refuse a declared-spatial child and never spawn it...
+    calls = _arm_builder(monkeypatch)
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "tools.delegate_spatial_guard", SimpleNamespace())
+    result = dt.delegate_task(goal="Read the wing tab drawing",
+                              context="spatial_tag: basic",
+                              parent_agent=_StubParent())
+    assert "WS-B" in result and "BUILDER REACHED" not in result
+    assert calls == []
+    # ...while ordinary delegation proceeds past the guard seam
+    try:
+        dt.delegate_task(goal="Fix the login form validation",
+                         parent_agent=_StubParent())
+    except Exception:
+        pass  # any failure past the builder seam proves the delegation ran on
+    assert calls

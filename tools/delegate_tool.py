@@ -57,6 +57,15 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 
 
+# WS-B fallback declaration detector — an independent duplicate of the
+# spatial-guard's syntax, defined HERE so a broken guard module cannot
+# silently authorize a declared-spatial child. Coarse by design: quoted or
+# bare value, any occurrence; opt-outs are filtered at the use site.
+_FALLBACK_SPATIAL_DECLARATION = re.compile(
+    r"^[ \t>*+\-#]*(?:spatial_tag|visual_artifact)[ \t]*[:=][ \t]*"
+    r"(?:\"([^\"\n]*)\"|'([^'\n]*)'|(\S+))", re.I | re.M)
+
+
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
 # ---------------------------------------------------------------------------
@@ -3298,23 +3307,28 @@ def delegate_task(
         if _spatial_refusal:
             return tool_error(_spatial_refusal)
     except Exception:
+        # Independent, deliberately COARSE fallback (duplicated by design — it
+        # must not import from the module that just failed): any
+        # spatial_tag/visual_artifact line that does not obviously opt out
+        # refuses the delegation. Over-matching is safe (fail closed).
         logger.warning("delegate spatial guard failed", exc_info=True)
-        try:
-            from tools.delegate_spatial_guard import declares_spatial
-
-            if any(declares_spatial("\n".join(
-                    str(t.get(k) or "") for k in ("goal", "context")))
-                    for t in task_list if isinstance(t, dict)):
-                return tool_error(
-                    "delegate_task refused (WS-B): spatial intent was declared "
-                    "but the delegation lane capability could not be verified "
-                    "(guard internal error). Do the spatial work in a "
-                    "spatial-capable lane (assign it to a worker on "
-                    "tier/spatial-worker, e.g. worker-pcb/worker-layout) and "
-                    "report the guard failure to the operator."
-                )
-        except Exception:
-            logger.exception("delegate spatial guard fallback failed")
+        _fb_text = "\n".join(
+            "\n".join(str(t.get(k) or "") for k in ("goal", "context"))
+            for t in task_list if isinstance(t, dict))
+        _fb_hits = _FALLBACK_SPATIAL_DECLARATION.finditer(_fb_text)
+        _fb_declared = any(
+            next((g for g in m.groups() if g is not None), "").strip().lower()
+            not in ("", "none", "n/a", "na", "false", "off", "no", "-",
+                    "#", "none.") for m in _fb_hits)
+        if _fb_declared:
+            return tool_error(
+                "delegate_task refused (WS-B): spatial intent was declared "
+                "but the delegation lane capability could not be verified "
+                "(guard internal error). Do the spatial work in a "
+                "spatial-capable lane (assign it to a worker on "
+                "tier/spatial-worker, e.g. worker-pcb/worker-layout) and "
+                "report the guard failure to the operator."
+            )
 
     overall_start = time.monotonic()
     results = []
