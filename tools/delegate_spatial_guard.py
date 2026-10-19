@@ -121,15 +121,42 @@ def load_capabilities() -> tuple[dict, dict, dict]:
     models = {str(k): v for k, v in
               (raw_models.items() if isinstance(raw_models, dict) else [])
               if isinstance(v, dict) and v}
-    policy = _yaml(bot / "capability_routing.yaml")
-    floor = _DEFAULT_FLOOR
-    try:
-        axes = ((policy.get("classes") or {}).get("spatial_required") or {}).get("axes")
-        if isinstance(axes, dict) and axes:
-            floor = {str(k): str(v) for k, v in axes.items()}
-    except Exception:
-        pass
+    floor = _policy_floor(bot / "capability_routing.yaml")
     return tiers, models, floor
+
+
+# A PRESENT but invalid capability policy must not silently become a weaker
+# default floor: nothing satisfies this sentinel axis (no benchmark row ever
+# declares it at level "basic"), so a malformed policy refuses
+# declared-spatial delegation (fail closed). An ABSENT policy file is a
+# legitimate optional component -> default floor.
+_UNSATISFIABLE = {"__malformed_policy__": "basic"}
+
+
+def _policy_floor(path: Path) -> dict:
+    if not path.is_file():
+        return _DEFAULT_FLOOR
+    doc = _yaml(path)
+    if not doc:
+        return _UNSATISFIABLE  # present but unreadable/invalid YAML
+    classes = doc.get("classes")
+    if not isinstance(classes, dict):
+        return _UNSATISFIABLE
+    cls = classes.get("spatial_required")
+    if not isinstance(cls, dict):
+        return _UNSATISFIABLE
+    axes = cls.get("axes")
+    if not isinstance(axes, dict) or not axes:
+        return _UNSATISFIABLE
+    floor = {}
+    for axis, minimum in axes.items():
+        if not str(axis).strip():
+            return _UNSATISFIABLE
+        level = str(minimum or "").strip().lower()
+        if level not in _LEVELS:
+            return _UNSATISFIABLE  # unknown minimum can never be a weaker floor
+        floor[str(axis)] = level
+    return floor
 
 
 def _is_alias(model_id: str, rec: dict) -> bool:

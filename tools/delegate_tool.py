@@ -57,13 +57,28 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 
 
-# WS-B fallback declaration detector — an independent duplicate of the
-# spatial-guard's syntax, defined HERE so a broken guard module cannot
-# silently authorize a declared-spatial child. Coarse by design: quoted or
-# bare value, any occurrence; opt-outs are filtered at the use site.
+# WS-B fallback declaration detector — a full, independent DUPLICATE of the
+# spatial-guard's syntax and opt-out rules, defined HERE so a broken guard
+# module cannot silently authorize a declared-spatial child. It must
+# recognise AT LEAST every declaration the guard recognises (parity is
+# tested); over-matching would be safe, under-matching would not.
 _FALLBACK_SPATIAL_DECLARATION = re.compile(
     r"^[ \t>*+\-#]*(?:spatial_tag|visual_artifact)[ \t]*[:=][ \t]*"
     r"(?:\"([^\"\n]*)\"|'([^'\n]*)'|(\S+))", re.I | re.M)
+_FALLBACK_NONE_VALUES = {"none", "n/a", "na", "false", "off", "no", "-",
+                         "<path>", "<none>", "<value>"}
+
+
+def _fallback_declares_spatial(text):
+    """The call-site's independent spatial-declaration detector."""
+    for m in _FALLBACK_SPATIAL_DECLARATION.finditer(text or ""):
+        raw = next((g for g in m.groups() if g is not None), "")
+        v = raw.strip().strip("\"'").strip().lower()
+        if v.startswith("#"):
+            continue
+        if v and v not in _FALLBACK_NONE_VALUES:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3307,24 +3322,57 @@ def delegate_task(
         if _spatial_refusal:
             return tool_error(_spatial_refusal)
     except Exception:
-        # Independent, deliberately COARSE fallback (duplicated by design — it
-        # must not import from the module that just failed): any
-        # spatial_tag/visual_artifact line that does not obviously opt out
-        # refuses the delegation. Over-matching is safe (fail closed).
+        # Independent fallback (duplicated by design — it must not import from
+        # the module that just failed): refuse EVERY declared-spatial task
+        # before any spawn, name the tasks, and record a goal-hash-only
+        # refusal row for each (best-effort; telemetry never weakens refusal).
         logger.warning("delegate spatial guard failed", exc_info=True)
-        _fb_text = "\n".join(
-            "\n".join(str(t.get(k) or "") for k in ("goal", "context"))
-            for t in task_list if isinstance(t, dict))
-        _fb_hits = _FALLBACK_SPATIAL_DECLARATION.finditer(_fb_text)
-        _fb_declared = any(
-            next((g for g in m.groups() if g is not None), "").strip().lower()
-            not in ("", "none", "n/a", "na", "false", "off", "no", "-",
-                    "#", "none.") for m in _fb_hits)
-        if _fb_declared:
+        import time as _fb_time
+        _fb_ref = str((cfg or {}).get("model") or "").strip() \
+            or str(getattr(parent_agent, "model", "") or "").strip() \
+            or "<inherited>"
+        _fb_refused = []
+        for _fb_i, _fb_t in enumerate(task_list or []):
+            if not isinstance(_fb_t, dict):
+                continue
+            _fb_text = "\n".join(str(_fb_t.get(k) or "") for k in ("goal", "context"))
+            if _fallback_declares_spatial(_fb_text):
+                _fb_refused.append((_fb_i, str(_fb_t.get("goal") or "")))
+        if _fb_refused:
+            try:
+                import hashlib as _fb_hashlib
+                _fb_log = os.environ.get(
+                    "HERMES_DELEGATION_GUARD_LOG",
+                    os.path.expanduser(
+                        "~/.hermes/state/delegation-spatial-guard.jsonl"))
+                _fb_dir = os.path.dirname(_fb_log)
+                if _fb_dir:
+                    os.makedirs(_fb_dir, exist_ok=True)
+                with open(_fb_log, "a", encoding="utf-8") as _fb_fh:
+                    for _fb_i, _fb_goal in _fb_refused:
+                        _fb_fh.write(json.dumps({
+                            "ts": _fb_time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                    _fb_time.gmtime()),
+                            "event": "refused",
+                            "task_index": _fb_i,
+                            "ref": _fb_ref[:120],
+                            "reason": "guard-module-broken",
+                            "goal_sha256": _fb_hashlib.sha256(
+                                _fb_goal.encode("utf-8")).hexdigest(),
+                            "goal_chars": len(_fb_goal),
+                            "pid": os.getpid(),
+                        }, separators=(",", ":")) + "\n")
+            except Exception:
+                logger.warning("delegate spatial guard fallback: could not "
+                               "record refusals", exc_info=True)
+            if len(_fb_refused) == 1:
+                _fb_which = f"task {_fb_refused[0][0]}"
+            else:
+                _fb_which = ("tasks " + ", ".join(str(i) for i, _ in _fb_refused))
             return tool_error(
-                "delegate_task refused (WS-B): spatial intent was declared "
-                "but the delegation lane capability could not be verified "
-                "(guard internal error). Do the spatial work in a "
+                f"delegate_task refused (WS-B): {_fb_which} declare(s) spatial "
+                "intent, but the delegation lane capability could not be "
+                "verified (guard internal error). Do the spatial work in a "
                 "spatial-capable lane (assign it to a worker on "
                 "tier/spatial-worker, e.g. worker-pcb/worker-layout) and "
                 "report the guard failure to the operator."

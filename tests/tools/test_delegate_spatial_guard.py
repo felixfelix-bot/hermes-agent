@@ -218,9 +218,13 @@ def test_guard_fails_closed_for_declared_spatial_on_internal_error(bot, monkeypa
     assert guard([{"goal": "fix the login bug"}], {"model": "tier/delegation"}) is None
 
 
+def _set_policy(bot, content):
+    (bot / "capability_routing.yaml").write_text(content)
+
+
 def test_malformed_floor_fails_closed_even_for_a_floor_meeting_model(bot):
     import yaml
-    (bot / "capability_routing.yaml").write_text(yaml.safe_dump({
+    _set_policy(bot, yaml.safe_dump({
         "classes": {"spatial_required": {
             "axes": {"spatial": ["strong"], "vision": "basic"}}}}))
     # a malformed configured minimum must not become a weaker one
@@ -229,6 +233,47 @@ def test_malformed_floor_fails_closed_even_for_a_floor_meeting_model(bot):
     msg = guard([{"goal": "x", "context": "spatial_tag: basic"}],
                 {"model": "tier/spatial-worker"})
     assert msg and "no spatial-capable candidate" in msg
+
+
+@pytest.mark.parametrize("content", [
+    "this is: {not: valid: yaml: at all",        # invalid YAML
+    "classes: 'not-a-mapping'",                  # classes is a string
+    "classes:\n  spatial_required: 'nope'",     # class is a string
+    "classes:\n  spatial_required:\n    axes: [strong]",   # axes is a list
+    "classes:\n  spatial_required:\n    axes: {}",        # axes is empty
+    "classes:\n  spatial_required:\n    axes: {spatial: ultra}",  # unknown level
+])
+def test_present_but_invalid_policy_refuses_everything(bot, content):
+    _set_policy(bot, content)
+    assert lane_has_spatial("gpt-6-astra") is False
+    assert lane_has_spatial("tier/spatial-worker") is False
+
+
+def test_absent_policy_uses_the_default_floor(bot):
+    assert not (bot / "capability_routing.yaml").exists()
+    assert lane_has_spatial("gpt-6-astra") is True
+
+
+def test_valid_policy_floor_is_used(bot):
+    import yaml
+    _set_policy(bot, yaml.safe_dump({
+        "classes": {"spatial_required": {"axes": {"spatial": "good"}}}}))
+    # gpt-6-astra declares basic < good: a VALID stronger floor must bind
+    assert lane_has_spatial("gpt-6-astra") is False
+    assert lane_has_spatial("tier/spatial-worker") is False
+
+
+def test_fallback_detector_never_under_detects_the_guard():
+    corpus = [
+        "spatial_tag: basic", 'spatial_tag: " basic"', "spatial_tag: none",
+        "spatial_tag: none.", 'spatial_tag: ""', "spatial_tag: # comment",
+        "spatial_tag:", "visual_artifact: m.png",
+        'visual_artifact: "reports/my map.png"', "visual_artifact: <path>",
+        "**spatial_tag: basic**", "spatial_tag: NONE", "  - spatial_tag: good",
+        "spatial_tag: none\nspatial_tag: good",
+    ]
+    for c in corpus:
+        assert not declares_spatial(c) or dt._fallback_declares_spatial(c), c
 
 
 def test_inherited_parent_model_is_checked(bot):
@@ -340,3 +385,25 @@ def test_delegate_task_fallback_is_independent_of_a_broken_guard_module(bot, mon
     except Exception:
         pass  # any failure past the builder seam proves the delegation ran on
     assert calls
+
+
+def test_fallback_logs_and_names_every_declared_spatial_task(bot, monkeypatch, tmp_path):
+    # broken module + a batch: EVERY declared-spatial task must be refused,
+    # named in the message, and recorded (goal-hash-only) in the JSONL.
+    calls = _arm_builder(monkeypatch)
+    from types import SimpleNamespace
+    monkeypatch.setitem(sys.modules, "tools.delegate_spatial_guard", SimpleNamespace())
+    result = dt.delegate_task(
+        tasks=[
+            {"goal": "Read the wing tab drawing", "context": "spatial_tag: basic"},
+            {"goal": "Fix the login form validation"},
+            {"goal": "Map the seats", "context": "visual_artifact: seats.png"},
+        ],
+        parent_agent=_StubParent())
+    assert "WS-B" in result and "tasks 0, 2" in result
+    assert "BUILDER REACHED" not in result
+    assert calls == []
+    rows = (tmp_path / "guard.jsonl").read_text().splitlines()
+    assert [json.loads(r)["task_index"] for r in rows] == [0, 2]
+    assert all(json.loads(r)["reason"] == "guard-module-broken" for r in rows)
+    assert "wing tab" not in (tmp_path / "guard.jsonl").read_text()
