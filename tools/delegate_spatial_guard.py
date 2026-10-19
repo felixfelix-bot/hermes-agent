@@ -3,33 +3,36 @@
 ``delegate_task`` pins every child to ``delegation.model`` (the manager profile
 uses ``tier/delegation``). That pool is market-priced general work, and its
 first candidate ``hermes/workhorse`` carries **operator-directed placeholder**
-spatial/vision axes while dispatching to a text-only DeepSeek model. A naive
-"some candidate declares spatial" check therefore passes while the child is
-blind — exactly the 2026-10-17 defect.
+spatial/vision axes while dispatching to a text-only DeepSeek model (the F6
+read-back reports served family deepseek). A naive "some candidate declares
+spatial" check therefore passes while the child is blind.
 
-This guard:
+The guard:
   * triggers only on an **explicit** spatial declaration in the delegated
-    goal/context (``spatial_tag: <non-none>`` or ``visual_artifact: <path>``);
+    goal/context — a line-anchored ``spatial_tag: <non-none>`` or
+    ``visual_artifact: <path>`` (quoted values allowed; ``none``-values,
+    empty values and ``#`` comments never count, and EVERY occurrence is
+    checked so a later real declaration cannot be masked by an earlier
+    opt-out);
   * counts a candidate only when its benchmark row declares every configured
-    floor axis AND the id is a real model, not a fleet-internal alias
-    (``hermes/*``). An alias's advertised axes describe the alias, not the
-    served model: ``hermes/workhorse`` advertises spatial/vision "basic" while
-    its lane dispatches DeepSeek (F6 read-back says served family deepseek), so
-    it is exactly the poisoning the gate must ignore. Operator-directed
-    placeholder axes on a REAL id (e.g. ``gpt-6-astra``) still count — that is
-    the fleet's designated spatial lane;
-  * fails closed on an unknown lane or unreadable config;
+    floor axis AND the id is a real model, not a routing alias: fleet-internal
+    aliases (``hermes/*``, the documented alias namespace) never satisfy a
+    capability floor, nor does a row whose ``reported_as`` names a different
+    id — an alias's advertised axes describe the alias, not the served model
+    (``hermes/workhorse`` is exactly this poisoning). Operator-directed
+    placeholder axes on a REAL id (``gpt-6-astra``) still count: that is the
+    fleet's designated spatial lane;
+  * fails closed on an unknown lane, unreadable or malformed capability data
+    (malformed entries are skipped, never raise);
   * refuses BEFORE any child is spawned (no wasted spend) and appends a JSONL
-    record (goal hash only — never the prompt) so the refusal volume can be
-    measured before per-task routing exists.
+    record (goal hash only — never the prompt) for every refused task so the
+    volume can be measured before per-task routing exists.
 
 The operator directive is "forbid + alert first": there is no per-task spatial
-routing yet (WS-B stage 2), so the refusal message routes the caller to
-``tier/spatial-worker`` / a concrete spatial model instead.
-
-A guard *bug* must not brick all delegation: the call site logs and proceeds on
-an unexpected exception. Unknown/missing capability data is a deliberate
-refusal (fail closed), not a crash.
+routing yet, so the refusal message routes the caller to the spatial worker
+lane instead. A guard *bug* must not brick ordinary delegation — but it must
+not silently authorize a declared-spatial child either: an internal guard
+error refuses declared-spatial tasks and allows the rest.
 """
 from __future__ import annotations
 
@@ -49,27 +52,39 @@ except Exception:  # pragma: no cover - PyYAML is a repo dependency
 
 logger = logging.getLogger(__name__)
 
+# Line-anchored declaration syntax: optional markdown decoration, the key,
+# then a single non-empty token (optionally quoted). Values that are comments
+# or opt-outs never trigger the guard.
 _SPATIAL_TAG = re.compile(
     r"^[ \t>*+\-#]*spatial_tag[ \t]*[:=][ \t]*(\S+)", re.I | re.M)
 _VISUAL_ARTIFACT = re.compile(
     r"^[ \t>*+\-#]*visual_artifact[ \t]*[:=][ \t]*(\S+)", re.I | re.M)
-_NONE_VALUES = {"none", "n/a", "na", "false", "off", "no", "-"}
+_NONE_VALUES = {"none", "n/a", "na", "false", "off", "no", "-",
+                "<path>", "<none>", "<value>"}
 _DEFAULT_FLOOR = {"spatial": "basic", "vision": "basic"}
 _LEVELS = {"": 0, "none": 0, "basic": 1, "good": 2, "strong": 3,
            "excellent": 4, "advanced": 4}
 DEFAULT_LOG = Path.home() / ".hermes" / "state" / "delegation-spatial-guard.jsonl"
 
 
+def _clean(value: str) -> str:
+    v = (value or "").strip().strip("\"'").strip().lower()
+    if v.startswith("#"):  # a comment token is not a declaration
+        return ""
+    return v
+
+
+def _declared(text: str, pattern: re.Pattern) -> bool:
+    for m in pattern.finditer(text):
+        if _clean(m.group(1)) and _clean(m.group(1)) not in _NONE_VALUES:
+            return True
+    return False
+
+
 def declares_spatial(text: str | None) -> bool:
     """True when the text carries a real (non-opt-out) spatial declaration."""
     text = text or ""
-    for m in _SPATIAL_TAG.finditer(text):
-        if m.group(1).strip().strip("\"'").lower() not in _NONE_VALUES:
-            return True
-    m = _VISUAL_ARTIFACT.search(text)
-    if m and m.group(1).strip().strip("\"'").lower() not in _NONE_VALUES:
-        return True
-    return False
+    return _declared(text, _SPATIAL_TAG) or _declared(text, _VISUAL_ARTIFACT)
 
 
 def _bot_dir() -> Path:
@@ -87,10 +102,24 @@ def _yaml(path: Path) -> dict:
 
 
 def load_capabilities() -> tuple[dict, dict, dict]:
-    """(tiers, benchmark rows, floor axes) or ({}, {}, floor) when unreadable."""
+    """(tiers, benchmark rows, floor axes); invalid entries are dropped.
+
+    Shape-invalid tiers/models/candidates are skipped, never raised — a
+    malformed config degrades to "unknown lane", which fails closed.
+    """
     bot = _bot_dir()
-    tiers = _yaml(bot / "model_tiers.yaml").get("tiers") or {}
-    models = _yaml(bot / "model_benchmarks.yaml").get("models") or {}
+    raw_tiers = _yaml(bot / "model_tiers.yaml").get("tiers") or {}
+    raw_models = _yaml(bot / "model_benchmarks.yaml").get("models") or {}
+    tiers = {}
+    for name, spec in (raw_tiers.items() if isinstance(raw_tiers, dict) else []):
+        if not isinstance(spec, dict):
+            continue
+        cands = spec.get("candidates")
+        if isinstance(cands, list) and cands:
+            tiers[str(name)] = {"candidates": [str(m) for m in cands]}
+    models = {str(k): v for k, v in
+              (raw_models.items() if isinstance(raw_models, dict) else [])
+              if isinstance(v, dict) and v}
     policy = _yaml(bot / "capability_routing.yaml")
     floor = _DEFAULT_FLOOR
     try:
@@ -99,20 +128,30 @@ def load_capabilities() -> tuple[dict, dict, dict]:
             floor = {str(k): str(v) for k, v in axes.items()}
     except Exception:
         pass
-    if not isinstance(tiers, dict):
-        tiers = {}
-    if not isinstance(models, dict):
-        models = {}
     return tiers, models, floor
 
 
-def _is_alias_id(model_id: str) -> bool:
-    """Fleet-internal routing aliases never satisfy a capability floor."""
-    return str(model_id or "").strip().lower().startswith("hermes/")
+def _is_alias(model_id: str, rec: dict) -> bool:
+    """A routing alias's axes describe the alias, not the served model.
+
+    Fleet-internal aliases live in the ``hermes/`` namespace (the documented
+    GENERAL_ALIAS namespace), and a row whose ``reported_as`` names a
+    different id is a reported alias, not the id itself.
+    """
+    mid = str(model_id or "").strip().lower()
+    if mid.startswith("hermes/"):
+        return True
+    rep = rec.get("reported_as") if isinstance(rec, dict) else None
+    if isinstance(rep, str):
+        rep = [rep]
+    if isinstance(rep, Iterable):
+        return any(str(x).strip().lower() and str(x).strip().lower() != mid
+                   for x in rep)
+    return False
 
 
 def _meets_floor(model_id: str, rec: dict, floor: dict) -> bool:
-    if _is_alias_id(model_id):
+    if _is_alias(model_id, rec):
         return False
     if not isinstance(rec, dict) or not rec:
         return False
@@ -139,75 +178,125 @@ def lane_has_spatial(ref: str) -> bool | None:
         return None
     if ref.startswith("tier/"):
         cands = (tiers.get(ref) or {}).get("candidates")
-        if not isinstance(cands, list) or not cands:
+        if not cands:
             return None
-        return any(_meets_floor(str(m), models.get(str(m)) or {}, floor) for m in cands)
+        return any(_meets_floor(m, models.get(m) or {}, floor) for m in cands)
     rec = models.get(ref)
     if not isinstance(rec, dict):
         return None
     return _meets_floor(ref, rec, floor)
 
 
+def _log_path() -> Path:
+    return Path(os.environ.get("HERMES_DELEGATION_GUARD_LOG") or DEFAULT_LOG)
+
+
 def _log_refusal(record: dict) -> None:
-    path = Path(os.environ.get("HERMES_DELEGATION_GUARD_LOG") or DEFAULT_LOG)
+    path = _log_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-    except Exception:  # telemetry must never break delegation
-        logger.debug("delegate spatial guard: could not write %s", path, exc_info=True)
+    except Exception:
+        logger.warning("delegate spatial guard: could not record a refusal "
+                       "to %s", path, exc_info=True)
 
 
-def guard(task_list: list[dict], cfg: dict,
-          parent_model: str = "") -> str | None:
-    """Return a refusal message when a spatial child rides a non-spatial lane.
+def _safe_meta(value: str, cap: int = 120) -> str:
+    return str(value or "").strip()[:cap]
 
-    Checks every task in a batch; the first offending task is reported (each is
-    logged). Returns None when the delegation may proceed.
-    """
-    cfg = cfg or {}
+
+def _refusal_message(task_indices: list[int], ref: str, why: str, axes: str,
+                     log_hint: str) -> str:
+    if len(task_indices) == 1:
+        which = f"task {task_indices[0]}"
+    else:
+        which = "tasks " + ", ".join(str(i) for i in task_indices)
+    return (
+        f"delegate_task refused (WS-B): {which} declare(s) spatial intent, but "
+        f"{why} (floor {axes}; fleet-internal aliases do not count). "
+        "delegate_task cannot select a model per task, so do the spatial work "
+        "in a spatial-capable lane: assign it to a worker on tier/spatial-worker "
+        "(e.g. worker-pcb/worker-layout) or run it in a spatial parent, then "
+        f"retry without the spatial child. Refusals are recorded in {log_hint} "
+        "to measure the volume before per-task routing exists."
+    )
+
+
+def _guard_inner(task_list: list, cfg: dict, parent_model: str) -> str | None:
     ref = str(cfg.get("model") or "").strip() or (parent_model or "").strip()
+    log_path = _log_path()
+    log_hint = str(log_path) if os.environ.get("HERMES_DELEGATION_GUARD_LOG") \
+        else "~/.hermes/state/delegation-spatial-guard.jsonl"
+    unknown = ref and lane_has_spatial(ref) is None
+    refusals: list[int] = []
     for i, task in enumerate(task_list or []):
         if not isinstance(task, dict):
             continue
         text = "\n".join(str(task.get(k) or "") for k in ("goal", "context"))
         if not declares_spatial(text):
             continue
-        has = lane_has_spatial(ref)
-        if has is True:
+        if lane_has_spatial(ref) is True:
             continue
-        if has is None:
-            why = (f"lane {ref or '<inherited>'} capability is UNKNOWN "
-                   "(config missing or the lane/model is not declared)")
-        else:
-            why = f"lane {ref!r} has no spatial-capable candidate"
         goal = str(task.get("goal") or "")
         _log_refusal({
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "refused",
             "task_index": i,
-            "ref": ref,
-            "reason": "unknown" if has is None else "no-spatial-candidate",
+            "ref": _safe_meta(ref),
+            "reason": "unknown" if unknown else "no-spatial-candidate",
             "goal_sha256": hashlib.sha256(goal.encode("utf-8")).hexdigest(),
             "goal_chars": len(goal),
             "pid": os.getpid(),
-            "profile": os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME") or "",
+            "profile": _safe_meta(os.environ.get("HERMES_PROFILE")
+                                  or os.environ.get("HERMES_PROFILE_NAME")),
         })
-        logger.warning("delegate_task refused spatial child %d on %s (%s)", i, ref, why)
+        logger.warning("delegate_task refused spatial child %d on %r",
+                       i, ref or "<inherited>")
+        refusals.append(i)
+    if not refusals:
+        return None
+    if unknown:
+        why = (f"lane {ref!r} capability is UNKNOWN (config missing or the "
+               "lane/model is not declared)")
         floor = _DEFAULT_FLOOR
+    else:
+        why = f"lane {ref!r} has no spatial-capable candidate"
         try:
             floor = load_capabilities()[2]
         except Exception:
-            pass
-        axes = ", ".join(f"{k}>={v}" for k, v in floor.items())
-        return (
-            f"delegate_task refused (WS-B): task {i} is declared spatial, but "
-            f"{why} (floor {axes}; fleet-internal aliases do not count). "
-            "delegate_task cannot select a model per task, so do the spatial "
-            "work in a spatial-capable lane: assign it to a worker on "
-            "tier/spatial-worker (e.g. worker-pcb/worker-layout) or run it in "
-            "a spatial parent, then retry without the spatial child. Refusals "
-            "are recorded in ~/.hermes/state/delegation-spatial-guard.jsonl to "
-            "measure the volume before per-task routing exists."
-        )
-    return None
+            floor = _DEFAULT_FLOOR
+    axes = ", ".join(f"{k}>={v}" for k, v in floor.items())
+    return _refusal_message(refusals, ref or "<inherited>", why, axes, log_hint)
+
+
+def guard(task_list: list, cfg: dict, parent_model: str = "") -> str | None:
+    """Return a refusal message when a spatial child rides a non-spatial lane.
+
+    Checks every task in a batch; ALL refused tasks are logged and named in the
+    message (the whole batch is refused before any spawn). Returns None when
+    the delegation may proceed.
+
+    Never raises. On an internal error, a task that DECLARES spatial intent is
+    still refused (fail closed for spatial); everything else proceeds so a
+    guard bug cannot brick ordinary delegation.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        return _guard_inner(task_list, cfg, parent_model or "")
+    except Exception:
+        logger.exception("delegate spatial guard failed; failing closed for "
+                         "declared-spatial tasks only")
+        for i, task in enumerate(task_list or []):
+            if not isinstance(task, dict):
+                continue
+            text = "\n".join(str(task.get(k) or "") for k in ("goal", "context"))
+            if declares_spatial(text):
+                return _refusal_message(
+                    [i], (str(cfg.get("model") or "").strip()
+                          or parent_model or "<inherited>"),
+                    "lane capability could not be verified (guard internal "
+                    "error)",
+                    ", ".join(f"{k}>={v}" for k, v in _DEFAULT_FLOOR.items()),
+                    str(_log_path()))
+        return None

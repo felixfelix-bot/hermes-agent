@@ -3284,9 +3284,11 @@ def delegate_task(
     # WS-B (operator directive: forbid + alert first): a task that DECLARES
     # spatial intent must not ride a delegation lane with no spatial-capable
     # candidate (the manager pins tier/delegation, whose spatial claim is a
-    # placeholder). Refuse before any child is spawned. A guard bug must not
-    # brick delegation, so an unexpected exception is logged and we proceed;
-    # an unknown/missing capability config is a deliberate refusal.
+    # placeholder). Refuse before any child is spawned. guard() never raises
+    # (it fails closed for declared-spatial tasks and lets everything else
+    # through); this belt-and-braces handler keeps that contract even if the
+    # guard module itself is broken: declared-spatial is still refused, a guard
+    # bug cannot brick ordinary delegation.
     try:
         from tools.delegate_spatial_guard import guard as _spatial_guard
 
@@ -3296,8 +3298,23 @@ def delegate_task(
         if _spatial_refusal:
             return tool_error(_spatial_refusal)
     except Exception:
-        logger.warning("delegate spatial guard failed; allowing delegation",
-                       exc_info=True)
+        logger.warning("delegate spatial guard failed", exc_info=True)
+        try:
+            from tools.delegate_spatial_guard import declares_spatial
+
+            if any(declares_spatial("\n".join(
+                    str(t.get(k) or "") for k in ("goal", "context")))
+                    for t in task_list if isinstance(t, dict)):
+                return tool_error(
+                    "delegate_task refused (WS-B): spatial intent was declared "
+                    "but the delegation lane capability could not be verified "
+                    "(guard internal error). Do the spatial work in a "
+                    "spatial-capable lane (assign it to a worker on "
+                    "tier/spatial-worker, e.g. worker-pcb/worker-layout) and "
+                    "report the guard failure to the operator."
+                )
+        except Exception:
+            logger.exception("delegate spatial guard fallback failed")
 
     overall_start = time.monotonic()
     results = []
