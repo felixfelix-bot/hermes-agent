@@ -202,10 +202,12 @@ def guard(task_list: list[dict], cfg: dict,
         axes = ", ".join(f"{k}>={v}" for k, v in floor.items())
         return (
             f"delegate_task refused (WS-B): task {i} is declared spatial, but "
-            f"{why} (floor {axes}; fleet-internal aliases do not count). Route the "
-            "subtask to tier/spatial-worker or a concrete spatial model, then "
-            "retry. Refusals are recorded in ~/.hermes/state/"
-            "delegation-spatial-guard.jsonl to measure the volume before "
-            "per-task routing exists."
+            f"{why} (floor {axes}; fleet-internal aliases do not count). "
+            "delegate_task cannot select a model per task, so do the spatial "
+            "work in a spatial-capable lane: assign it to a worker on "
+            "tier/spatial-worker (e.g. worker-pcb/worker-layout) or run it in "
+            "a spatial parent, then retry without the spatial child. Refusals "
+            "are recorded in ~/.hermes/state/delegation-spatial-guard.jsonl to "
+            "measure the volume before per-task routing exists."
         )
     return None
