@@ -511,6 +511,6 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(cli._last_turn_result))
+        exit_single_query(_single_query_exit_code(cli._last_turn_result), result=cli._last_turn_result)
     finally:
         _finalize_single_query(cli)

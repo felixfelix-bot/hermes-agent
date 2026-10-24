@@ -604,6 +604,45 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
 
 
 
+def test_respawn_guard_allows_filesystem_access_error(kanban_home):
+    """A workspace EACCES is not a credential blocker.
+
+    ``permission denied`` in a workspace path matches the generic auth
+    alternation, so without the filesystem carve-out the guard parks the
+    task as ``blocker_auth`` forever — it runs BEFORE any spawn, so the
+    failure breaker never trips. Seen 2026-10-14: 3 net4sats cards stuck
+    on ``workspace: [Errno 13] Permission denied: '/home/c08r4d0r'``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fs-eacces", assignee="a")
+        kb.claim_task(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/home/c08r4d0r'", tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_still_blocks_quota_429(kanban_home):
+    """A genuine quota wall (429) still parks as ``blocker_auth``."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quota-429", assignee="a")
+        kb.claim_task(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("upstream returned 429 rate limit exceeded", tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+
+
 
 
 

@@ -30,9 +30,21 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
 
-def exit_single_query(code: int) -> None:
+def exit_single_query(code: int, result: dict | None = None) -> None:
     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
     if os.environ.get("HERMES_KANBAN_TASK"):
+        # The in-loop nudge in agent.kanban_stop only runs on the conversation
+        # loop's normal exit; the ~27 early return paths bypass it. Reconcile
+        # here, the single point every quiet worker turn funnels through.
+        with contextlib.suppress(Exception):
+            from agent.kanban_terminal_guard import reconcile_worker_exit
+            action = reconcile_worker_exit(
+                completed=bool(result and result.get("completed")),
+                result=result,
+            )
+            if action == "recorded":
+                print("kanban: run ended without a terminal board call — recorded protocol_violation",
+                      file=sys.stderr, flush=True)
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.

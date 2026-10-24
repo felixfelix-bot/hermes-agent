@@ -119,6 +119,36 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     )
 
 
+def _board_has_spawnable_work(slug: str, *, review_probe: bool) -> bool:
+    """True when *slug* holds at least one task the dispatcher would spawn for.
+
+    Shared by the tick loop and the stuck-probe so the two can't drift. Honors
+    the board's ``no_llm_dispatch`` opt-out: a deterministic-tooling board with
+    a full ready queue is "correctly idle", not "stuck", so it must never count
+    toward spawnable work (2026-10-15: the ready queue on three opted-out boards
+    kept the stuck-warn firing while zero cards were actually dispatchable).
+    Fail-closed (False) on any error — an unreadable board cannot be proven to
+    have spawnable work.
+    """
+    if _board_no_llm_dispatch(slug):
+        return False
+    conn = None
+    try:
+        kbd = _kbd()
+        conn = _kbc().connect(board=slug)
+        if kbd.has_spawnable_ready(conn):
+            return True
+        if review_probe and kbd.has_spawnable_review(conn):
+            return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+
 class _KanbanDispatcher:
     """Per-tick board work for the embedded dispatcher (runs in worker threads).
 
@@ -244,17 +274,8 @@ class _KanbanDispatcher:
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
         for slug in self._board_slugs():
-            conn = None
-            try:
-                conn = _kbc().connect(board=slug)
-                if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
-                    return True
-            except Exception:
-                continue
-            finally:
-                if conn is not None:
-                    with contextlib.suppress(Exception):
-                        conn.close()
+            if _board_has_spawnable_work(slug, review_probe=_review_probe):
+                return True
         return False
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
